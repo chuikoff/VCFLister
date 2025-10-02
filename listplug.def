@@ -1,0 +1,6 @@
+LIBRARY "VCFLister"
+EXPORTS
+    ListLoadW
+    ListCloseWindow
+    ListSearchTextW
+    ListGetDetectString
