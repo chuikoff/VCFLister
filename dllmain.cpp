@@ -22,7 +22,7 @@
 #define TRY_VOID    try {
 #define CATCH_VOID  } catch (...) { /* swallow */ }
 
-// ---------- утилита: читаем файл в wstring ----------
+// ---------- утилита: читаем файл в wstring с корректной детекцией кодировки ----------
 static std::wstring ReadWholeFileAsWide(const wchar_t* path)
 {
     std::wstring empty;
@@ -32,11 +32,13 @@ static std::wstring ReadWholeFileAsWide(const wchar_t* path)
     std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (buf.empty()) return empty;
 
-    auto toWide = [](const char* data, int len, UINT cp)->std::wstring {
-        int wlen = MultiByteToWideChar(cp, 0, data, len, nullptr, 0);
+    auto tryMbToW = [](const char* data, int len, UINT cp, bool strictUTF8 = false)->std::wstring {
+        DWORD flags = 0;
+        if (strictUTF8 && cp == CP_UTF8) flags = MB_ERR_INVALID_CHARS; // важный флаг!
+        int wlen = MultiByteToWideChar(cp, flags, data, len, nullptr, 0);
         if (wlen <= 0) return L"";
         std::wstring w(wlen, L'\0');
-        MultiByteToWideChar(cp, 0, data, len, w.data(), wlen);
+        if (!MultiByteToWideChar(cp, flags, data, len, w.data(), wlen)) return L"";
         return w;
         };
 
@@ -51,16 +53,25 @@ static std::wstring ReadWholeFileAsWide(const wchar_t* path)
         (unsigned char)buf[0] == 0xEF &&
         (unsigned char)buf[1] == 0xBB &&
         (unsigned char)buf[2] == 0xBF) {
-        return toWide(buf.data() + 3, (int)buf.size() - 3, CP_UTF8);
+        return tryMbToW(buf.data() + 3, (int)buf.size() - 3, CP_UTF8, /*strict*/true);
     }
 
-    // UTF-8 без BOM -> CP1251 -> ACP
-    std::wstring w = toWide(buf.data(), (int)buf.size(), CP_UTF8);
+    // 1) строгий UTF-8 (если невалидно — вернётся пусто)
+    std::wstring w = tryMbToW(buf.data(), (int)buf.size(), CP_UTF8, /*strict*/true);
     if (!w.empty()) return w;
-    w = toWide(buf.data(), (int)buf.size(), 1251);
+
+    // 2) Windows-1251
+    w = tryMbToW(buf.data(), (int)buf.size(), 1251);
     if (!w.empty()) return w;
-    return toWide(buf.data(), (int)buf.size(), CP_ACP);
+
+    // 3) OEM (866) — иногда исходники такие
+    w = tryMbToW(buf.data(), (int)buf.size(), CP_OEMCP);
+    if (!w.empty()) return w;
+
+    // 4) Системная ACP как последний шанс
+    return tryMbToW(buf.data(), (int)buf.size(), CP_ACP);
 }
+
 
 // -------------------- ЭКСПОРТЫ ПЛАГИНА --------------------
 
