@@ -1,4 +1,4 @@
-﻿// vcf_view.cpp - VCF Lister view (non-clickable, proper layout, left-pane scrollbar)
+﻿// vcf_view.cpp - VCF Lister view (non-clickable, proper layout, left-pane scrollbar, email fallback)
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -77,16 +77,56 @@ struct ViewState {
 
     Fonts fonts;
 };
-// hit-test point inside rect (левый/верхний включительно, правый/нижний — исключая)
+
+// hit-test helper
 static inline bool PtIn(const RECT& r, int x, int y) {
     return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
 }
+
 // ---------- Utils ----------
 static std::wstring PrimaryPhone(const Contact& c) {
     return c.phones.empty() ? L"" : c.phones[0].number;
 }
 static std::wstring PrimaryEmail(const Contact& c) {
     for (auto& e : c.emails) { if (!e.addr.empty()) return e.addr; }
+    return L"";
+}
+
+// извлекаем e-mail из mailto: или из текста (простой поиск вокруг '@')
+static bool IsEmailChar(wchar_t ch) {
+    return iswalnum(ch) || ch == L'.' || ch == L'_' || ch == L'-' || ch == L'+';
+}
+static std::wstring ExtractEmailFromText(const std::wstring& txt) {
+    size_t at = txt.find(L'@');
+    if (at == std::wstring::npos) return L"";
+    size_t l = at, r = at;
+    while (l > 0 && IsEmailChar(txt[l - 1])) --l;
+    while (r + 1 < txt.size() && IsEmailChar(txt[r + 1])) ++r;
+    if (l<at && r>at) return txt.substr(l, r - l + 1);
+    return L"";
+}
+static std::wstring FallbackEmail(const Contact& c) {
+    // 1) mailto: в URL
+    if (!c.url.empty()) {
+        const std::wstring m = L"mailto:";
+        if (c.url.size() > m.size()) {
+            std::wstring low = c.url; std::transform(low.begin(), low.end(), low.begin(), ::towlower);
+            if (low.rfind(m, 0) == 0) {
+                std::wstring e = c.url.substr(m.size());
+                // обрежем параметры после '?'
+                size_t q = e.find(L'?'); if (q != std::wstring::npos) e = e.substr(0, q);
+                return e;
+            }
+        }
+        // иначе попробуем вытащить что-то похожее на e-mail прямо из url
+        std::wstring f = ExtractEmailFromText(c.url);
+        if (!f.empty()) return f;
+    }
+    // 2) из заметки
+    if (!c.note.empty()) {
+        std::wstring f = ExtractEmailFromText(c.note);
+        if (!f.empty()) return f;
+    }
     return L"";
 }
 
@@ -134,7 +174,7 @@ static void DrawLabel(HDC dc, HFONT f, int x, int y, const std::wstring& label, 
 static void DrawNameField(HDC dc, Fonts& f, HWND h, int x, int& y, int w, const std::wstring& name) {
     // Label
     DrawLabel(dc, f.hBold, x, y, L"Name:", RGB(90, 90, 90));
-    // Дадим нормальный вертикальный отступ под значение
+    // Нормальный отступ под значение
     y += S(h, 22);
 
     // Value
@@ -151,23 +191,21 @@ static void DrawLabelValue(HDC dc, Fonts& f, int x, int& y, int w,
     if (value.empty()) return;
 
     // label + ": "
+    std::wstring lab = label + L": ";
     HFONT old = (HFONT)SelectObject(dc, f.hBold);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, labCol);
-    std::wstring lab = label + L": ";
     TextOutW(dc, x, y, lab.c_str(), (int)lab.size());
 
-    // measure and draw value with wrapping
-    RECT rcVal{ x + S(hWnd, (int)lab.size() * 7 / 2), y, x + w, y + 10000 }; // безопасный старт справа от метки
-    // точнее вычислим старт по ширине метки
+    // точная ширина метки
     SIZE szLab{}; GetTextExtentPoint32W(dc, lab.c_str(), (int)lab.size(), &szLab);
-    rcVal.left = x + szLab.cx;
 
+    // value с переносами
+    RECT rcVal{ x + szLab.cx, y, x + w, y + 10000 };
     SelectObject(dc, f.hNorm);
     int hUsed = DrawMeasuredText(dc, f.hNorm, value, rcVal, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, valCol);
 
     y += std::max(S(hWnd, 22), hUsed) + S(hWnd, 6);
-
     SelectObject(dc, old);
 }
 
@@ -186,7 +224,7 @@ static void UpdateListScrollbar(ViewState* st, int total) {
     si.nPage = std::max(1, st->perPage);
     si.nPos = std::min(st->listScroll, std::max(0, total - st->perPage));
     SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
-    ShowWindow(st->hScroll, (total > st->perPage) ? SW_SHOW : SW_HIDE);
+    ShowWindow(st->hScroll, (total > st->perPage) ? SW_SHOW : SW_HIDE); // можно поставить SW_SHOW всегда
 }
 
 static int ListPaneWidth(HWND h) { return S(h, 260); }
@@ -248,8 +286,14 @@ static void RenderList(HDC dc, HWND h, ViewState* st,
         // subtitle
         SelectObject(dc, st->fonts.hSmall);
         SetTextColor(dc, RGB(110, 110, 110));
+        std::wstring subShow = sub;
+        if (subShow.empty()) {
+            // Левый подзаголовок тоже пытается показать email из fallback
+            std::wstring fb = FallbackEmail(c);
+            if (!fb.empty()) subShow = L"Email: " + fb;
+        }
         RECT subRc = nameRc; subRc.top = nameRc.top + S(h, 20);
-        DrawTextW(dc, sub.c_str(), (int)sub.size(), &subRc, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(dc, subShow.c_str(), (int)subShow.size(), &subRc, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         ycur += st->listItemH;
     }
@@ -462,6 +506,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (!c.url.empty())   DrawLabelValue(mem, F, dx, dy, dw, L"URL", c.url, RGB(90, 90, 90), RGB(30, 30, 30), h);
             if (!c.bday.empty())  DrawLabelValue(mem, F, dx, dy, dw, L"BDay", c.bday, RGB(90, 90, 90), RGB(30, 30, 30), h);
 
+            // Phones
             for (auto& p : c.phones) {
                 if (p.number.empty()) continue;
                 std::wstring val = p.number;
@@ -472,8 +517,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
                 DrawLabelValue(mem, F, dx, dy, dw, L"Phone", val, RGB(90, 90, 90), RGB(30, 30, 30), h);
             }
+
+            // Emails (primary) — если пусто, используем fallback
+            bool anyEmail = false;
             for (auto& e : c.emails) {
                 if (e.addr.empty()) continue;
+                anyEmail = true;
                 std::wstring val = e.addr;
                 if (!e.types.empty()) {
                     std::wstring types;
@@ -482,6 +531,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
                 DrawLabelValue(mem, F, dx, dy, dw, L"Email", val, RGB(90, 90, 90), RGB(30, 30, 30), h);
             }
+            if (!anyEmail) {
+                std::wstring fb = FallbackEmail(c);
+                if (!fb.empty()) {
+                    DrawLabelValue(mem, F, dx, dy, dw, L"Email", fb, RGB(90, 90, 90), RGB(30, 30, 30), h);
+                }
+            }
+
+            // Addresses
             for (auto& a : c.addrs) {
                 if (a.text.empty()) continue;
                 DrawLabelValue(mem, F, dx, dy, dw, L"Address", a.text, RGB(90, 90, 90), RGB(30, 30, 30), h);
@@ -540,7 +597,7 @@ void VCFView_SetSelection(HWND h, size_t idx) {
     }
 }
 
-// Search helpers (unchanged)
+// Search helpers
 static bool isWordBoundary(const std::wstring& s, size_t pos) { return (pos == 0) || !iswalnum(s[pos - 1]); }
 static bool isWordBoundary2(const std::wstring& s, size_t pos) { return (pos >= s.size()) || !iswalnum(s[pos]); }
 

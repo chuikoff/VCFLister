@@ -361,3 +361,13 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Build outputs (на всякий случай)
+Debug/
+Release/
+*.lib
+*.exp
+
+# Плагин (артефакты сборки)
+*.wlx
+*.wlx64
