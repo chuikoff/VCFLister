@@ -1,4 +1,4 @@
-// vcf_parser.cpp — разбор vCard 3.0 (поддержка itemN.EMAIL/TEL, EMAIL выводится; без Address::types)
+// vcf_parser.cpp — vCard 3.0 parser with Quoted-Printable + CHARSET support
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -14,7 +14,7 @@
 
 #include "vcf_parser.hpp"
 
-// ---- utils -------------------------------------------------
+// ---------- small utils ----------
 static inline std::wstring trim(const std::wstring& s) {
     size_t a = 0, b = s.size();
     while (a < b && iswspace(s[a])) ++a;
@@ -49,7 +49,7 @@ static std::wstring unescape(const std::wstring& s) {
     return r;
 }
 
-// разворачиваем перенесённые строки (следующая начинается с пробела/таба)
+// unfold: join lines where the next one starts with space / tab
 static std::vector<std::wstring> unfoldLines(const std::wstring& text) {
     std::vector<std::wstring> raw;
     std::wstring cur;
@@ -76,7 +76,7 @@ static std::vector<std::wstring> unfoldLines(const std::wstring& text) {
     return raw;
 }
 
-// отрезаем itemN. у имени свойства (item1.EMAIL -> EMAIL)
+// remove "itemN." prefix (e.g. item1.EMAIL -> EMAIL)
 static std::wstring basePropName(const std::wstring& name) {
     size_t dot = name.find(L'.');
     if (dot == std::wstring::npos) return name;
@@ -86,7 +86,7 @@ static std::wstring basePropName(const std::wstring& name) {
     return (last == std::wstring::npos) ? name : name.substr(last + 1);
 }
 
-// TYPE=HOME,WORK и т.п. (для TEL/EMAIL)
+// TYPE=HOME,WORK etc for TEL/EMAIL
 static std::vector<std::wstring> parseTypes(const std::vector<std::wstring>& params) {
     std::vector<std::wstring> out;
     for (auto& p : params) {
@@ -105,7 +105,80 @@ static std::vector<std::wstring> parseTypes(const std::vector<std::wstring>& par
     return out;
 }
 
-// ---- parser ------------------------------------------------
+// map CHARSET name -> Windows codepage
+static UINT codepageFromCharset(std::wstring cs) {
+    cs = upper(cs);
+    if (cs == L"UTF-8" || cs == L"UTF8") return CP_UTF8;
+    if (cs == L"UTF-16" || cs == L"UTF16" || cs == L"UTF-16LE") return 1200;
+    if (cs == L"WINDOWS-1251" || cs == L"CP1251" || cs == L"WIN-1251") return 1251;
+    if (cs == L"KOI8-R" || cs == L"KOI8R") return 20866;
+    if (cs == L"ISO-8859-5" || cs == L"ISO8859-5") return 28595;
+    if (cs == L"ISO-8859-1" || cs == L"ISO8859-1" || cs == L"LATIN1") return 28591;
+    return CP_UTF8; // default
+}
+
+// convert ASCII-only wstring -> narrow
+static std::string w2ascii(const std::wstring& w) {
+    std::string s; s.reserve(w.size());
+    for (wchar_t ch : w) s.push_back((char)((ch < 128) ? ch : '?'));
+    return s;
+}
+
+// Quoted-Printable decode to bytes
+static std::vector<unsigned char> decodeQP(const std::string& in) {
+    std::vector<unsigned char> out; out.reserve(in.size());
+    const size_t n = in.size();
+    for (size_t i = 0; i < n; ) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '=') {
+            // soft break "=\r\n" / "=\n"
+            if (i + 1 < n && in[i + 1] == '\r' && i + 2 < n && in[i + 2] == '\n') { i += 3; continue; }
+            if (i + 1 < n && in[i + 1] == '\n') { i += 2; continue; }
+            // hex
+            auto hex = [&](char x)->int {
+                if (x >= '0' && x <= '9') return x - '0';
+                if (x >= 'A' && x <= 'F') return 10 + (x - 'A');
+                if (x >= 'a' && x <= 'f') return 10 + (x - 'a');
+                return -1;
+                };
+            if (i + 2 < n) {
+                int h1 = hex(in[i + 1]), h2 = hex(in[i + 2]);
+                if (h1 >= 0 && h2 >= 0) {
+                    out.push_back((unsigned char)((h1 << 4) | h2));
+                    i += 3; continue;
+                }
+            }
+            // invalid sequence -> keep '='
+            out.push_back('=');
+            ++i;
+        }
+        else {
+            out.push_back(c);
+            ++i;
+        }
+    }
+    return out;
+}
+
+// bytes (given codepage) -> wstring
+static std::wstring mbToWide(const unsigned char* data, int len, UINT cp) {
+    DWORD flags = (cp == CP_UTF8) ? MB_ERR_INVALID_CHARS : 0;
+    int wlen = MultiByteToWideChar(cp, flags, (LPCCH)data, len, nullptr, 0);
+    if (wlen <= 0) return L"";
+    std::wstring w(wlen, L'\0');
+    MultiByteToWideChar(cp, flags, (LPCCH)data, len, &w[0], wlen);
+    return w;
+}
+
+// apply ENCODING=QUOTED-PRINTABLE (and CHARSET)
+static std::wstring decodeTextValue(const std::wstring& wval, bool isQP, const std::wstring& charset) {
+    if (!isQP) return wval; // already wide (file-decoded) if not QP
+    std::string ascii = w2ascii(wval); // QP is ASCII-safe
+    auto bytes = decodeQP(ascii);
+    return mbToWide(bytes.data(), (int)bytes.size(), codepageFromCharset(charset));
+}
+
+// ---------- main parser ----------
 std::vector<Contact> ParseVCard(const std::wstring& text)
 {
     std::vector<Contact> contacts;
@@ -127,7 +200,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         size_t colon = line.find(L':');
         if (colon == std::wstring::npos) continue;
         std::wstring left = line.substr(0, colon);
-        std::wstring value = unescape(line.substr(colon + 1));
+        std::wstring value = line.substr(colon + 1); // декодируем ниже при необходимости
 
         auto parts = split(left, L';');
         if (parts.empty()) continue;
@@ -136,56 +209,74 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         std::vector<std::wstring> params;
         for (size_t i = 1; i < parts.size(); ++i) params.push_back(parts[i]);
 
+        // collect common params
+        bool encQP = false;
+        std::wstring charset;
+        for (auto& p : params) {
+            auto P = upper(p);
+            if (P.rfind(L"ENCODING=", 0) == 0) {
+                auto v = P.substr(9);
+                if (v == L"QUOTED-PRINTABLE" || v == L"QP") encQP = true;
+                // ENCODING=B (base64) оставим на фото/другое, здесь не требуется
+            }
+            else if (P.rfind(L"CHARSET=", 0) == 0) {
+                charset = p.substr(8); // оригинал с регистром
+            }
+        }
+
+        // decode
+        std::wstring v = unescape(decodeTextValue(value, encQP, charset));
+
         if (name == L"N") {
-            auto v = split(value, L';');
-            if (v.size() >= 1) cur.n_family = v[0];
-            if (v.size() >= 2) cur.n_given = v[1];
+            auto vs = split(v, L';');
+            if (vs.size() >= 1) cur.n_family = vs[0];
+            if (vs.size() >= 2) cur.n_given = vs[1];
         }
         else if (name == L"FN") {
-            cur.fn = value;
+            cur.fn = v;
         }
         else if (name == L"ORG") {
-            cur.org = value;
+            cur.org = v;
         }
         else if (name == L"TITLE") {
-            cur.title = value;
+            cur.title = v;
         }
         else if (name == L"URL") {
-            cur.url = value;
+            cur.url = v;
         }
         else if (name == L"BDAY") {
-            cur.bday = value;
+            cur.bday = v;
         }
         else if (name == L"NOTE") {
-            cur.note = value;
+            cur.note = v;
         }
         else if (name == L"TEL") {
             Phone p;
-            p.number = value;
+            p.number = v;
             p.types = parseTypes(params);
             if (!p.number.empty()) cur.phones.push_back(std::move(p));
         }
         else if (name == L"EMAIL") {
             Email e;
-            e.addr = value;
+            e.addr = v;
             e.types = parseTypes(params);
             if (!e.addr.empty()) cur.emails.push_back(std::move(e));
         }
         else if (name == L"ADR") {
-            // ADR: PO;EXT;STREET;LOCALITY;REGION;POSTCODE;COUNTRY -> соберём одной строкой
-            auto v = split(value, L';');
+            // ADR: PO;EXT;STREET;LOCALITY;REGION;POSTCODE;COUNTRY -> join into one line
+            auto vs = split(v, L';');
             std::wstring joined;
-            for (size_t i = 0; i < v.size(); ++i) {
-                auto t = trim(v[i]); if (t.empty()) continue;
+            for (auto& part : vs) {
+                auto t = trim(part); if (t.empty()) continue;
                 if (!joined.empty()) joined += L", ";
                 joined += t;
             }
             if (!joined.empty()) {
-                Address a; a.text = joined;            // <-- только text, без types
+                Address a; a.text = joined; // types не используем
                 cur.addrs.push_back(std::move(a));
             }
         }
-        // PHOTO/X-ABLABEL/прочее — оставим как есть/игнорируем
+        // PHOTO/base64 и прочие X- поля можно обрабатывать отдельно при необходимости
     }
 
     if (inCard) contacts.push_back(cur);
