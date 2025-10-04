@@ -1,4 +1,4 @@
-﻿// vcf_view.cpp - VCF Lister view (non-clickable, proper layout, left-pane scrollbar, email fallback)
+﻿// vcf_view.cpp - VCF Lister view with right-click "Copy" (no Ctrl+C), clean values (no type tails)
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -63,6 +63,13 @@ static void FreeFonts(Fonts& f) {
     f = {};
 }
 
+// ---------- hit testing for right pane fields ----------
+struct FieldHit {
+    RECT rc{};                 // прямоугольник значения (а не метки)
+    std::wstring label;        // "Email", "Phone", ...
+    std::wstring value;        // именно текст значения (то, что копируем)
+};
+
 // ---------- State ----------
 struct ViewState {
     std::vector<Contact> contacts;
@@ -74,6 +81,10 @@ struct ViewState {
     int  perPage = 1;
 
     HWND hScroll = nullptr; // отдельный контрол прокрутки слева
+
+    // right pane fields (для контекстного меню)
+    std::vector<FieldHit> fields;
+    int contextField = -1; // индекс поля под правым кликом
 
     Fonts fonts;
 };
@@ -92,7 +103,7 @@ static std::wstring PrimaryEmail(const Contact& c) {
     return L"";
 }
 
-// извлекаем e-mail из mailto: или из текста (простой поиск вокруг '@')
+// e-mail fallback из URL/NOTE
 static bool IsEmailChar(wchar_t ch) {
     return iswalnum(ch) || ch == L'.' || ch == L'_' || ch == L'-' || ch == L'+';
 }
@@ -106,28 +117,39 @@ static std::wstring ExtractEmailFromText(const std::wstring& txt) {
     return L"";
 }
 static std::wstring FallbackEmail(const Contact& c) {
-    // 1) mailto: в URL
     if (!c.url.empty()) {
         const std::wstring m = L"mailto:";
         if (c.url.size() > m.size()) {
             std::wstring low = c.url; std::transform(low.begin(), low.end(), low.begin(), ::towlower);
             if (low.rfind(m, 0) == 0) {
                 std::wstring e = c.url.substr(m.size());
-                // обрежем параметры после '?'
                 size_t q = e.find(L'?'); if (q != std::wstring::npos) e = e.substr(0, q);
                 return e;
             }
         }
-        // иначе попробуем вытащить что-то похожее на e-mail прямо из url
         std::wstring f = ExtractEmailFromText(c.url);
         if (!f.empty()) return f;
     }
-    // 2) из заметки
     if (!c.note.empty()) {
         std::wstring f = ExtractEmailFromText(c.note);
         if (!f.empty()) return f;
     }
     return L"";
+}
+
+// ---------- clipboard ----------
+static void SetClipboardTextW(HWND h, const std::wstring& text) {
+    if (!OpenClipboard(h)) return;
+    EmptyClipboard();
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (hmem) {
+        void* p = GlobalLock(hmem);
+        memcpy(p, text.c_str(), bytes);
+        GlobalUnlock(hmem);
+        SetClipboardData(CF_UNICODETEXT, hmem);
+    }
+    CloseClipboard();
 }
 
 // ---------- GDI+ helper ----------
@@ -174,7 +196,6 @@ static void DrawLabel(HDC dc, HFONT f, int x, int y, const std::wstring& label, 
 static void DrawNameField(HDC dc, Fonts& f, HWND h, int x, int& y, int w, const std::wstring& name) {
     // Label
     DrawLabel(dc, f.hBold, x, y, L"Name:", RGB(90, 90, 90));
-    // Нормальный отступ под значение
     y += S(h, 22);
 
     // Value
@@ -183,12 +204,14 @@ static void DrawNameField(HDC dc, Fonts& f, HWND h, int x, int& y, int w, const 
     y += used + S(h, 10);
 }
 
-static void DrawLabelValue(HDC dc, Fonts& f, int x, int& y, int w,
+// Нарисовать пару "Label: value" и вернуть прямоугольник value (для хит-теста)
+static RECT DrawLabelValueWithRect(HDC dc, Fonts& f, int x, int& y, int w,
     const std::wstring& label, const std::wstring& value,
     COLORREF labCol, COLORREF valCol,
     HWND hWnd)
 {
-    if (value.empty()) return;
+    RECT empty{ 0,0,0,0 };
+    if (value.empty()) return empty;
 
     // label + ": "
     std::wstring lab = label + L": ";
@@ -207,6 +230,13 @@ static void DrawLabelValue(HDC dc, Fonts& f, int x, int& y, int w,
 
     y += std::max(S(hWnd, 22), hUsed) + S(hWnd, 6);
     SelectObject(dc, old);
+
+    // вернуть фактический прямоугольник value
+    RECT calc = rcVal;
+    HFONT oldN = (HFONT)SelectObject(dc, f.hNorm);
+    DrawTextW(dc, value.c_str(), (int)value.size(), &calc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+    SelectObject(dc, oldN);
+    return calc;
 }
 
 // ---------- left list (2 lines + inside scrollbar control) ----------
@@ -224,7 +254,7 @@ static void UpdateListScrollbar(ViewState* st, int total) {
     si.nPage = std::max(1, st->perPage);
     si.nPos = std::min(st->listScroll, std::max(0, total - st->perPage));
     SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
-    ShowWindow(st->hScroll, (total > st->perPage) ? SW_SHOW : SW_HIDE); // можно поставить SW_SHOW всегда
+    ShowWindow(st->hScroll, (total > st->perPage) ? SW_SHOW : SW_HIDE);
 }
 
 static int ListPaneWidth(HWND h) { return S(h, 260); }
@@ -288,7 +318,6 @@ static void RenderList(HDC dc, HWND h, ViewState* st,
         SetTextColor(dc, RGB(110, 110, 110));
         std::wstring subShow = sub;
         if (subShow.empty()) {
-            // Левый подзаголовок тоже пытается показать email из fallback
             std::wstring fb = FallbackEmail(c);
             if (!fb.empty()) subShow = L"Email: " + fb;
         }
@@ -315,8 +344,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st = new ViewState();
         SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)st);
         MakeFonts(h, st->fonts);
+
+        // GDI+ init
         static ULONG_PTR gdipToken = 0;
-        if (!gdipToken) { GdiplusStartupInput gi; GdiplusStartup(&gdipToken, &gi, nullptr); }
+        if (!gdipToken) {
+            GdiplusStartupInput gi;
+            GdiplusStartup(&gdipToken, &gi, nullptr);
+        }
 
         // создаем ЛЕВЫЙ вертикальный скроллбар (внутри окна)
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
@@ -336,7 +370,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE: {
         if (!st) break;
         st->listItemH = 0;
-        // позиционируем полосу прокрутки у края левой панели
         int listW = ListPaneWidth(h);
         int sbw = ScrollbarWidth();
         int cy = HIWORD(l);
@@ -373,7 +406,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 st->listScroll = pos;
                 InvalidateRect(h, nullptr, TRUE);
             }
-            // sync pos
             SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_POS; si.nPos = st->listScroll;
             SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
             return 0;
@@ -389,7 +421,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int step = (delta > 0) ? -1 : +1;
             int maxScroll = std::max(0, (int)st->contacts.size() - st->perPage);
             st->listScroll = std::max(0, std::min(maxScroll, st->listScroll + step));
-            // обновим контрол
             SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_POS; si.nPos = st->listScroll;
             SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
             InvalidateRect(h, nullptr, TRUE);
@@ -398,15 +429,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_LBUTTONDOWN: {
-        // только выбор элемента списка, без ссылок
         if (!st) break;
         int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
-        // вычислим индекс по координате
+
+        // попадание в левый список -> смена выделенного контакта
         int pad = S(h, 8);
-        int top = pad;
         int listW = ListPaneWidth(h) - ScrollbarWidth();
         if (x >= pad && x < listW - pad) {
-            int row = (y - top) / (st->listItemH ? st->listItemH : S(h, 52));
+            int rowH = st->listItemH ? st->listItemH : S(h, 52);
+            int row = (y - pad) / rowH;
             if (row >= 0) {
                 size_t idx = (size_t)(st->listScroll + row);
                 if (idx < st->contacts.size()) {
@@ -418,37 +449,24 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
-    case WM_KEYDOWN: {
+    case WM_RBUTTONDOWN: {
         if (!st) break;
-        if (w == VK_UP) {
-            if (st->sel > 0) { st->sel--; if ((int)st->sel < st->listScroll) st->listScroll = (int)st->sel; InvalidateRect(h, nullptr, TRUE); }
-            return 0;
+        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
+        st->contextField = -1;
+        for (int i = (int)st->fields.size() - 1; i >= 0; --i) {
+            if (PtIn(st->fields[i].rc, x, y)) { st->contextField = i; break; }
         }
-        if (w == VK_DOWN) {
-            if (st->sel + 1 < st->contacts.size()) {
-                st->sel++;
-                RECT rc; GetClientRect(h, &rc);
-                int innerH = rc.bottom - rc.top - S(h, 16);
-                if (!st->listItemH) st->listItemH = S(h, 52);
-                int perPage = std::max(1, innerH / st->listItemH);
-                if ((int)st->sel >= st->listScroll + perPage) st->listScroll = (int)st->sel - (perPage - 1);
-                InvalidateRect(h, nullptr, TRUE);
+        if (st->contextField >= 0) {
+            HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(hMenu, MF_STRING, 1, L"Копировать");
+            POINT pt; pt.x = x; pt.y = y; ClientToScreen(h, &pt);
+            int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                pt.x, pt.y, 0, h, nullptr);
+            DestroyMenu(hMenu);
+            if (cmd == 1) {
+                std::wstring txt = st->fields[st->contextField].value;
+                if (!txt.empty()) SetClipboardTextW(h, txt);
             }
-            return 0;
-        }
-        if (w == VK_PRIOR) {
-            st->listScroll = std::max(0, st->listScroll - std::max(1, st->perPage - 1));
-            InvalidateRect(h, nullptr, TRUE); return 0;
-        }
-        if (w == VK_NEXT) {
-            st->listScroll = std::min(std::max(0, (int)st->contacts.size() - st->perPage), st->listScroll + std::max(1, st->perPage - 1));
-            InvalidateRect(h, nullptr, TRUE); return 0;
-        }
-        if (w == VK_HOME) { st->listScroll = 0; st->sel = 0; InvalidateRect(h, nullptr, TRUE); return 0; }
-        if (w == VK_END) {
-            st->sel = st->contacts.empty() ? 0 : st->contacts.size() - 1;
-            st->listScroll = std::max(0, (int)st->contacts.size() - st->perPage);
-            InvalidateRect(h, nullptr, TRUE); return 0;
         }
         return 0;
     }
@@ -468,7 +486,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // разделитель
         RECT sep{ listW, rc.top, listW + 1, rc.bottom }; FillRect(mem, &sep, (HBRUSH)GetStockObject(GRAY_BRUSH));
 
-        // правая панель (все поля контакта)
+        // правая панель
+        st->fields.clear();
+
         if (st->sel < st->contacts.size()) {
             int dx = listW + S(h, 12);
             int dy = rc.top + S(h, 12);
@@ -501,50 +521,44 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
 
             auto& F = st->fonts;
-            if (!c.org.empty())   DrawLabelValue(mem, F, dx, dy, dw, L"Org", c.org, RGB(90, 90, 90), RGB(30, 30, 30), h);
-            if (!c.title.empty()) DrawLabelValue(mem, F, dx, dy, dw, L"Role", c.title, RGB(90, 90, 90), RGB(30, 30, 30), h);
-            if (!c.url.empty())   DrawLabelValue(mem, F, dx, dy, dw, L"URL", c.url, RGB(90, 90, 90), RGB(30, 30, 30), h);
-            if (!c.bday.empty())  DrawLabelValue(mem, F, dx, dy, dw, L"BDay", c.bday, RGB(90, 90, 90), RGB(30, 30, 30), h);
 
-            // Phones
+            auto pushField = [&](const std::wstring& lab, const std::wstring& val) {
+                // рисуем и запоминаем прямоугольник значения
+                RECT r = DrawLabelValueWithRect(mem, F, dx, dy, dw, lab, val,
+                    RGB(90, 90, 90), RGB(30, 30, 30), h);
+                FieldHit fh; fh.rc = r; fh.label = lab; fh.value = val;
+                st->fields.push_back(std::move(fh));
+                };
+
+            if (!c.org.empty())   pushField(L"Org", c.org);
+            if (!c.title.empty()) pushField(L"Role", c.title);
+            if (!c.url.empty())   pushField(L"URL", c.url);
+            if (!c.bday.empty())  pushField(L"BDay", c.bday);
+
+            // Phones — показываем только число (без типов HOME/WORK/…)
             for (auto& p : c.phones) {
                 if (p.number.empty()) continue;
-                std::wstring val = p.number;
-                if (!p.types.empty()) {
-                    std::wstring types;
-                    for (size_t i = 0; i < p.types.size(); ++i) { if (i) types += L","; types += p.types[i]; }
-                    val += L" (" + types + L")";
-                }
-                DrawLabelValue(mem, F, dx, dy, dw, L"Phone", val, RGB(90, 90, 90), RGB(30, 30, 30), h);
+                pushField(L"Phone", p.number);
             }
 
-            // Emails (primary) — если пусто, используем fallback
+            // Emails — только адрес (без типов)
             bool anyEmail = false;
             for (auto& e : c.emails) {
                 if (e.addr.empty()) continue;
                 anyEmail = true;
-                std::wstring val = e.addr;
-                if (!e.types.empty()) {
-                    std::wstring types;
-                    for (size_t i = 0; i < e.types.size(); ++i) { if (i) types += L","; types += e.types[i]; }
-                    val += L" (" + types + L")";
-                }
-                DrawLabelValue(mem, F, dx, dy, dw, L"Email", val, RGB(90, 90, 90), RGB(30, 30, 30), h);
+                pushField(L"Email", e.addr);
             }
             if (!anyEmail) {
                 std::wstring fb = FallbackEmail(c);
-                if (!fb.empty()) {
-                    DrawLabelValue(mem, F, dx, dy, dw, L"Email", fb, RGB(90, 90, 90), RGB(30, 30, 30), h);
-                }
+                if (!fb.empty()) pushField(L"Email", fb);
             }
 
-            // Addresses
             for (auto& a : c.addrs) {
                 if (a.text.empty()) continue;
-                DrawLabelValue(mem, F, dx, dy, dw, L"Address", a.text, RGB(90, 90, 90), RGB(30, 30, 30), h);
+                pushField(L"Address", a.text);
             }
             if (!c.note.empty()) {
-                DrawLabelValue(mem, F, dx, dy, dw, L"Note", c.note, RGB(90, 90, 90), RGB(30, 30, 30), h);
+                pushField(L"Note", c.note);
             }
         }
 
@@ -577,6 +591,7 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     st->contacts = contacts;
     st->sel = 0;
     st->listScroll = 0;
+    st->contextField = -1;
     InvalidateRect(h, nullptr, TRUE);
 }
 
@@ -593,11 +608,12 @@ void VCFView_SetSelection(HWND h, size_t idx) {
     if (!st) return;
     if (idx < st->contacts.size()) {
         st->sel = idx;
+        st->contextField = -1;
         InvalidateRect(h, nullptr, TRUE);
     }
 }
 
-// Search helpers
+// Поиск — без изменений
 static bool isWordBoundary(const std::wstring& s, size_t pos) { return (pos == 0) || !iswalnum(s[pos - 1]); }
 static bool isWordBoundary2(const std::wstring& s, size_t pos) { return (pos >= s.size()) || !iswalnum(s[pos]); }
 
@@ -652,4 +668,4 @@ bool VCFView_Search(HWND h, const std::wstring& needle) {
     return VCFView_SearchEx(h, needle, 0, /*backwards*/false, /*matchCase*/false, /*whole*/false, /*wrap*/true);
 }
 
-bool VCFView_CopyActive(HWND) { return false; } // отключено
+bool VCFView_CopyActive(HWND) { return false; } // не используется
