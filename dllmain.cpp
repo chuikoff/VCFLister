@@ -1,4 +1,4 @@
-// dllmain.cpp — Total Commander WLX64 плагин (VCF Lister)
+// dllmain.cpp вЂ” Total Commander WLX64 РїР»Р°РіРёРЅ (VCF Lister)
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -11,18 +11,18 @@
 #include <vector>
 #include <fstream>
 
-#include "listplug.h"      // из TC SDK (wlx)
-#include "vcf_parser.hpp"  // наш парсер vCard
-#include "vcf_view.hpp"    // наше окно-рендер
+#include "listplug.h"      // РёР· TC SDK (wlx)
+#include "vcf_parser.hpp"  // РЅР°С€ РїР°СЂСЃРµСЂ vCard
+#include "vcf_view.hpp"    // РЅР°С€Рµ РѕРєРЅРѕ-СЂРµРЅРґРµСЂ
 
-// ---- guards: не даем исключениям вылетать в Total Commander ----
+// ---- guards: РЅРµ РґР°РµРј РёСЃРєР»СЋС‡РµРЅРёСЏРј РІС‹Р»РµС‚Р°С‚СЊ РІ Total Commander ----
 #define TRY_API     try {
 #define CATCH_API(r) } catch (...) { return (r); }
 
 #define TRY_VOID    try {
 #define CATCH_VOID  } catch (...) { /* swallow */ }
 
-// ---------- утилита: читаем файл в wstring с корректной детекцией кодировки ----------
+// ---------- СѓС‚РёР»РёС‚Р°: С‡РёС‚Р°РµРј С„Р°Р№Р» РІ wstring СЃ РєРѕСЂСЂРµРєС‚РЅРѕР№ РґРµС‚РµРєС†РёРµР№ РєРѕРґРёСЂРѕРІРєРё ----------
 static std::wstring ReadWholeFileAsWide(const wchar_t* path)
 {
     std::wstring empty;
@@ -34,7 +34,7 @@ static std::wstring ReadWholeFileAsWide(const wchar_t* path)
 
     auto tryMbToW = [](const char* data, int len, UINT cp, bool strictUTF8 = false)->std::wstring {
         DWORD flags = 0;
-        if (strictUTF8 && cp == CP_UTF8) flags = MB_ERR_INVALID_CHARS; // важный флаг!
+        if (strictUTF8 && cp == CP_UTF8) flags = MB_ERR_INVALID_CHARS; // РІР°Р¶РЅС‹Р№ С„Р»Р°Рі!
         int wlen = MultiByteToWideChar(cp, flags, data, len, nullptr, 0);
         if (wlen <= 0) return L"";
         std::wstring w(wlen, L'\0');
@@ -56,7 +56,7 @@ static std::wstring ReadWholeFileAsWide(const wchar_t* path)
         return tryMbToW(buf.data() + 3, (int)buf.size() - 3, CP_UTF8, /*strict*/true);
     }
 
-    // 1) строгий UTF-8 (если невалидно — вернётся пусто)
+    // 1) СЃС‚СЂРѕРіРёР№ UTF-8 (РµСЃР»Рё РЅРµРІР°Р»РёРґРЅРѕ вЂ” РІРµСЂРЅС‘С‚СЃСЏ РїСѓСЃС‚Рѕ)
     std::wstring w = tryMbToW(buf.data(), (int)buf.size(), CP_UTF8, /*strict*/true);
     if (!w.empty()) return w;
 
@@ -64,18 +64,18 @@ static std::wstring ReadWholeFileAsWide(const wchar_t* path)
     w = tryMbToW(buf.data(), (int)buf.size(), 1251);
     if (!w.empty()) return w;
 
-    // 3) OEM (866) — иногда исходники такие
+    // 3) OEM (866) вЂ” РёРЅРѕРіРґР° РёСЃС…РѕРґРЅРёРєРё С‚Р°РєРёРµ
     w = tryMbToW(buf.data(), (int)buf.size(), CP_OEMCP);
     if (!w.empty()) return w;
 
-    // 4) Системная ACP как последний шанс
+    // 4) РЎРёСЃС‚РµРјРЅР°СЏ ACP РєР°Рє РїРѕСЃР»РµРґРЅРёР№ С€Р°РЅСЃ
     return tryMbToW(buf.data(), (int)buf.size(), CP_ACP);
 }
 
 
-// -------------------- ЭКСПОРТЫ ПЛАГИНА --------------------
+// -------------------- Р­РљРЎРџРћР РўР« РџР›РђР“РРќРђ --------------------
 
-// ВАЖНО: в проекте должна остаться РОВНО ОДНА такая функция (ANSI, int)
+// Р’РђР–РќРћ: РІ РїСЂРѕРµРєС‚Рµ РґРѕР»Р¶РЅР° РѕСЃС‚Р°С‚СЊСЃСЏ Р РћР’РќРћ РћР”РќРђ С‚Р°РєР°СЏ С„СѓРЅРєС†РёСЏ (ANSI, int)
 int __stdcall ListGetDetectString(char* DetectString, int maxlen)
 {
     TRY_API
@@ -114,13 +114,13 @@ void __stdcall ListCloseWindow(HWND ListWin)
     CATCH_VOID
 }
 
-// Поиск (Ctrl+F, F3/Shift+F3)
+// РџРѕРёСЃРє (Ctrl+F, F3/Shift+F3)
 int __stdcall ListSearchTextW(HWND ListWin, wchar_t* SearchString, int SearchParameter)
 {
     TRY_API
         if (!ListWin || !SearchString) return LISTPLUGIN_ERROR;
 
-    // fallback-флаги (если старый listplug.h)
+    // fallback-С„Р»Р°РіРё (РµСЃР»Рё СЃС‚Р°СЂС‹Р№ listplug.h)
 #ifndef lcs_findfirst
 #define lcs_findfirst 1
 #endif

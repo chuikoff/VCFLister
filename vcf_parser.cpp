@@ -1,4 +1,4 @@
-// vcf_parser.cpp — vCard 2.1/3.0 parser with Quoted-Printable (multi-line) + CHARSET support
+// vcf_parser.cpp вЂ” vCard 2.1/3.0 parser with Quoted-Printable (multi-line) + CHARSET support
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -173,13 +173,13 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
 {
     std::vector<Contact> contacts;
 
-    // 1) Разворачиваем только «space/tab folded» строки (стандарт RFC)
+    // 1) Р Р°Р·РІРѕСЂР°С‡РёРІР°РµРј С‚РѕР»СЊРєРѕ В«space/tab foldedВ» СЃС‚СЂРѕРєРё (СЃС‚Р°РЅРґР°СЂС‚ RFC)
     auto lines = unfoldLines_fold_prefix(text);
 
     Contact cur;
     bool inCard = false;
 
-    // идём по физическим строкам с индексом (чтобы уметь смотреть вперёд)
+    // РёРґС‘Рј РїРѕ С„РёР·РёС‡РµСЃРєРёРј СЃС‚СЂРѕРєР°Рј СЃ РёРЅРґРµРєСЃРѕРј (С‡С‚РѕР±С‹ СѓРјРµС‚СЊ СЃРјРѕС‚СЂРµС‚СЊ РІРїРµСЂС‘Рґ)
     for (size_t idx = 0; idx < lines.size(); ++idx) {
         auto raw = trim(lines[idx]);
         if (raw.empty()) continue;
@@ -191,7 +191,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         if (!inCard) continue;
 
         size_t colon = raw.find(L':');
-        if (colon == std::wstring::npos) continue; // пропускаем мусорные строки (например, продолжение QP без двоеточия, встретиться тут не должно)
+        if (colon == std::wstring::npos) continue; // РїСЂРѕРїСѓСЃРєР°РµРј РјСѓСЃРѕСЂРЅС‹Рµ СЃС‚СЂРѕРєРё (РЅР°РїСЂРёРјРµСЂ, РїСЂРѕРґРѕР»Р¶РµРЅРёРµ QP Р±РµР· РґРІРѕРµС‚РѕС‡РёСЏ, РІСЃС‚СЂРµС‚РёС‚СЊСЃСЏ С‚СѓС‚ РЅРµ РґРѕР»Р¶РЅРѕ)
 
         std::wstring left = raw.substr(0, colon);
         std::wstring value = raw.substr(colon + 1);
@@ -203,7 +203,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         std::vector<std::wstring> params;
         for (size_t i = 1; i < parts.size(); ++i) params.push_back(parts[i]);
 
-        // параметры
+        // РїР°СЂР°РјРµС‚СЂС‹
         bool encQP = false;
         std::wstring charset;
         for (auto& p : params) {
@@ -217,25 +217,25 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             }
         }
 
-        // 2) Специально для vCard 2.1 + QP:
-        // склеиваем последующие строки БЕЗ двоеточия (чаще всего начинаются с '='),
-        // так как это продолжение значения (мягкий перенос QP).
+        // 2) РЎРїРµС†РёР°Р»СЊРЅРѕ РґР»СЏ vCard 2.1 + QP:
+        // СЃРєР»РµРёРІР°РµРј РїРѕСЃР»РµРґСѓСЋС‰РёРµ СЃС‚СЂРѕРєРё Р‘Р•Р— РґРІРѕРµС‚РѕС‡РёСЏ (С‡Р°С‰Рµ РІСЃРµРіРѕ РЅР°С‡РёРЅР°СЋС‚СЃСЏ СЃ '='),
+        // С‚Р°Рє РєР°Рє СЌС‚Рѕ РїСЂРѕРґРѕР»Р¶РµРЅРёРµ Р·РЅР°С‡РµРЅРёСЏ (РјСЏРіРєРёР№ РїРµСЂРµРЅРѕСЃ QP).
         if (encQP) {
             while (idx + 1 < lines.size()) {
                 const std::wstring& nextRaw = lines[idx + 1];
-                // если следующая строка уже начинается как новое свойство (есть ':'), выходим
+                // РµСЃР»Рё СЃР»РµРґСѓСЋС‰Р°СЏ СЃС‚СЂРѕРєР° СѓР¶Рµ РЅР°С‡РёРЅР°РµС‚СЃСЏ РєР°Рє РЅРѕРІРѕРµ СЃРІРѕР№СЃС‚РІРѕ (РµСЃС‚СЊ ':'), РІС‹С…РѕРґРёРј
                 if (nextRaw.find(L':') != std::wstring::npos) break;
-                // иначе это продолжение QP-значения
+                // РёРЅР°С‡Рµ СЌС‚Рѕ РїСЂРѕРґРѕР»Р¶РµРЅРёРµ QP-Р·РЅР°С‡РµРЅРёСЏ
                 value += L"\n";
-                value += nextRaw;  // важен именно перевод строки, чтобы "=\n" убрался декодером
+                value += nextRaw;  // РІР°Р¶РµРЅ РёРјРµРЅРЅРѕ РїРµСЂРµРІРѕРґ СЃС‚СЂРѕРєРё, С‡С‚РѕР±С‹ "=\n" СѓР±СЂР°Р»СЃСЏ РґРµРєРѕРґРµСЂРѕРј
                 ++idx;
             }
         }
 
-        // декодирование и unescape
+        // РґРµРєРѕРґРёСЂРѕРІР°РЅРёРµ Рё unescape
         std::wstring v = unescape(decodeTextValue(value, encQP, charset));
 
-        // раскладываем по полям
+        // СЂР°СЃРєР»Р°РґС‹РІР°РµРј РїРѕ РїРѕР»СЏРј
         if (name == L"N") {
             auto vs = split(v, L';');
             if (vs.size() >= 1) cur.n_family = vs[0];
@@ -280,11 +280,11 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                 joined += t;
             }
             if (!joined.empty()) {
-                Address a; a.text = joined; // Address::types не используем
+                Address a; a.text = joined; // Address::types РЅРµ РёСЃРїРѕР»СЊР·СѓРµРј
                 cur.addrs.push_back(std::move(a));
             }
         }
-        // PHOTO/base64 и частные X-* поля можно добавить при необходимости
+        // PHOTO/base64 Рё С‡Р°СЃС‚РЅС‹Рµ X-* РїРѕР»СЏ РјРѕР¶РЅРѕ РґРѕР±Р°РІРёС‚СЊ РїСЂРё РЅРµРѕР±С…РѕРґРёРјРѕСЃС‚Рё
     }
 
     if (inCard) contacts.push_back(cur);

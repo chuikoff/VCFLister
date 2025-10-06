@@ -1,4 +1,4 @@
-﻿// vcf_view.cpp - VCF Lister view with right-click "Copy" (no Ctrl+C), clean values (no type tails)
+// vcf_view.cpp - VCF Lister view with right-click "Copy" (no Ctrl+C), clean values (no type tails)
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
