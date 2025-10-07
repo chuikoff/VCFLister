@@ -29,7 +29,6 @@ static int Dpi(HWND h) {
     return dpi ? dpi : 96;
 }
 static int S(HWND h, int px) { return MulDiv(px, Dpi(h), 96); }
-
 // ---------- Fonts ----------
 struct Fonts {
     HFONT hTitle = nullptr; // big value
@@ -88,6 +87,22 @@ struct ViewState {
 
     Fonts fonts;
 };
+static void EnsureSelVisible(HWND h, ViewState* st) {
+    RECT rc; GetClientRect(h, &rc);
+    int innerH = rc.bottom - rc.top - S(h, 16);
+    int rowH = st->listItemH ? st->listItemH : S(h, 52);
+    int per = std::max(1, innerH / rowH);
+    st->perPage = per;
+
+    int sel = (int)st->sel;
+    if (sel < st->listScroll) st->listScroll = sel;
+    else if (sel >= st->listScroll + per) st->listScroll = sel - (per - 1);
+
+    if (st->listScroll < 0) st->listScroll = 0;
+    int maxScroll = std::max(0, (int)st->contacts.size() - per);
+    if (st->listScroll > maxScroll) st->listScroll = maxScroll;
+}
+
 
 // hit-test helper
 static inline bool PtIn(const RECT& r, int x, int y) {
@@ -290,10 +305,16 @@ static void RenderList(HDC dc, HWND h, ViewState* st,
         std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
         if (name.empty()) name = L"(no name)";
 
+        std::wstring sub;
         std::wstring pv = PrimaryPhone(c);
-        std::wstring subLabel = !pv.empty() ? L"Tel: " : L"Email: ";
-        if (pv.empty()) pv = PrimaryEmail(c);
-        std::wstring sub = subLabel + pv;
+        if (!pv.empty()) {
+            sub = L"Tel: " + pv;
+        }
+        else {
+            std::wstring em = PrimaryEmail(c);
+            if (!em.empty()) sub = L"Email: " + em;
+        }
+
 
         RECT item{ x + pad, ycur, x + wList - pad, ycur + st->listItemH - S(h,2) };
         HBRUSH ibg = CreateSolidBrush(idx == st->sel ? RGB(219, 234, 254) : RGB(248, 248, 248));
@@ -608,6 +629,7 @@ void VCFView_SetSelection(HWND h, size_t idx) {
     if (!st) return;
     if (idx < st->contacts.size()) {
         st->sel = idx;
+        EnsureSelVisible(h, st);
         st->contextField = -1;
         InvalidateRect(h, nullptr, TRUE);
     }
@@ -653,8 +675,10 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle,
         while (pos != std::wstring::npos) {
             if (!wholeWord || (isWordBoundary(hay, pos) && isWordBoundary2(hay, pos + n.size()))) {
                 st->sel = i;
+                EnsureSelVisible(h, st);
                 InvalidateRect(h, nullptr, TRUE);
                 return true;
+
             }
             pos = hay.find(n, pos + 1);
         }
