@@ -1,6 +1,4 @@
-// vcf_parser.cpp — vCard 2.1/3.0 parser with Quoted-Printable (multi-line) + CHARSET support
-#define UNICODE
-#define _UNICODE
+// vcf_parser.cpp — vCard 2.1/3.0 parser with QP + BASE64 photo
 #define NOMINMAX
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
@@ -14,7 +12,7 @@
 
 #include "vcf_parser.hpp"
 
-// ---------- utils ----------
+// ---------- helpers ----------
 static inline std::wstring trim(const std::wstring& s) {
     size_t a = 0, b = s.size();
     while (a < b && iswspace(s[a])) ++a;
@@ -49,7 +47,34 @@ static std::wstring unescape(const std::wstring& s) {
     return r;
 }
 
-// unfold "folded" vCard lines where the continuation starts with space or tab (RFC)
+// --- Base64 decode (ASCII, игнорирует пробелы/переводы строк) ---
+static std::vector<uint8_t> Base64Decode(const std::string& s) {
+    auto val = [](unsigned char c)->int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+        };
+    std::vector<uint8_t> out;
+    int v = 0, vb = -8;
+    for (unsigned char c : s) {
+        if (c <= ' ') continue; // пропускаем пробелы/CRLF/TAB
+        if (c == '=') break;
+        int d = val(c);
+        if (d < 0) continue;
+        v = (v << 6) | d;
+        vb += 6;
+        if (vb >= 0) {
+            out.push_back((uint8_t)((v >> vb) & 0xFF));
+            vb -= 8;
+        }
+    }
+    return out;
+}
+
+// Разворачивание «сложенных» строк: строки, начинающиеся с пробела/таба, — продолжение предыдущей
 static std::vector<std::wstring> unfoldLines_fold_prefix(const std::wstring& text) {
     std::vector<std::wstring> raw;
     std::wstring cur;
@@ -168,18 +193,26 @@ static std::vector<std::wstring> parseTypes(const std::vector<std::wstring>& par
     return out;
 }
 
+// helper: положить embedded-фото в Contact::photo
+static void setEmbeddedPhoto(Contact& c, std::vector<uint8_t> bytes)
+{
+    if (bytes.empty()) return;
+    Photo ph;
+    ph.bytes = std::move(bytes);
+    c.photo = std::move(ph);
+}
+
 // ---------- main parser ----------
 std::vector<Contact> ParseVCard(const std::wstring& text)
 {
     std::vector<Contact> contacts;
 
-    // 1) Разворачиваем только «space/tab folded» строки (стандарт RFC)
+    // 1) Разворачиваем «сложенные» строки: продолжения начинаются с пробела/таба
     auto lines = unfoldLines_fold_prefix(text);
 
     Contact cur;
     bool inCard = false;
 
-    // идём по физическим строкам с индексом (чтобы уметь смотреть вперёд)
     for (size_t idx = 0; idx < lines.size(); ++idx) {
         auto raw = trim(lines[idx]);
         if (raw.empty()) continue;
@@ -191,7 +224,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         if (!inCard) continue;
 
         size_t colon = raw.find(L':');
-        if (colon == std::wstring::npos) continue; // пропускаем мусорные строки (например, продолжение QP без двоеточия, встретиться тут не должно)
+        if (colon == std::wstring::npos) continue;
 
         std::wstring left = raw.substr(0, colon);
         std::wstring value = raw.substr(colon + 1);
@@ -203,76 +236,78 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         std::vector<std::wstring> params;
         for (size_t i = 1; i < parts.size(); ++i) params.push_back(parts[i]);
 
-        // параметры
         bool encQP = false;
         std::wstring charset;
+
+        // флаги для PHOTO
+        bool photoIsBase64 = false;
+        bool photoIsURL = false;
+
         for (auto& p : params) {
             auto P = upper(p);
             if (P.rfind(L"ENCODING=", 0) == 0) {
                 auto v = P.substr(9);
                 if (v == L"QUOTED-PRINTABLE" || v == L"QP") encQP = true;
+                if (v == L"BASE64" || v == L"B") photoIsBase64 = true;
             }
             else if (P.rfind(L"CHARSET=", 0) == 0) {
                 charset = p.substr(8);
             }
+            else if (P.rfind(L"VALUE=", 0) == 0) {
+                auto v = P.substr(6);
+                if (v == L"URL") photoIsURL = true;
+            }
         }
 
-        // 2) Специально для vCard 2.1 + QP:
-        // склеиваем последующие строки БЕЗ двоеточия (чаще всего начинаются с '='),
-        // так как это продолжение значения (мягкий перенос QP).
+        // Для vCard 2.1 + QP: склеиваем последующие строки БЕЗ двоеточия — это продолжение QP
         if (encQP) {
             while (idx + 1 < lines.size()) {
                 const std::wstring& nextRaw = lines[idx + 1];
-                // если следующая строка уже начинается как новое свойство (есть ':'), выходим
                 if (nextRaw.find(L':') != std::wstring::npos) break;
-                // иначе это продолжение QP-значения
                 value += L"\n";
-                value += nextRaw;  // важен именно перевод строки, чтобы "=\n" убрался декодером
+                value += nextRaw;
                 ++idx;
             }
         }
 
-        // декодирование и unescape
-        std::wstring v = unescape(decodeTextValue(value, encQP, charset));
-
-        // раскладываем по полям
+        // ----- раскладываем по полям -----
         if (name == L"N") {
-            auto vs = split(v, L';');
-            if (vs.size() >= 1) cur.n_family = vs[0];
-            if (vs.size() >= 2) cur.n_given = vs[1];
+            auto vs = split(value, L';');
+            if (vs.size() >= 1) cur.n_family = unescape(decodeTextValue(vs[0], encQP, charset));
+            if (vs.size() >= 2) cur.n_given = unescape(decodeTextValue(vs[1], encQP, charset));
         }
         else if (name == L"FN") {
-            cur.fn = v;
+            cur.fn = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (name == L"ORG") {
-            cur.org = v;
+            cur.org = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (name == L"TITLE") {
-            cur.title = v;
+            cur.title = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (name == L"URL") {
-            cur.url = v;
+            cur.url = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (name == L"BDAY") {
-            cur.bday = v;
+            cur.bday = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (name == L"NOTE") {
-            cur.note = v;
+            cur.note = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (name == L"TEL") {
             Phone p;
-            p.number = v;
+            p.number = unescape(decodeTextValue(value, encQP, charset));
             p.types = parseTypes(params);
             if (!p.number.empty()) cur.phones.push_back(std::move(p));
         }
         else if (name == L"EMAIL") {
             Email e;
-            e.addr = v;
+            e.addr = unescape(decodeTextValue(value, encQP, charset));
             e.types = parseTypes(params);
             if (!e.addr.empty()) cur.emails.push_back(std::move(e));
         }
         else if (name == L"ADR") {
-            auto vs = split(v, L';');
+            auto vs = split(unescape(decodeTextValue(value, encQP, charset)), L';');
             std::wstring joined;
             for (auto& part : vs) {
                 auto t = trim(part); if (t.empty()) continue;
@@ -280,11 +315,37 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                 joined += t;
             }
             if (!joined.empty()) {
-                Address a; a.text = joined; // Address::types не используем
+                Address a; a.text = joined;
                 cur.addrs.push_back(std::move(a));
             }
         }
-        // PHOTO/base64 и частные X-* поля можно добавить при необходимости
+        else if (name == L"PHOTO") {
+            // 1) PHOTO;VALUE=URL:...
+            if (photoIsURL) {
+                cur.photo_url = unescape(decodeTextValue(value, encQP, charset));
+            }
+            // 2) PHOTO;ENCODING=BASE64: (в v2.1 строки часто «сложены» с пробелом в начале)
+            else if (photoIsBase64) {
+                // склеим возможные продолжения (начинаются с пробела/таба)
+                size_t j = idx;
+                while (j + 1 < lines.size()) {
+                    const std::wstring& nxt = lines[j + 1];
+                    if (!nxt.empty() && (nxt[0] == L' ' || nxt[0] == L'\t')) {
+                        value.append(nxt.c_str() + 1);
+                        ++j;
+                    }
+                    else break;
+                }
+                idx = j;
+
+                // wstring -> ASCII (base64 ASCII-only)
+                std::string b64; b64.reserve(value.size());
+                for (wchar_t wc : value) if (wc <= 0x7F) b64.push_back((char)wc);
+
+                auto bytes = Base64Decode(b64);
+                setEmbeddedPhoto(cur, std::move(bytes));
+            }
+        }
     }
 
     if (inCard) contacts.push_back(cur);
