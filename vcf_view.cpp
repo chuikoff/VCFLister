@@ -19,6 +19,26 @@
 
 #include "vcf_view.hpp"
 
+// Надёжное понижение регистра (Unicode, независимо от локали)
+static std::wstring LowerInvariant(const std::wstring& s) {
+    if (s.empty()) return s;
+
+    // -1 => источник с терминальным '\0'; функция вернёт размер с учётом '\0'
+    int need = LCMapStringW(LOCALE_INVARIANT, LCMAP_LOWERCASE, s.c_str(), -1, nullptr, 0);
+    if (need <= 0) {
+        // фолбэк: towlower (на всякий случай)
+        std::wstring t = s;
+        std::transform(t.begin(), t.end(), t.begin(), ::towlower);
+        return t;
+    }
+    std::wstring out;
+    out.resize(need);
+    LCMapStringW(LOCALE_INVARIANT, LCMAP_LOWERCASE, s.c_str(), -1, &out[0], need);
+    if (!out.empty() && out.back() == L'\0') out.pop_back(); // убрать завершающий нуль
+    return out;
+}
+
+
 using namespace Gdiplus;
 
 // ---------- DPI helpers ----------
@@ -646,10 +666,9 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle,
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
     if (!st || st->contacts.empty() || needle.empty()) return false;
 
-    // Всегда игнорируем регистр (кириллица/латиница)
-    auto norm = [&](std::wstring x) {
-        std::transform(x.begin(), x.end(), x.begin(), ::towlower);
-        return x;
+    // Всегда игнорируем регистр (Unicode-safe)
+    auto norm = [&](const std::wstring& x) {
+        return LowerInvariant(x);
         };
     std::wstring n = norm(needle);
 
