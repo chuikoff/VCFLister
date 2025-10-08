@@ -646,18 +646,26 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle,
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
     if (!st || st->contacts.empty() || needle.empty()) return false;
 
+    // Всегда игнорируем регистр (кириллица/латиница)
     auto norm = [&](std::wstring x) {
-        if (!matchCase) { std::transform(x.begin(), x.end(), x.begin(), ::towlower); }
+        std::transform(x.begin(), x.end(), x.begin(), ::towlower);
         return x;
         };
     std::wstring n = norm(needle);
+
+    auto isWordBoundary = [](const std::wstring& s, size_t pos) {
+        return (pos == 0) || !iswalnum(s[pos - 1]);
+        };
+    auto isWordBoundary2 = [](const std::wstring& s, size_t pos) {
+        return (pos >= s.size()) || !iswalnum(s[pos]);
+        };
 
     auto buildHay = [&](const Contact& c) {
         std::wstring h;
         auto add = [&](const std::wstring& s) { if (!s.empty()) { h += L" "; h += norm(s); } };
         add(c.fn); add(c.n_given); add(c.n_family); add(c.org); add(c.title); add(c.bday); add(c.url); add(c.note);
         for (auto& t : c.phones) { add(t.number); for (auto& tp : t.types) add(tp); }
-        for (auto& e : c.emails) { add(e.addr); for (auto& tp : e.types) add(tp); }
+        for (auto& e : c.emails) { add(e.addr);   for (auto& tp : e.types) add(tp); }
         for (auto& a : c.addrs) { add(a.text); }
         return h;
         };
@@ -678,7 +686,6 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle,
                 EnsureSelVisible(h, st);
                 InvalidateRect(h, nullptr, TRUE);
                 return true;
-
             }
             pos = hay.find(n, pos + 1);
         }
@@ -687,6 +694,7 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle,
 
     return false;
 }
+
 
 bool VCFView_Search(HWND h, const std::wstring& needle) {
     return VCFView_SearchEx(h, needle, 0, /*backwards*/false, /*matchCase*/false, /*whole*/false, /*wrap*/true);
