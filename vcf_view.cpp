@@ -122,6 +122,24 @@ static void EnsureSelVisible(HWND h, ViewState* st) {
     int maxScroll = std::max(0, (int)st->contacts.size() - per);
     if (st->listScroll > maxScroll) st->listScroll = maxScroll;
 }
+// ---- selection helper (прокрутка + инвалидация) ----
+static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
+    if (!st || st->contacts.empty()) return;
+    if (idx >= st->contacts.size()) idx = st->contacts.size() - 1;
+
+    st->sel = idx;
+    EnsureSelVisible(h, st);
+
+    // синхронизируем ползунок списка
+    if (st->hScroll) {
+        SCROLLINFO si{}; si.cbSize = sizeof(si);
+        si.fMask = SIF_POS;
+        si.nPos = st->listScroll;
+        SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
+    }
+    st->contextField = -1;
+    InvalidateRect(h, nullptr, TRUE);
+}
 
 
 // hit-test helper
@@ -381,6 +399,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     ViewState* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
 
     switch (m) {
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS | DLGC_WANTCHARS;
+
     case WM_CREATE: {
         st = new ViewState();
         SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)st);
@@ -397,6 +418,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
             0, 0, GetSystemMetrics(SM_CXVSCROLL), 100,
             h, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetFocus(h);
+
         return 0;
     }
     case WM_DESTROY: {
@@ -469,6 +492,49 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_KEYDOWN: {
+        if (!st || st->contacts.empty()) return 0;
+
+        size_t sel = st->sel;
+        size_t count = st->contacts.size();
+        bool handled = false;
+
+        switch (w) {
+        case VK_UP:
+            if (sel > 0) { sel -= 1; handled = true; }
+            break;
+        case VK_DOWN:
+            if (sel + 1 < count) { sel += 1; handled = true; }
+            break;
+        case VK_PRIOR: // PageUp
+            if (st->perPage > 0) {
+                sel = (sel > (size_t)st->perPage) ? (sel - (size_t)st->perPage) : 0;
+                handled = true;
+            }
+            break;
+        case VK_NEXT:  // PageDown
+            if (st->perPage > 0) {
+                sel = std::min(count - 1, sel + (size_t)st->perPage);
+                handled = true;
+            }
+            break;
+        case VK_HOME:
+            sel = 0; handled = true;
+            break;
+        case VK_END:
+            sel = (count ? count - 1 : 0); handled = true;
+            break;
+        default:
+            break;
+        }
+
+        if (handled) {
+            SetSelectionAndReveal(h, st, sel);
+            return 0;
+        }
+        break;
+    }
+
     case WM_LBUTTONDOWN: {
         if (!st) break;
         int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
@@ -543,20 +609,35 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             DrawNameField(mem, st->fonts, h, dx, dy, dw, name);
 
-            // Photo
+            // Photo (обновлённая логика: 1:1, но влезает в панель без прокрутки)
             if (c.photo && !c.photo->bytes.empty()) {
                 auto img = ImageFromBytes(c.photo->bytes);
                 if (img) {
-                    int maxW = S(h, 160);
                     int iw = (int)img->GetWidth();
                     int ih = (int)img->GetHeight();
                     if (iw > 0 && ih > 0) {
-                        double k = (double)maxW / iw; if (k > 1.0) k = 1.0;
-                        int dwp = (int)(iw * k), dhp = (int)(ih * k);
-                        Graphics g(mem);
+                        // Максимально допустимые размеры: ширина правой панели и оставшаяся высота окна.
+                        // Небольшой нижний отступ, чтобы следующие поля не прилипали.
+                        int bottomPad = S(h, 24);
+                        int availableH = (rc.bottom - dy) - bottomPad;
+                        if (availableH < S(h, 60)) availableH = S(h, 60); // safety
+
+                        int maxW = dw;
+                        int maxH = availableH;
+
+                        // Не увеличиваем сверх оригинала: k <= 1.0
+                        double kW = (double)maxW / (double)iw;
+                        double kH = (double)maxH / (double)ih;
+                        double k = std::min(1.0, std::min(kW, kH));
+
+                        int drawW = (int)((double)iw * k);
+                        int drawH = (int)((double)ih * k);
+
+                        Gdiplus::Graphics g(mem);
                         g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-                        g.DrawImage(img.get(), dx, dy, dwp, dhp);
-                        dy += dhp + S(h, 8);
+                        g.DrawImage(img.get(), dx, dy, drawW, drawH);
+
+                        dy += drawH + S(h, 8);
                     }
                 }
             }
