@@ -56,4 +56,9 @@
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="VCFLister.def">
+      <Filter>Source Files</Filter>
+    </None>
+  </ItemGroup>
 </Project>
