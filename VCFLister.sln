@@ -1,22 +1,28 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.14.36518.9 d17.14
+VisualStudioVersion = 17.14.36518.9
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VCFLister", "VCFLister.vcxproj", "{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Win32 = Debug|Win32
 		Debug|x64 = Debug|x64
 		Debug|x86 = Debug|x86
+		Release|Win32 = Release|Win32
 		Release|x64 = Release|x64
 		Release|x86 = Release|x86
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Debug|Win32.ActiveCfg = Debug|Win32
+		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Debug|Win32.Build.0 = Debug|Win32
 		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Debug|x64.ActiveCfg = Debug|x64
 		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Debug|x64.Build.0 = Debug|x64
 		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Debug|x86.ActiveCfg = Debug|Win32
 		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Debug|x86.Build.0 = Debug|Win32
+		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Release|Win32.ActiveCfg = Release|Win32
+		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Release|Win32.Build.0 = Release|Win32
 		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Release|x64.ActiveCfg = Release|x64
 		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Release|x64.Build.0 = Release|x64
 		{15E11A15-3D9E-41EC-AF03-B8CFD77BD867}.Release|x86.ActiveCfg = Release|Win32
