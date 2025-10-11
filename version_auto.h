@@ -2,21 +2,20 @@
 #ifndef VCF_LISTER_VERSION_AUTO_H
 #define VCF_LISTER_VERSION_AUTO_H
 
-#define VCF_LISTER_VER_MAJOR 0
-#define VCF_LISTER_VER_MINOR 1
+#define VCF_LISTER_VER_MAJOR 1
+#define VCF_LISTER_VER_MINOR 0
 #define VCF_LISTER_VER_PATCH 0
-#define VCF_LISTER_VER_BUILD 21
+#define VCF_LISTER_VER_BUILD 17
 
-// Р”Р»СЏ RC: Р·Р°РїСЏС‚Р°СЏ-СЂР°Р·РґРµР»С‘РЅРЅС‹Рµ Р·РЅР°С‡РµРЅРёСЏ Рё wide-СЃС‚СЂРѕРєРё
-#define VCF_LISTER_FILEVER        0,1,0,21
-#define VCF_LISTER_PRODUCTVER     0,1,0,21
-#define VCF_LISTER_STRFILEVER     L"0.1.0.21"
-#define VCF_LISTER_STRPRODUCTVER  L"0.1.0.21"
+#define VCF_LISTER_FILEVER        1,0,0,17
+#define VCF_LISTER_PRODUCTVER     1,0,0,17
+#define VCF_LISTER_STRFILEVER     L"1.0.0.17"
+#define VCF_LISTER_STRPRODUCTVER  L"1.0.0.17"
 
-#define VCF_LISTER_VERSION_STR           "0.1.0.21"
-#define VCF_LISTER_GIT_SHA               "3c790e0-dirty"
-#define VCF_LISTER_BUILD_TIMESTAMP       "2025-10-10T09:38:32Z"
-#define VCF_LISTER_GIT_SHA_WSTR          L"3c790e0-dirty"
-#define VCF_LISTER_BUILD_TIMESTAMP_WSTR  L"2025-10-10T09:38:32Z"
+#define VCF_LISTER_VERSION_STR           "1.0.0.17"
+#define VCF_LISTER_GIT_SHA               "8d70858-dirty"
+#define VCF_LISTER_BUILD_TIMESTAMP       "2025-10-10T14:58:07Z"
+#define VCF_LISTER_GIT_SHA_WSTR          L"8d70858-dirty"
+#define VCF_LISTER_BUILD_TIMESTAMP_WSTR  L"2025-10-10T14:58:07Z"
 
 #endif // VCF_LISTER_VERSION_AUTO_H

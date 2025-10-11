@@ -40,6 +40,14 @@ struct Contact {
     // photo
     std::optional<Photo> photo;      // embedded
     std::wstring         photo_url;  // URL if provided
+    // === multi NOTE + Android ===
+    struct AndroidCustom {
+        std::wstring rawType;              // строка до ':'
+        std::vector<std::wstring> slots;   // части после ':', разделённые ';' (с учётом \;)
+    };
+    std::vector<std::wstring> notes;           // несколько NOTE
+    std::vector<AndroidCustom> androidCustoms; // X-ANDROID-CUSTOM
+
 };
 
 std::vector<Contact> ParseVCard(const std::wstring& text);

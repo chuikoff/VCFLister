@@ -9,6 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include <cwctype>
+#include <type_traits> // <-- добавлено для SFINAE-хелперов
 
 #include "vcf_parser.hpp"
 
@@ -34,17 +35,32 @@ static std::vector<std::wstring> split(const std::wstring& s, wchar_t sep) {
     }
     return out;
 }
+// расширено: обрабатываем также экранированный двоеточие '\:'
 static std::wstring unescape(const std::wstring& s) {
     std::wstring r; r.reserve(s.size());
     for (size_t i = 0; i < s.size(); ++i) {
         if (s[i] == L'\\' && i + 1 < s.size()) {
             wchar_t c = s[i + 1];
             if (c == L'n' || c == L'N') { r.push_back(L'\n'); ++i; continue; }
-            if (c == L',' || c == L';' || c == L'\\') { r.push_back(c); ++i; continue; }
+            if (c == L',' || c == L';' || c == L'\\' || c == L':') { r.push_back(c); ++i; continue; }
         }
         r.push_back(s[i]);
     }
     return r;
+}
+
+// split по ';' с учётом экранирования "\;"
+static std::vector<std::wstring> splitSemicolonEscaped(const std::wstring& s) {
+    std::vector<std::wstring> out; out.reserve(8);
+    std::wstring cur; cur.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        wchar_t c = s[i];
+        if (c == L'\\' && i + 1 < s.size()) { cur.push_back(s[++i]); continue; }
+        if (c == L';') { out.push_back(cur); cur.clear(); continue; }
+        cur.push_back(c);
+    }
+    out.push_back(cur);
+    return out;
 }
 
 // --- Base64 decode (ASCII, игнорирует пробелы/переводы строк) ---
@@ -202,6 +218,47 @@ static void setEmbeddedPhoto(Contact& c, std::vector<uint8_t> bytes)
     c.photo = std::move(ph);
 }
 
+/* ===========================
+   SFINAE-хелперы для новых полей
+   =========================== */
+
+   // addNote: если у Contact есть vector<wstring> notes — пушим туда; иначе аккуратно накапливаем в contact.note
+template<typename T>
+static auto addNoteImpl(T& c, const std::wstring& txt, int)
+-> decltype(c.notes.push_back(txt), void())
+{
+    c.notes.push_back(txt);
+    if (c.note.empty()) c.note = txt; // совместимость
+}
+static void addNoteImpl(...) { /* no-op fallback */ }
+
+static void addNote(Contact& c, const std::wstring& txt) {
+    if (txt.empty()) return;
+    // попытка положить в notes (если есть)
+    addNoteImpl(c, txt, 0);
+    // если поля notes нет — склеиваем в note (с пустой строкой между)
+    if (c.notes.size() == 0) {
+        if (c.note.empty()) c.note = txt;
+        else                c.note += L"\n\n" + txt;
+    }
+}
+
+// addAndroidCustom: если у Contact есть vector<AndroidCustom> androidCustoms — записываем; иначе no-op
+template<typename T>
+static auto addAndroidImpl(T& c, const std::wstring& rawType, const std::vector<std::wstring>& slots, int)
+-> decltype(c.androidCustoms.push_back(typename T::AndroidCustom{}), void())
+{
+    typename T::AndroidCustom ac;
+    ac.rawType = rawType;
+    ac.slots = slots;
+    c.androidCustoms.push_back(std::move(ac));
+}
+static void addAndroidImpl(...) { /* no-op */ }
+
+static void addAndroidCustom(Contact& c, const std::wstring& rawType, const std::vector<std::wstring>& slots) {
+    addAndroidImpl(c, rawType, slots, 0);
+}
+
 // ---------- main parser ----------
 std::vector<Contact> ParseVCard(const std::wstring& text)
 {
@@ -292,7 +349,9 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             cur.bday = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (name == L"NOTE") {
-            cur.note = unescape(decodeTextValue(value, encQP, charset));
+            // РАНЬШЕ: перезатирали одно поле note (терялись много NOTE)  [исходник: см. блок NOTE] 
+            // ТЕПЕРЬ: накапливаем все заметки (или конкатенируем, если в модели нет vector<notes>)
+            addNote(cur, unescape(decodeTextValue(value, encQP, charset)));
         }
         else if (name == L"TEL") {
             Phone p;
@@ -345,6 +404,22 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                 auto bytes = Base64Decode(b64);
                 setEmbeddedPhoto(cur, std::move(bytes));
             }
+        }
+        else if (name == L"X-ANDROID-CUSTOM") {
+            // Пример: X-ANDROID-CUSTOM:vnd.android.cursor.item/nickname;John;\;escaped\;;...
+            std::wstring raw = unescape(decodeTextValue(value, encQP, charset));
+            std::wstring rawType;
+            std::vector<std::wstring> slots;
+            size_t p = raw.find(L':');
+            if (p != std::wstring::npos) {
+                rawType = raw.substr(0, p);
+                slots = splitSemicolonEscaped(raw.substr(p + 1));
+            }
+            else {
+                slots = splitSemicolonEscaped(raw);
+            }
+            // положим (если есть место в модели; иначе тихий no-op)
+            addAndroidCustom(cur, rawType, slots);
         }
     }
 
