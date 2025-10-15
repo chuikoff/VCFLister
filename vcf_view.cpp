@@ -1,4 +1,4 @@
-// vcf_view.cpp - VCF Lister view with right-click "Copy" (no Ctrl+C), clean values (no type tails)
+// vcf_view.cpp - VCF Lister view with right-click "Copy" (no Ctrl+C), clean values (no type tails) + Dark/Light theme (Auto by default, INI override)
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -34,7 +34,93 @@ namespace detail_detect {
     };
 }
 
-// Надёжное понижение регистра (Unicode, независимо от локали)
+// ===================== THEME (Auto + INI override) =====================
+static std::wstring g_iniPath;      // устанавливается через VCFView_SetIniPath(...)
+static bool g_dark = false;         // текущий режим
+
+// Палитра
+static HBRUSH   g_hbrBk = nullptr;
+static COLORREF g_clrBk, g_clrTxt, g_clrSub, g_clrGrid, g_clrSeparator;
+static COLORREF g_clrListBg, g_clrListSel;
+static COLORREF g_clrLabel, g_clrValue, g_clrTitle;
+
+static void SafeDelBrush(HBRUSH& b) { if (b) { DeleteObject(b); b = nullptr; } }
+
+// чтение DWORD из реестра
+static bool ReadRegDWORD(HKEY root, const wchar_t* subkey, const wchar_t* name, DWORD& out) {
+    HKEY h; if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &h) != ERROR_SUCCESS) return false;
+    DWORD type = 0, size = sizeof(DWORD);
+    LONG r = RegGetValueW(h, nullptr, name, RRF_RT_REG_DWORD, &type, &out, &size);
+    RegCloseKey(h); return r == ERROR_SUCCESS;
+}
+
+// системная тема: true = Dark, false = Light
+static bool DetectSystemDark() {
+    DWORD v = 1; // 1 = Light, 0 = Dark
+    if (ReadRegDWORD(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", v))
+        return v == 0;
+    return false;
+}
+
+// INI override: [VCFLister] Dark = 0/1/2 (0=Light,1=Dark,2=Auto)
+static int ReadIniDarkMode() {
+    if (g_iniPath.empty()) return 2;
+    wchar_t buf[16]{};
+    GetPrivateProfileStringW(L"VCFLister", L"Dark", L"2", buf, 16, g_iniPath.c_str());
+    if (buf[0] == L'0') return 0;
+    if (buf[0] == L'1') return 1;
+    return 2; // Auto
+}
+
+static void RecomputeTheme() {
+    const int ini = ReadIniDarkMode();
+    const bool sysDark = DetectSystemDark();
+    g_dark = (ini == 2) ? sysDark : (ini == 1);
+
+    if (g_dark) {
+        g_clrBk = RGB(32, 32, 32);
+        g_clrTxt = RGB(220, 220, 220);
+        g_clrSub = RGB(160, 160, 160);
+        g_clrGrid = RGB(64, 64, 64);
+        g_clrSeparator = RGB(70, 70, 70);
+
+        g_clrListBg = RGB(28, 28, 28);
+        g_clrListSel = RGB(60, 80, 120);   // мягкая подсветка
+
+        g_clrLabel = RGB(170, 170, 170);
+        g_clrValue = RGB(230, 230, 230);
+        g_clrTitle = RGB(235, 235, 235);
+    }
+    else {
+        g_clrBk = RGB(255, 255, 255);
+        g_clrTxt = RGB(30, 30, 30);
+        g_clrSub = RGB(110, 110, 110);
+        g_clrGrid = RGB(220, 220, 220);
+        g_clrSeparator = RGB(200, 200, 200);
+
+        g_clrListBg = RGB(248, 248, 248);
+        g_clrListSel = RGB(219, 234, 254);
+
+        g_clrLabel = RGB(90, 90, 90);
+        g_clrValue = RGB(30, 30, 30);
+        g_clrTitle = RGB(20, 20, 20);
+    }
+    SafeDelBrush(g_hbrBk);
+    g_hbrBk = CreateSolidBrush(g_clrBk);
+}
+
+// Внешний сеттер пути к INI (зовите из ListSetDefaultParams)
+extern "C" void VCFView_SetIniPath(const wchar_t* iniPath) {
+    if (iniPath && *iniPath) g_iniPath = iniPath;
+    RecomputeTheme();
+}
+// Внешний «освежитель» темы, если нужно вручную
+extern "C" void VCFView_RefreshTheme(HWND hWnd) {
+    RecomputeTheme();
+    if (IsWindow(hWnd)) InvalidateRect(hWnd, nullptr, TRUE);
+}
+
+// ===================== Unicode lower-case helper =====================
 static std::wstring LowerInvariant(const std::wstring& s) {
     if (s.empty()) return s;
     int need = LCMapStringW(LOCALE_INVARIANT, LCMAP_LOWERCASE, s.c_str(), -1, nullptr, 0);
@@ -196,7 +282,6 @@ static std::wstring FallbackEmail_NotesAware(const Contact& c) {
         std::wstring f = ExtractEmailFromText(c.note);
         if (!f.empty()) return f;
     }
-    // если у контакта есть vector<notes> — ищем и там
     if constexpr (detail_detect::has_notes<Contact>::value) {
         if (!c.notes.empty()) {
             for (const auto& n : c.notes) {
@@ -263,10 +348,10 @@ static void DrawLabel(HDC dc, HFONT f, int x, int y, const std::wstring& label, 
     SelectObject(dc, old);
 }
 static void DrawNameField(HDC dc, Fonts& f, HWND h, int x, int& y, int w, const std::wstring& name) {
-    DrawLabel(dc, f.hBold, x, y, L"Name:", RGB(90, 90, 90));
+    DrawLabel(dc, f.hBold, x, y, L"Name:", g_clrLabel);
     y += S(h, 22);
     RECT rc{ x, y, x + w, y + 10000 };
-    int used = DrawMeasuredText(dc, f.hTitle, name, rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, RGB(20, 20, 20));
+    int used = DrawMeasuredText(dc, f.hTitle, name, rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, g_clrTitle);
     y += used + S(h, 10);
 }
 // Нарисовать пару "Label: value" и вернуть прямоугольник value
@@ -326,7 +411,7 @@ static void RenderList(HDC dc, HWND h, ViewState* st,
     int sbw = ScrollbarWidth();
     int wList = w - sbw; if (wList < S(h, 120)) wList = w;
 
-    HBRUSH bg = CreateSolidBrush(RGB(248, 248, 248));
+    HBRUSH bg = CreateSolidBrush(g_clrListBg);
     RECT rbg{ x,y,x + wList,y + hgt }; FillRect(dc, &rbg, bg); DeleteObject(bg);
 
     int pad = S(h, 8);
@@ -355,10 +440,10 @@ static void RenderList(HDC dc, HWND h, ViewState* st,
         }
 
         RECT item{ x + pad, ycur, x + wList - pad, ycur + st->listItemH - S(h,2) };
-        HBRUSH ibg = CreateSolidBrush(idx == st->sel ? RGB(219, 234, 254) : RGB(248, 248, 248));
+        HBRUSH ibg = CreateSolidBrush(idx == st->sel ? g_clrListSel : g_clrListBg);
         FillRect(dc, &item, ibg); DeleteObject(ibg);
 
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(230, 230, 230));
+        HPEN pen = CreatePen(PS_SOLID, 1, g_clrGrid);
         HGDIOBJ oldPen = SelectObject(dc, pen);
         MoveToEx(dc, item.left, item.bottom, nullptr);
         LineTo(dc, item.right, item.bottom);
@@ -366,12 +451,12 @@ static void RenderList(HDC dc, HWND h, ViewState* st,
 
         HFONT old = (HFONT)SelectObject(dc, st->fonts.hNorm);
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(30, 30, 30));
+        SetTextColor(dc, g_clrTxt);
         RECT nameRc = item; nameRc.left += S(h, 8); nameRc.top += S(h, 6); nameRc.right -= S(h, 6);
         DrawTextW(dc, name.c_str(), (int)name.size(), &nameRc, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);
 
         SelectObject(dc, st->fonts.hSmall);
-        SetTextColor(dc, RGB(110, 110, 110));
+        SetTextColor(dc, g_clrSub);
         std::wstring subShow = sub;
         if (subShow.empty()) {
             std::wstring fb = FallbackEmail_NotesAware(c);
@@ -405,6 +490,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         static ULONG_PTR gdipToken = 0;
         if (!gdipToken) { GdiplusStartupInput gi; GdiplusStartup(&gdipToken, &gi, nullptr); }
 
+        // Тема при старте
+        RecomputeTheme();
+
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
             0, 0, GetSystemMetrics(SM_CXVSCROLL), 100,
             h, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -418,6 +506,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             delete st;
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
         }
+        SafeDelBrush(g_hbrBk);
         return 0;
     }
     case WM_SIZE: {
@@ -529,19 +618,31 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+
+                       // реагируем на смену темы системы/цветов
+    case WM_THEMECHANGED:
+    case WM_SETTINGCHANGE:
+    case WM_SYSCOLORCHANGE: {
+        RecomputeTheme();
+        InvalidateRect(h, nullptr, TRUE);
+        return 0;
+    }
+
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
         HGDIOBJ oldBmp = SelectObject(mem, bmp);
-        HBRUSH wbg = CreateSolidBrush(RGB(255, 255, 255));
-        FillRect(mem, &rc, wbg); DeleteObject(wbg);
+
+        HBRUSH wbg = g_hbrBk ? g_hbrBk : (HBRUSH)(COLOR_WINDOW + 1);
+        FillRect(mem, &rc, wbg);
 
         int listW = ListPaneWidth(h);
         RenderList(mem, h, st, rc.left, rc.top, listW, rc.bottom - rc.top, st->listRc);
 
-        RECT sep{ listW, rc.top, listW + 1, rc.bottom }; FillRect(mem, &sep, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        HBRUSH sepBr = CreateSolidBrush(g_clrSeparator);
+        RECT sep{ listW, rc.top, listW + 1, rc.bottom }; FillRect(mem, &sep, sepBr); DeleteObject(sepBr);
 
         st->fields.clear();
 
@@ -590,11 +691,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 }
             }
 
-
             auto& F = st->fonts;
             auto pushField = [&](const std::wstring& lab, const std::wstring& val) {
-                RECT r = DrawLabelValueWithRect(mem, F, dx, dy, dw, lab, val,
-                    RGB(90, 90, 90), RGB(30, 30, 30), h);
+                RECT r = DrawLabelValueWithRect(mem, F, dx, dy, dw, lab, val, g_clrLabel, g_clrValue, h);
                 FieldHit fh; fh.rc = r; fh.label = lab; fh.value = val;
                 st->fields.push_back(std::move(fh));
                 };
