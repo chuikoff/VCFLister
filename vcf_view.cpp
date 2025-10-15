@@ -555,26 +555,41 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (name.empty()) name = L"(no name)";
             DrawNameField(mem, st->fonts, h, dx, dy, dw, name);
 
-            // Photo: максимально большой, но без появления вертикальной прокрутки
+            // Photo: максимально 500x500 и не выходя за доступное место справа
             if (c.photo && !c.photo->bytes.empty()) {
                 auto img = ImageFromBytes(c.photo->bytes);
                 if (img) {
                     int iw = (int)img->GetWidth();
                     int ih = (int)img->GetHeight();
                     if (iw > 0 && ih > 0) {
+                        const int MAX_PHOTO = 500; // жёстный лимит размеров фото
+
                         int bottomPad = S(h, 24);
                         int availableH = (rc.bottom - dy) - bottomPad;
                         if (availableH < S(h, 60)) availableH = S(h, 60);
+
                         int maxW = dw, maxH = availableH;
-                        double k = std::min(1.0, std::min((double)maxW / iw, (double)maxH / ih));
-                        int drawW = (int)(iw * k), drawH = (int)(ih * k);
+
+                        // базовый коэффициент — под доступную область
+                        double k_area = std::min(1.0, std::min((double)maxW / iw, (double)maxH / ih));
+
+                        // дополнительный кап — не больше 500x500
+                        double k_cap = std::min(1.0, std::min((double)MAX_PHOTO / iw, (double)MAX_PHOTO / ih));
+
+                        double k = std::min(k_area, k_cap);
+
+                        int drawW = (int)(iw * k);
+                        int drawH = (int)(ih * k);
+
                         Gdiplus::Graphics g(mem);
                         g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
                         g.DrawImage(img.get(), dx, dy, drawW, drawH);
+
                         dy += drawH + S(h, 8);
                     }
                 }
             }
+
 
             auto& F = st->fonts;
             auto pushField = [&](const std::wstring& lab, const std::wstring& val) {
