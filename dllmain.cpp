@@ -62,6 +62,9 @@ typedef struct {
 // Глобалы и утилиты
 static HINSTANCE g_hInst = nullptr;
 
+// Декларация из viewer-а: передаём путь к INI, чтобы он применил Dark/Light/Auto
+extern "C" void VCFView_SetIniPath(const wchar_t* iniPath);
+
 // ANSI → UTF-16
 static std::wstring A2W(const char* s) {
     if (!s) return L"";
@@ -186,8 +189,15 @@ static int Impl_ListSendCommand(HWND PluginWin, int Command, int Parameter) {
     return 0;
 }
 
-static void Impl_ListSetDefaultParams(const ListDefaultParamStruct* /*dps*/) {
-    // no-op
+// <<< ВАЖНО: сюда добавлен вызов VCFView_SetIniPath >>>
+static void Impl_ListSetDefaultParams(const ListDefaultParamStruct* dps) {
+    if (!dps) return;
+    // В TC dps->DefaultIniName — путь к wincmd.ini (ANSI).
+    // Конвертируем в UTF-16 и передаём viewer-у; он сам применит Dark/Light/Auto.
+    std::wstring wideIni = A2W(dps->DefaultIniName);
+    if (!wideIni.empty()) {
+        VCFView_SetIniPath(wideIni.c_str());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
