@@ -1,4 +1,5 @@
-// vcf_view.cpp - VCF Lister view with right-click "Copy" (no Ctrl+C), clean values (no type tails) + Dark/Light theme (Auto by default, INI override)
+// vcf_view.cpp - VCF Lister view with left list + right EDIT (multiline, read-only)
+// Dark/Light theme (Auto by default, INI override), context menu "Copy" on right click
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
@@ -42,7 +43,6 @@ static bool g_dark = false;         // текущий режим
 static HBRUSH   g_hbrBk = nullptr;
 static COLORREF g_clrBk, g_clrTxt, g_clrSub, g_clrGrid, g_clrSeparator;
 static COLORREF g_clrListBg, g_clrListSel;
-static COLORREF g_clrLabel, g_clrValue, g_clrTitle;
 
 static void SafeDelBrush(HBRUSH& b) { if (b) { DeleteObject(b); b = nullptr; } }
 
@@ -53,6 +53,28 @@ static bool ReadRegDWORD(HKEY root, const wchar_t* subkey, const wchar_t* name, 
     LONG r = RegGetValueW(h, nullptr, name, RRF_RT_REG_DWORD, &type, &out, &size);
     RegCloseKey(h); return r == ERROR_SUCCESS;
 }
+// --- Subclass for right EDIT to forward ESC to Lister ---
+static WNDPROC g_EditOldProc = nullptr;
+
+static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_CHAR:
+        if (wParam == VK_ESCAPE) {
+            // Перешлём Esc родителю Lister (родитель нашего viewer-а)
+            HWND viewer = GetParent(hEdit);
+            HWND lister = viewer ? GetParent(viewer) : nullptr;
+            if (lister) {
+                PostMessageW(lister, WM_KEYDOWN, VK_ESCAPE, 0);
+                return 0; // съедаем, чтобы EDIT не обрабатывал
+            }
+        }
+        break;
+    }
+    return CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
+}
+
 
 // системная тема: true = Dark, false = Light
 static bool DetectSystemDark() {
@@ -85,11 +107,7 @@ static void RecomputeTheme() {
         g_clrSeparator = RGB(70, 70, 70);
 
         g_clrListBg = RGB(28, 28, 28);
-        g_clrListSel = RGB(60, 80, 120);   // мягкая подсветка
-
-        g_clrLabel = RGB(170, 170, 170);
-        g_clrValue = RGB(230, 230, 230);
-        g_clrTitle = RGB(235, 235, 235);
+        g_clrListSel = RGB(60, 80, 120);
     }
     else {
         g_clrBk = RGB(255, 255, 255);
@@ -100,10 +118,6 @@ static void RecomputeTheme() {
 
         g_clrListBg = RGB(248, 248, 248);
         g_clrListSel = RGB(219, 234, 254);
-
-        g_clrLabel = RGB(90, 90, 90);
-        g_clrValue = RGB(30, 30, 30);
-        g_clrTitle = RGB(20, 20, 20);
     }
     SafeDelBrush(g_hbrBk);
     g_hbrBk = CreateSolidBrush(g_clrBk);
@@ -149,8 +163,6 @@ static int S(HWND h, int px) { return MulDiv(px, Dpi(h), 96); }
 
 // ---------- Fonts ----------
 struct Fonts {
-    HFONT hTitle = nullptr;
-    HFONT hBold = nullptr;
     HFONT hNorm = nullptr;
     HFONT hSmall = nullptr;
 };
@@ -166,26 +178,18 @@ static HFONT MakeFont(HWND h, int px, int weight, const wchar_t* face) {
 }
 
 static void MakeFonts(HWND h, Fonts& f) {
-    f.hTitle = MakeFont(h, 18, FW_SEMIBOLD, L"Segoe UI");
-    f.hBold = MakeFont(h, 14, FW_SEMIBOLD, L"Segoe UI");
     f.hNorm = MakeFont(h, 14, FW_NORMAL, L"Segoe UI");
     f.hSmall = MakeFont(h, 12, FW_NORMAL, L"Segoe UI");
 }
 
 static void FreeFonts(Fonts& f) {
-    if (f.hTitle) DeleteObject(f.hTitle);
-    if (f.hBold)  DeleteObject(f.hBold);
     if (f.hNorm)  DeleteObject(f.hNorm);
     if (f.hSmall) DeleteObject(f.hSmall);
     f = {};
 }
 
-// ---------- hit testing for right pane fields ----------
-struct FieldHit {
-    RECT rc{};
-    std::wstring label;
-    std::wstring value;
-};
+// ---------- hit testing legacy (не нужен для EDIT), оставим пустым ----------
+struct FieldHit { RECT rc{}; std::wstring label; std::wstring value; };
 
 // ---------- State ----------
 struct ViewState {
@@ -198,52 +202,14 @@ struct ViewState {
     int  perPage = 1;
 
     HWND hScroll = nullptr;
+    HWND hEdit = nullptr; // правая панель: EDIT (multiline, read-only)
 
-    std::vector<FieldHit> fields;
-    int contextField = -1;
+    std::vector<FieldHit> fields; // не используется, оставлено для совместимости
 
     Fonts fonts;
 };
 
-static void EnsureSelVisible(HWND h, ViewState* st) {
-    RECT rc; GetClientRect(h, &rc);
-    int innerH = rc.bottom - rc.top - S(h, 16);
-    int rowH = st->listItemH ? st->listItemH : S(h, 52);
-    int per = std::max(1, innerH / rowH);
-    st->perPage = per;
-
-    int sel = (int)st->sel;
-    if (sel < st->listScroll) st->listScroll = sel;
-    else if (sel >= st->listScroll + per) st->listScroll = sel - (per - 1);
-
-    if (st->listScroll < 0) st->listScroll = 0;
-    int maxScroll = std::max(0, (int)st->contacts.size() - per);
-    if (st->listScroll > maxScroll) st->listScroll = maxScroll;
-}
-
-static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
-    if (!st || st->contacts.empty()) return;
-    if (idx >= st->contacts.size()) idx = st->contacts.size() - 1;
-
-    st->sel = idx;
-    EnsureSelVisible(h, st);
-
-    if (st->hScroll) {
-        SCROLLINFO si{}; si.cbSize = sizeof(si);
-        si.fMask = SIF_POS;
-        si.nPos = st->listScroll;
-        SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
-    }
-    st->contextField = -1;
-    InvalidateRect(h, nullptr, TRUE);
-}
-
-// hit-test helper
-static inline bool PtIn(const RECT& r, int x, int y) {
-    return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
-}
-
-// ---------- Utils ----------
+// ---------- Basic utils ----------
 static std::wstring PrimaryPhone(const Contact& c) {
     return c.phones.empty() ? L"" : c.phones[0].number;
 }
@@ -293,7 +259,95 @@ static std::wstring FallbackEmail_NotesAware(const Contact& c) {
     return L"";
 }
 
-// ---------- clipboard ----------
+// ---------- Build details text for EDIT ----------
+static void AppendLine(std::wstring& out, const std::wstring& k, const std::wstring& v) {
+    if (v.empty()) return;
+    out += k; out += L": "; out += v; out += L"\r\n";
+}
+static std::wstring BuildContactText(const Contact& c) {
+    std::wstring t;
+
+    // Name
+    std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
+    if (name.empty()) name = L"(no name)";
+    AppendLine(t, L"Name", name);
+
+    AppendLine(t, L"Org", c.org);
+    AppendLine(t, L"Role", c.title);
+    AppendLine(t, L"URL", c.url);
+    AppendLine(t, L"BDay", c.bday);
+
+    // Phones
+    for (auto& p : c.phones) {
+        if (p.number.empty()) continue;
+        if (!p.types.empty()) {
+            std::wstring types;
+            for (size_t i = 0; i < p.types.size(); ++i) { if (i) types += L","; types += p.types[i]; }
+            AppendLine(t, L"Phone (" + types + L")", p.number);
+        }
+        else {
+            AppendLine(t, L"Phone", p.number);
+        }
+    }
+
+    // Emails (with fallback)
+    bool anyEmail = false;
+    for (auto& e : c.emails) {
+        if (e.addr.empty()) continue;
+        anyEmail = true;
+        if (!e.types.empty()) {
+            std::wstring types;
+            for (size_t i = 0; i < e.types.size(); ++i) { if (i) types += L","; types += e.types[i]; }
+            AppendLine(t, L"Email (" + types + L")", e.addr);
+        }
+        else {
+            AppendLine(t, L"Email", e.addr);
+        }
+    }
+    if (!anyEmail) {
+        std::wstring fb = FallbackEmail_NotesAware(c);
+        if (!fb.empty()) AppendLine(t, L"Email", fb);
+    }
+
+    // Addresses
+    for (auto& a : c.addrs) {
+        if (a.text.empty()) continue;
+        AppendLine(t, L"Address", a.text);
+    }
+
+    // Notes
+    bool printedAnyNote = false;
+    if constexpr (detail_detect::has_notes<Contact>::value) {
+        if (!c.notes.empty()) {
+            for (size_t i = 0; i < c.notes.size(); ++i) {
+                std::wstring lab = (i == 0) ? L"Note" : (L"Note #" + std::to_wstring(i + 1));
+                AppendLine(t, lab, c.notes[i]);
+            }
+            printedAnyNote = true;
+        }
+    }
+    if (!printedAnyNote && !c.note.empty()) {
+        AppendLine(t, L"Note", c.note);
+    }
+
+    // Android customs
+    if constexpr (detail_detect::has_android<Contact>::value) {
+        if (!c.androidCustoms.empty()) {
+            for (const auto& ac : c.androidCustoms) {
+                if (!ac.rawType.empty()) AppendLine(t, L"Android type", ac.rawType);
+                for (size_t i = 0; i < ac.slots.size(); ++i) {
+                    if (ac.slots[i].empty()) continue;
+                    std::wstring lab = ac.slots.size() > 1 ? (L"Android slot #" + std::to_wstring(i + 1)) : L"Android";
+                    AppendLine(t, lab, ac.slots[i]);
+                }
+            }
+        }
+    }
+
+    return t;
+}
+
+// ---------- clipboard (для «копировать всё», если нет выделения) ----------
 static void SetClipboardTextW(HWND h, const std::wstring& text) {
     if (!OpenClipboard(h)) return;
     EmptyClipboard();
@@ -306,83 +360,6 @@ static void SetClipboardTextW(HWND h, const std::wstring& text) {
         SetClipboardData(CF_UNICODETEXT, hmem);
     }
     CloseClipboard();
-}
-
-// ---------- GDI+ helper ----------
-static std::unique_ptr<Image> ImageFromBytes(const std::vector<uint8_t>& bytes) {
-    if (bytes.empty()) return {};
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
-    if (!hMem) return {};
-    void* p = GlobalLock(hMem);
-    memcpy(p, bytes.data(), bytes.size());
-    GlobalUnlock(hMem);
-    IStream* stm = nullptr;
-    if (CreateStreamOnHGlobal(hMem, TRUE, &stm) != S_OK) { GlobalFree(hMem); return {}; }
-    auto img = std::make_unique<Image>(stm);
-    stm->Release();
-    if (img->GetLastStatus() != Ok) return {};
-    return img;
-}
-
-// ---------- text drawing helpers ----------
-static int DrawMeasuredText(HDC dc, HFONT f, const std::wstring& txt, RECT rc, UINT fmt, COLORREF col) {
-    HFONT old = (HFONT)SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, col);
-
-    RECT calc = rc;
-    DrawTextW(dc, txt.c_str(), (int)txt.size(), &calc, fmt | DT_CALCRECT);
-
-    RECT draw = rc;
-    draw.bottom = rc.top + (calc.bottom - calc.top);
-    DrawTextW(dc, txt.c_str(), (int)txt.size(), &draw, fmt);
-
-    SelectObject(dc, old);
-    return (calc.bottom - calc.top);
-}
-static void DrawLabel(HDC dc, HFONT f, int x, int y, const std::wstring& label, COLORREF labCol) {
-    HFONT old = (HFONT)SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, labCol);
-    TextOutW(dc, x, y, label.c_str(), (int)label.size());
-    SelectObject(dc, old);
-}
-static void DrawNameField(HDC dc, Fonts& f, HWND h, int x, int& y, int w, const std::wstring& name) {
-    DrawLabel(dc, f.hBold, x, y, L"Name:", g_clrLabel);
-    y += S(h, 22);
-    RECT rc{ x, y, x + w, y + 10000 };
-    int used = DrawMeasuredText(dc, f.hTitle, name, rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, g_clrTitle);
-    y += used + S(h, 10);
-}
-// Нарисовать пару "Label: value" и вернуть прямоугольник value
-static RECT DrawLabelValueWithRect(HDC dc, Fonts& f, int x, int& y, int w,
-    const std::wstring& label, const std::wstring& value,
-    COLORREF labCol, COLORREF valCol,
-    HWND hWnd)
-{
-    RECT empty{ 0,0,0,0 };
-    if (value.empty()) return empty;
-
-    std::wstring lab = label + L": ";
-    HFONT old = (HFONT)SelectObject(dc, f.hBold);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, labCol);
-    TextOutW(dc, x, y, lab.c_str(), (int)lab.size());
-
-    SIZE szLab{}; GetTextExtentPoint32W(dc, lab.c_str(), (int)lab.size(), &szLab);
-
-    RECT rcVal{ x + szLab.cx, y, x + w, y + 10000 };
-    SelectObject(dc, f.hNorm);
-    int hUsed = DrawMeasuredText(dc, f.hNorm, value, rcVal, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX, valCol);
-
-    y += std::max(S(hWnd, 22), hUsed) + S(hWnd, 6);
-    SelectObject(dc, old);
-
-    RECT calc = rcVal;
-    HFONT oldN = (HFONT)SelectObject(dc, f.hNorm);
-    DrawTextW(dc, value.c_str(), (int)value.size(), &calc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
-    SelectObject(dc, oldN);
-    return calc;
 }
 
 // ---------- left list ----------
@@ -472,6 +449,56 @@ static void RenderList(HDC dc, HWND h, ViewState* st,
     UpdateListScrollbar(st, (int)st->contacts.size());
 }
 
+// ---------- EDIT content update ----------
+static void UpdateRightEdit(ViewState* st) {
+    if (!st || !IsWindow(st->hEdit)) return;
+    std::wstring text;
+    if (st->sel < st->contacts.size()) {
+        text = BuildContactText(st->contacts[st->sel]);
+    }
+    else {
+        text = L"";
+    }
+    // Установим текст; оставляем курсор в начале
+    SendMessageW(st->hEdit, WM_SETTEXT, 0, (LPARAM)text.c_str());
+    SendMessageW(st->hEdit, EM_SETSEL, 0, 0);
+    SendMessageW(st->hEdit, EM_SCROLLCARET, 0, 0);
+}
+
+// ---------- selection helpers ----------
+static void EnsureSelVisible(HWND h, ViewState* st) {
+    RECT rc; GetClientRect(h, &rc);
+    int innerH = rc.bottom - rc.top - S(h, 16);
+    int rowH = st->listItemH ? st->listItemH : S(h, 52);
+    int per = std::max(1, innerH / rowH);
+    st->perPage = per;
+
+    int sel = (int)st->sel;
+    if (sel < st->listScroll) st->listScroll = sel;
+    else if (sel >= st->listScroll + per) st->listScroll = sel - (per - 1);
+
+    if (st->listScroll < 0) st->listScroll = 0;
+    int maxScroll = std::max(0, (int)st->contacts.size() - per);
+    if (st->listScroll > maxScroll) st->listScroll = maxScroll;
+}
+
+static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
+    if (!st || st->contacts.empty()) return;
+    if (idx >= st->contacts.size()) idx = st->contacts.size() - 1;
+
+    st->sel = idx;
+    EnsureSelVisible(h, st);
+
+    if (st->hScroll) {
+        SCROLLINFO si{}; si.cbSize = sizeof(si);
+        si.fMask = SIF_POS;
+        si.nPos = st->listScroll;
+        SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
+    }
+    UpdateRightEdit(st);
+    InvalidateRect(h, nullptr, TRUE);
+}
+
 // ---------- Window procedure ----------
 static const wchar_t* kClass = L"VCF_VIEW_CLASS";
 
@@ -493,14 +520,43 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // Тема при старте
         RecomputeTheme();
 
+        // Скролл для списка
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
             0, 0, GetSystemMetrics(SM_CXVSCROLL), 100,
             h, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+        // EDIT справа (multiline, readonly)
+        st->hEdit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
+            0, 0, 0, 0,
+            h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+        // EDIT справа (multiline, readonly)
+        st->hEdit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
+            0, 0, 0, 0,
+            h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+
+        // Шрифт и цвета
+        SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
+
+        // <<< ВАЖНО: сабклассим EDIT для обработки Esc >>>
+        g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+
+        // Шрифт и цвета
+        SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
+
         SetFocus(h);
         return 0;
     }
     case WM_DESTROY: {
         if (st) {
+            if (st->hEdit && IsWindow(st->hEdit)) DestroyWindow(st->hEdit);
             if (st->hScroll && IsWindow(st->hScroll)) DestroyWindow(st->hScroll);
             FreeFonts(st->fonts);
             delete st;
@@ -512,10 +568,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE: {
         if (!st) break;
         st->listItemH = 0;
+
+        RECT rc; GetClientRect(h, &rc);
         int listW = ListPaneWidth(h);
         int sbw = ScrollbarWidth();
         int cy = HIWORD(l);
+
+        // скролл у левой панели
         MoveWindow(st->hScroll, listW - sbw, 0, sbw, cy, TRUE);
+
+        // EDIT: занимает всё справа
+        int pad = S(h, 12);
+        int ex = listW + 1 + pad;
+        int ew = rc.right - ex - pad;
+        int ey = pad;
+        int eh = rc.bottom - ey - pad;
+        if (ew < S(h, 100)) ew = std::max<int>(0, rc.right - (listW + pad));
+
+        MoveWindow(st->hEdit, ex, ey, ew, eh, TRUE);
+
         InvalidateRect(h, nullptr, TRUE);
         return 0;
     }
@@ -555,7 +626,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (!st) break;
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ScreenToClient(h, &pt);
-        if (PtIn(st->listRc, pt.x, pt.y)) {
+        if (PtInRect(&st->listRc, pt)) {
             int delta = GET_WHEEL_DELTA_WPARAM(w);
             int step = (delta > 0) ? -1 : +1;
             int maxScroll = std::max(0, (int)st->contacts.size() - st->perPage);
@@ -593,39 +664,73 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int row = (y - pad) / rowH;
             if (row >= 0) {
                 size_t idx = (size_t)(st->listScroll + row);
-                if (idx < st->contacts.size()) { st->sel = idx; InvalidateRect(h, nullptr, TRUE); return 0; }
-            }
-        }
-        return 0;
-    }
-    case WM_RBUTTONDOWN: {
-        if (!st) break;
-        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
-        st->contextField = -1;
-        for (int i = (int)st->fields.size() - 1; i >= 0; --i) {
-            if (PtIn(st->fields[i].rc, x, y)) { st->contextField = i; break; }
-        }
-        if (st->contextField >= 0) {
-            HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING, 1, L"\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C");
-            POINT pt; pt.x = x; pt.y = y; ClientToScreen(h, &pt);
-            int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, nullptr);
-            DestroyMenu(hMenu);
-            if (cmd == 1) {
-                std::wstring txt = st->fields[st->contextField].value;
-                if (!txt.empty()) SetClipboardTextW(h, txt);
+                if (idx < st->contacts.size()) { st->sel = idx; UpdateRightEdit(st); InvalidateRect(h, nullptr, TRUE); return 0; }
             }
         }
         return 0;
     }
 
-                       // реагируем на смену темы системы/цветов
+                       // Смена темы системы/цветов
     case WM_THEMECHANGED:
     case WM_SETTINGCHANGE:
     case WM_SYSCOLORCHANGE: {
         RecomputeTheme();
+        // перекрасим EDIT (через WM_CTLCOLOREDIT) и фон
         InvalidateRect(h, nullptr, TRUE);
         return 0;
+    }
+
+                          // Контекстное меню: правый клик по EDIT → "Копировать"
+    case WM_CONTEXTMENU: {
+        if (!st) break;
+        HWND hSrc = (HWND)w;
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (hSrc == st->hEdit || (hSrc == h)) {
+            // если пришло на родителя — проверим, попали ли в EDIT
+            if (hSrc == h) {
+                POINT cpt = pt; ScreenToClient(h, &cpt);
+                RECT rcE{}; GetWindowRect(st->hEdit, &rcE);
+                if (!(pt.x >= rcE.left && pt.x < rcE.right && pt.y >= rcE.top && pt.y < rcE.bottom)) break;
+            }
+
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C"); // "Копировать"
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, nullptr);
+            DestroyMenu(m);
+            if (cmd == 1) {
+                // Если есть выделение — WM_COPY, иначе копируем весь текст
+                DWORD selStart = 0, selEnd = 0;
+                SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&selStart, (LPARAM)&selEnd);
+                if (selStart != selEnd) {
+                    SendMessageW(st->hEdit, WM_COPY, 0, 0);
+                }
+                else {
+                    int len = GetWindowTextLengthW(st->hEdit);
+                    std::wstring all(len, L'\0');
+                    GetWindowTextW(st->hEdit, &all[0], len + 1);
+                    SetClipboardTextW(h, all);
+                }
+            }
+            return 0;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORLISTBOX:
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)w;
+        SetTextColor(dc, g_clrTxt);
+        SetBkColor(dc, g_clrBk);
+        return (INT_PTR)(g_hbrBk ? g_hbrBk : GetSysColorBrush(COLOR_WINDOW));
+    }
+
+    case WM_ERASEBKGND: {
+        HDC dc = (HDC)w;
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_hbrBk ? g_hbrBk : (HBRUSH)(COLOR_WINDOW + 1));
+        return 1;
     }
 
     case WM_PAINT: {
@@ -635,120 +740,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
         HGDIOBJ oldBmp = SelectObject(mem, bmp);
 
+        // фон
         HBRUSH wbg = g_hbrBk ? g_hbrBk : (HBRUSH)(COLOR_WINDOW + 1);
         FillRect(mem, &rc, wbg);
 
+        // левая панель
         int listW = ListPaneWidth(h);
         RenderList(mem, h, st, rc.left, rc.top, listW, rc.bottom - rc.top, st->listRc);
 
+        // разделитель
         HBRUSH sepBr = CreateSolidBrush(g_clrSeparator);
         RECT sep{ listW, rc.top, listW + 1, rc.bottom }; FillRect(mem, &sep, sepBr); DeleteObject(sepBr);
 
-        st->fields.clear();
-
-        if (st->sel < st->contacts.size()) {
-            int dx = listW + S(h, 12);
-            int dy = rc.top + S(h, 12);
-            int dw = rc.right - dx - S(h, 12);
-
-            const Contact& c = st->contacts[st->sel];
-            std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
-            if (name.empty()) name = L"(no name)";
-            DrawNameField(mem, st->fonts, h, dx, dy, dw, name);
-
-            // Photo: максимально 500x500 и не выходя за доступное место справа
-            if (c.photo && !c.photo->bytes.empty()) {
-                auto img = ImageFromBytes(c.photo->bytes);
-                if (img) {
-                    int iw = (int)img->GetWidth();
-                    int ih = (int)img->GetHeight();
-                    if (iw > 0 && ih > 0) {
-                        const int MAX_PHOTO = 500; // жёстный лимит размеров фото
-
-                        int bottomPad = S(h, 24);
-                        int availableH = (rc.bottom - dy) - bottomPad;
-                        if (availableH < S(h, 60)) availableH = S(h, 60);
-
-                        int maxW = dw, maxH = availableH;
-
-                        // базовый коэффициент — под доступную область
-                        double k_area = std::min(1.0, std::min((double)maxW / iw, (double)maxH / ih));
-
-                        // дополнительный кап — не больше 500x500
-                        double k_cap = std::min(1.0, std::min((double)MAX_PHOTO / iw, (double)MAX_PHOTO / ih));
-
-                        double k = std::min(k_area, k_cap);
-
-                        int drawW = (int)(iw * k);
-                        int drawH = (int)(ih * k);
-
-                        Gdiplus::Graphics g(mem);
-                        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-                        g.DrawImage(img.get(), dx, dy, drawW, drawH);
-
-                        dy += drawH + S(h, 8);
-                    }
-                }
-            }
-
-            auto& F = st->fonts;
-            auto pushField = [&](const std::wstring& lab, const std::wstring& val) {
-                RECT r = DrawLabelValueWithRect(mem, F, dx, dy, dw, lab, val, g_clrLabel, g_clrValue, h);
-                FieldHit fh; fh.rc = r; fh.label = lab; fh.value = val;
-                st->fields.push_back(std::move(fh));
-                };
-
-            if (!c.org.empty())   pushField(L"Org", c.org);
-            if (!c.title.empty()) pushField(L"Role", c.title);
-            if (!c.url.empty())   pushField(L"URL", c.url);
-            if (!c.bday.empty())  pushField(L"BDay", c.bday);
-
-            for (auto& p : c.phones) if (!p.number.empty()) pushField(L"Phone", p.number);
-
-            bool anyEmail = false;
-            for (auto& e : c.emails) {
-                if (e.addr.empty()) continue;
-                anyEmail = true; pushField(L"Email", e.addr);
-            }
-            if (!anyEmail) {
-                std::wstring fb = FallbackEmail_NotesAware(c);
-                if (!fb.empty()) pushField(L"Email", fb);
-            }
-
-            for (auto& a : c.addrs) if (!a.text.empty()) pushField(L"Address", a.text);
-
-            // ---- Multi-Notes ----
-            bool printedAnyNote = false;
-            if constexpr (detail_detect::has_notes<Contact>::value) {
-                if (!c.notes.empty()) {
-                    for (size_t i = 0; i < c.notes.size(); ++i) {
-                        std::wstring lab = (i == 0) ? L"Note" : (L"Note #" + std::to_wstring(i + 1));
-                        pushField(lab, c.notes[i]);
-                    }
-                    printedAnyNote = true;
-                }
-            }
-            if (!printedAnyNote && !c.note.empty()) {
-                pushField(L"Note", c.note); // fallback для старых контактов
-            }
-
-            // ---- Android custom section ----
-            if constexpr (detail_detect::has_android<Contact>::value) {
-                if (!c.androidCustoms.empty()) {
-                    for (const auto& ac : c.androidCustoms) {
-                        if (!ac.rawType.empty()) {
-                            pushField(L"Android type", ac.rawType);
-                        }
-                        for (size_t i = 0; i < ac.slots.size(); ++i) {
-                            if (ac.slots[i].empty()) continue;
-                            std::wstring lab = ac.slots.size() > 1 ? (L"Android slot #" + std::to_wstring(i + 1)) : L"Android";
-                            pushField(lab, ac.slots[i]);
-                        }
-                    }
-                }
-            }
-        }
-
+        // вывод
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, oldBmp); DeleteObject(bmp); DeleteDC(mem);
         EndPaint(h, &ps);
@@ -778,7 +782,7 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     st->contacts = contacts;
     st->sel = 0;
     st->listScroll = 0;
-    st->contextField = -1;
+    UpdateRightEdit(st);
     InvalidateRect(h, nullptr, TRUE);
 }
 
@@ -796,12 +800,12 @@ void VCFView_SetSelection(HWND h, size_t idx) {
     if (idx < st->contacts.size()) {
         st->sel = idx;
         EnsureSelVisible(h, st);
-        st->contextField = -1;
+        UpdateRightEdit(st);
         InvalidateRect(h, nullptr, TRUE);
     }
 }
 
-// Поиск — без изменений, но учитывает LowerInvariant в builder
+// Поиск — как раньше (регистр учитывается флагом, но нормализация к lower для корректности кириллицы)
 static bool isWordBoundary(const std::wstring& s, size_t pos) { return (pos == 0) || !iswalnum(s[pos - 1]); }
 static bool isWordBoundary2(const std::wstring& s, size_t pos) { return (pos >= s.size()) || !iswalnum(s[pos]); }
 
@@ -837,7 +841,7 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle,
         size_t pos = hay.find(n);
         while (pos != std::wstring::npos) {
             if (!wholeWord || (isWordBoundary(hay, pos) && isWordBoundary2(hay, pos + n.size()))) {
-                st->sel = i; EnsureSelVisible(h, st); InvalidateRect(h, nullptr, TRUE);
+                st->sel = i; EnsureSelVisible(h, st); UpdateRightEdit(st); InvalidateRect(h, nullptr, TRUE);
                 return true;
             }
             pos = hay.find(n, pos + 1);
