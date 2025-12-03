@@ -12,6 +12,7 @@
 #include <vector>
 #include <fstream>
 #include <cstring>
+#include <excpt.h>  // Оставляем, но не используем
 
 #include "vcf_parser.hpp"
 #include "vcf_view.hpp"
@@ -57,14 +58,16 @@ static HINSTANCE g_hInst = nullptr;
 extern "C" void VCFView_SetIniPath(const wchar_t* iniPath);
 extern "C" void VCFView_SetRawBlocks(HWND hView, const std::vector<std::wstring>& rawBlocks);
 
-// ANSI → UTF-16
+// ANSI → UTF-16 (твоя версия с malloc, чтобы no unwinding)
 static std::wstring A2W(const char* s) {
     if (!s) return L"";
     int need = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
     if (need <= 0) return L"";
-    std::wstring w; w.resize(need);
-    MultiByteToWideChar(CP_ACP, 0, s, -1, &w[0], need);
-    if (!w.empty() && w.back() == L'\0') w.pop_back();
+    wchar_t* buf = (wchar_t*)malloc(need * sizeof(wchar_t));
+    if (!buf) return L"";
+    MultiByteToWideChar(CP_ACP, 0, s, -1, buf, need);
+    std::wstring w(buf);
+    free(buf);
     return w;
 }
 
@@ -129,20 +132,6 @@ static std::vector<std::wstring> SplitVCardBlocks(const std::wstring& text) {
         i = e;
     }
     return out;
-}
-
-// Guards
-#define TRY_API     try {
-#define CATCH_API(r) } catch (...) { return (r); }
-#define TRY_VOID    try {
-#define CATCH_VOID  } catch (...) { /* swallow */ }
-
-BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        g_hInst = hinstDLL;
-        DisableThreadLibraryCalls(hinstDLL);
-    }
-    return TRUE;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -215,65 +204,120 @@ static void Impl_ListSetDefaultParams(const ListDefaultParamStruct* dps) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// x64: экспорт Unicode
+// x64: экспорт Unicode (с __try, так как x64 ok)
 #if defined(_WIN64)
 
 WLX_EXPORT HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLoad, int ShowFlags) {
-    TRY_API return Impl_ListLoadW(ParentWin, FileToLoad, ShowFlags); CATCH_API(NULL)
+    __try {
+        return Impl_ListLoadW(ParentWin, FileToLoad, ShowFlags);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return NULL;
+    }
 }
 WLX_EXPORT int __stdcall ListLoadNextW(HWND ParentWin, HWND PluginWin, wchar_t* FileToLoad, int ShowFlags) {
-    TRY_API return Impl_ListLoadNextW(ParentWin, PluginWin, FileToLoad, ShowFlags); CATCH_API(LISTPLUGIN_ERROR)
+    __try {
+        return Impl_ListLoadNextW(ParentWin, PluginWin, FileToLoad, ShowFlags);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return LISTPLUGIN_ERROR;
+    }
 }
 WLX_EXPORT int __stdcall ListSearchTextW(HWND PluginWin, wchar_t* SearchString, int SearchParameter) {
-    TRY_API return Impl_ListSearchTextW(PluginWin, SearchString, SearchParameter); CATCH_API(LISTPLUGIN_ERROR)
+    __try {
+        return Impl_ListSearchTextW(PluginWin, SearchString, SearchParameter);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return LISTPLUGIN_ERROR;
+    }
 }
 WLX_EXPORT int __stdcall ListSendCommand(HWND PluginWin, int Command, int Parameter) {
-    TRY_API return Impl_ListSendCommand(PluginWin, Command, Parameter); CATCH_API(0)
+    __try {
+        return Impl_ListSendCommand(PluginWin, Command, Parameter);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
 }
 WLX_EXPORT void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) {
-    TRY_VOID Impl_ListSetDefaultParams(dps); CATCH_VOID
+    __try {
+        Impl_ListSetDefaultParams(dps);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Игнорируем
+    }
 }
 WLX_EXPORT void __stdcall ListCloseWindow(HWND ListWin) {
-    TRY_VOID if (ListWin && IsWindow(ListWin)) DestroyWindow(ListWin); CATCH_VOID
+    __try {
+        if (ListWin && IsWindow(ListWin)) DestroyWindow(ListWin);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Игнорируем
+    }
 }
 WLX_EXPORT int __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
-    TRY_API
+    __try {
         if (!DetectString || maxlen <= 0) return 0;
-    const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
-    lstrcpynW(DetectString, ds, maxlen);
-    return 1;
-    CATCH_API(0)
+        const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
+        lstrcpynW(DetectString, ds, maxlen);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
 }
 
 #else
-// ─────────────────────────────────────────────────────────────────────────────
-// x86: экспорт ANSI через .def + обёртки
+// x86: экспорт ANSI + Unicode без __try
 extern "C" {
     int __stdcall ListGetDetectString(char* DetectString, int maxlen) {
-        TRY_API
-            const char* ds = "EXT=\"VCF\" | EXT=\"VCARD\"";
+        const char* ds = "EXT=\"VCF\" | EXT=\"VCARD\"";
         if (!DetectString || maxlen <= 0) return 0;
         strncpy_s(DetectString, maxlen, ds, _TRUNCATE);
         return 1;
-        CATCH_API(0)
     }
     HWND __stdcall ListLoad(HWND ParentWin, char* FileToLoad, int ShowFlags) {
-        TRY_API std::wstring wfile = A2W(FileToLoad); return Impl_ListLoadW(ParentWin, wfile.c_str(), ShowFlags); CATCH_API(NULL)
+        std::wstring wfile = A2W(FileToLoad);
+        return Impl_ListLoadW(ParentWin, wfile.c_str(), ShowFlags);
     }
     int __stdcall ListLoadNext(HWND ParentWin, HWND PluginWin, char* FileToLoad, int ShowFlags) {
-        TRY_API std::wstring wfile = A2W(FileToLoad); return Impl_ListLoadNextW(ParentWin, PluginWin, wfile.c_str(), ShowFlags); CATCH_API(LISTPLUGIN_ERROR)
+        std::wstring wfile = A2W(FileToLoad);
+        return Impl_ListLoadNextW(ParentWin, PluginWin, wfile.c_str(), ShowFlags);
     }
     int __stdcall ListSearchText(HWND PluginWin, char* SearchString, int SearchParameter) {
-        TRY_API std::wstring w = A2W(SearchString); return Impl_ListSearchTextW(PluginWin, w.c_str(), SearchParameter); CATCH_API(LISTPLUGIN_ERROR)
+        std::wstring w = A2W(SearchString);
+        return Impl_ListSearchTextW(PluginWin, w.c_str(), SearchParameter);
     }
     int __stdcall ListSendCommand(HWND PluginWin, int Command, int Parameter) {
-        TRY_API return Impl_ListSendCommand(PluginWin, Command, Parameter); CATCH_API(0)
+        return Impl_ListSendCommand(PluginWin, Command, Parameter);
     }
     void __stdcall ListSetDefaultParams(ListDefaultParamStruct* dps) {
-        TRY_VOID Impl_ListSetDefaultParams(dps); CATCH_VOID
+        Impl_ListSetDefaultParams(dps);
     }
     void __stdcall ListCloseWindow(HWND ListWin) {
-        TRY_VOID if (ListWin && IsWindow(ListWin)) DestroyWindow(ListWin); CATCH_VOID
+        if (ListWin && IsWindow(ListWin)) DestroyWindow(ListWin);
+    }
+
+    // Добавлено: Unicode версии для x86 (без __try)
+    HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLoad, int ShowFlags) {
+        return Impl_ListLoadW(ParentWin, FileToLoad, ShowFlags);
+    }
+    int __stdcall ListSearchTextW(HWND PluginWin, wchar_t* SearchString, int SearchParameter) {
+        return Impl_ListSearchTextW(PluginWin, SearchString, SearchParameter);
+    }
+    int __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
+        if (!DetectString || maxlen <= 0) return 0;
+        const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
+        lstrcpynW(DetectString, ds, maxlen);
+        return 1;
     }
 }
 #endif
+
+BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_hInst = hinstDLL;
+        DisableThreadLibraryCalls(hinstDLL);
+    }
+    return TRUE;
+}

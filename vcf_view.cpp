@@ -19,6 +19,7 @@
 #include <cwctype>
 #include <memory>
 #include <map>
+#include <locale>  // Добавлено для std::iswspace и локалей (хотя <cwctype> покрывает базовое)
 
 #include "vcf_view.hpp"
 
@@ -769,7 +770,7 @@ static void UpdateRightPanel(ViewState* st) {
         }
         else if (st->sel < st->contacts.size()) {
             const Contact& c = st->contacts[st->sel];
-            auto add = [&](const std::wstring& k, const std::wstring& v) { if (!v.empty()) { text += k; text += L": "; text += v; text += L"\r\n"; } };
+            auto add = [&](const std::wstring& k, const std::wstring& v) { if (!v.empty()) { text += k; text += v; text += L"\r\n"; } };
             std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
             if (name.empty()) name = L"(no name)";
             add(g_tcRu ? L"Имя" : L"Name", name);

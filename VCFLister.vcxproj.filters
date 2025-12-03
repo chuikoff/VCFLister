@@ -36,6 +36,9 @@
     <ClInclude Include="version_auto.h">
       <Filter>Resource Files</Filter>
     </ClInclude>
+    <ClInclude Include="vcf_view_theme.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">

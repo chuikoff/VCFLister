@@ -7,3 +7,7 @@ EXPORTS
     ListSearchText        = _ListSearchText@12
     ListSendCommand       = _ListSendCommand@12
     ListSetDefaultParams  = _ListSetDefaultParams@4
+    ListLoadW
+    ListCloseWindow
+    ListSearchTextW
+    ListGetDetectString

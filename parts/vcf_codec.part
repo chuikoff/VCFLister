@@ -1,0 +1,257 @@
+﻿// ============================================================================
+// parts/vcf_codec.part
+// vCard codecs & helpers: headers params, quoted-printable, base64, bytes→wide,
+// сборка многострочных значений. Ничего не трогает UI.
+// Требует utils: Trim(), ToUpperASCII() — они объявлены ниже как форварды.
+// ============================================================================
+
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <cwchar>
+#include <algorithm>
+#include <windows.h>
+
+// ---- форварды из parts/vcf_utils.part (у тебя уже подключен выше) ------------
+std::wstring Trim(const std::wstring& s);
+std::wstring ToUpperASCII(const std::wstring& s);
+
+// ============================================================================
+// HeaderHasParam: проверка/извлечение параметра из заголовка вида
+// "KEY;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:..."
+// Есть 2 перегрузки: (header, paramUpper) и (header, paramUpper, outValueUpper)
+// Требует: ToUpperASCII, Trim
+// ============================================================================
+
+// 3-арг: ищет ;PARAM и (если outValueUpper) возвращает VALUE (upper, без кавычек)
+static inline bool HeaderHasParam(const std::wstring& header,
+                                  const std::wstring& paramUpper,
+                                  std::wstring* outValueUpper)
+{
+    // нормализуем искомое имя к виду ";NAME"
+    std::wstring P = paramUpper;
+    if (!P.empty() && P[0] != L';') P.insert(P.begin(), L';');
+
+    // нечувствительный поиск
+    std::wstring H  = ToUpperASCII(header);
+    std::wstring PU = ToUpperASCII(P);
+
+    size_t p = H.find(PU);
+    if (p == std::wstring::npos) return false;
+
+    if (!outValueUpper) return true; // только наличие
+
+    // ищем '=' после имени параметра
+    size_t eq = H.find(L'=', p + PU.size());
+    if (eq == std::wstring::npos) { outValueUpper->clear(); return true; }
+
+    size_t v0 = eq + 1;
+
+    // значение может быть в кавычках
+    if (v0 < header.size() && header[v0] == L'"') {
+        size_t q = header.find(L'"', v0 + 1);
+        if (q == std::wstring::npos) q = header.size();
+        *outValueUpper = ToUpperASCII(Trim(header.substr(v0 + 1, q - (v0 + 1))));
+        return true;
+    }
+
+    // иначе — до следующего ';' или ':' (двоеточие отделяет ключ:значение)
+    size_t semi  = header.find(L';', v0);
+    size_t colon = header.find(L':', v0);
+    size_t end   = (semi == std::wstring::npos) ? colon
+                    : (colon == std::wstring::npos ? semi : std::min(semi, colon));
+    if (end == std::wstring::npos) end = header.size();
+
+    *outValueUpper = ToUpperASCII(Trim(header.substr(v0, end - v0)));
+    return true;
+}
+
+// 2-арг: просто проверка наличия параметра
+static inline bool HeaderHasParam(const std::wstring& header,
+                                  const std::wstring& paramUpper)
+{
+    return HeaderHasParam(header, paramUpper, nullptr);
+}
+
+// ============================================================================
+// DecodeQuotedPrintableToBytes
+// RFC 2045: =XX (hex); мягкий перенос строки "=" в конце строки; игнор CR/LF.
+// Для входа используем wchar_t, но обрабатываем только ASCII-байты.
+// ============================================================================
+
+static inline int hexval(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return int(c - L'0');
+    if (c >= L'A' && c <= L'F') return 10 + int(c - L'A');
+    if (c >= L'a' && c <= L'f') return 10 + int(c - L'a');
+    return -1;
+}
+
+std::vector<uint8_t> DecodeQuotedPrintableToBytes(const std::wstring& in)
+{
+    std::vector<uint8_t> out; out.reserve(in.size());
+    const size_t n = in.size();
+    for (size_t i = 0; i < n; ++i) {
+        wchar_t c = in[i];
+
+        // игнорируем CR/LF — предполагаем, что вызов уже склеил "мягкие переносы"
+        if (c == L'\r' || c == L'\n') continue;
+
+        if (c == L'=') {
+            // мягкий перенос: '=' в конце или перед CR/LF — пропускаем
+            if (i + 1 >= n) break;
+            if (in[i+1] == L'\r' || in[i+1] == L'\n') { ++i; continue; }
+
+            // =XX (hex)
+            if (i + 2 < n) {
+                int h1 = hexval(in[i+1]);
+                int h2 = hexval(in[i+2]);
+                if (h1 >= 0 && h2 >= 0) {
+                    out.push_back(uint8_t((h1 << 4) | h2));
+                    i += 2;
+                    continue;
+                }
+            }
+            // иначе трактуем '=' как обычный символ
+            out.push_back(uint8_t('='));
+        } else if (c <= 0xFF) {
+            out.push_back(uint8_t(c & 0xFF));
+        } else {
+            // не-ASCII — теряем старший байт (редкий кейс для QP тела)
+            out.push_back(uint8_t(c & 0xFF));
+        }
+    }
+    return out;
+}
+
+// ============================================================================
+// Base64Decode — стандартный декодер. Игнорирует пробелы/CRLF.
+// ============================================================================
+
+std::vector<uint8_t> Base64Decode(const std::wstring& inW)
+{
+    static const int8_t T[256] = {
+        // таблица перевода ASCII -> 6 бит; -1 = игнор; -2 = '=' padding
+        /* 0..42 */ -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                     -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,
+        /* '+' */   62,
+        /* ','-'.' */-1,-1,
+        /* '/' */   63,
+        /* '0'..'9' */52,53,54,55,56,57,58,59,60,61,
+        /* ':'..'@' */-1,-1,-1,-2,-1,-1,-1,
+        /* 'A'..'Z' */ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                       15,16,17,18,19,20,21,22,23,24,25,
+        /* '['..'`' */-1,-1,-1,-1,-1,
+        /* 'a'..'z' */26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                       41,42,43,44,45,46,47,48,49,50,51,
+        /* '{'..255 */-1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                       -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                       -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                       -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                       -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                       -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                       -1,-1,-1,-1,-1,-1,-1,-1, -1,-1,-1,-1,-1,-1,-1,-1,
+                       -1,-1,-1,-1,-1,-1,-1,-1
+    };
+
+    std::vector<uint8_t> out; out.reserve(inW.size() * 3 / 4);
+    uint32_t buf = 0; int bits = 0;
+
+    for (wchar_t wc : inW) {
+        unsigned ch = (wc <= 0xFF) ? (unsigned)wc : 0xFFu;
+        int8_t v = T[ch];
+        if (v == -1) continue;      // игнор: пробелы, CR, LF и т.п.
+        if (v == -2) {              // '=' padding
+            // сбрасываем кратно 8 бит
+            if (bits >= 8) { out.push_back(uint8_t(buf >> (bits - 8))); bits -= 8; }
+            if (bits >= 8) { out.push_back(uint8_t(buf >> (bits - 8))); bits -= 8; }
+            break;
+        }
+        buf = (buf << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(uint8_t((buf >> bits) & 0xFF));
+        }
+    }
+    // на всякий случай — если без '=' и ровно кратно байту
+    // (обычно тут bits==0)
+    return out;
+}
+
+// ============================================================================
+// BytesToWide — перекодирование байтов в UTF-16 (wstring) с учётом CHARSET
+// Поддержка распространённых наборов: UTF-8, UTF8, UTF-16/UNICODE,
+// Windows-1251/CP1251, KOI8-R, ISO-8859-5; иначе — пробуем UTF-8, потом ACP.
+// ============================================================================
+
+static inline UINT CharsetToCodepage(const std::wstring& charsetUpper)
+{
+    if (charsetUpper.empty()) return 0;
+
+    if (charsetUpper.find(L"UTF-8") != std::wstring::npos ||
+        charsetUpper.find(L"UTF8")  != std::wstring::npos)
+        return CP_UTF8;
+
+    if (charsetUpper.find(L"UTF-16") != std::wstring::npos ||
+        charsetUpper.find(L"UNICODE") != std::wstring::npos)
+        return 1200; // псевдо-код: обработаем отдельно
+
+    if (charsetUpper.find(L"1251") != std::wstring::npos)
+        return 1251; // Windows-1251 / CP1251
+
+    if (charsetUpper.find(L"KOI8-R") != std::wstring::npos ||
+        charsetUpper.find(L"KOI8R")  != std::wstring::npos)
+        return 20866; // koi8-r на Windows
+
+    if (charsetUpper.find(L"ISO-8859-5") != std::wstring::npos ||
+        charsetUpper.find(L"ISO8859-5")  != std::wstring::npos)
+        return 28595; // iso-8859-5
+
+    if (charsetUpper.find(L"CP1252") != std::wstring::npos ||
+        charsetUpper.find(L"WINDOWS-1252") != std::wstring::npos)
+        return 1252;
+
+    if (charsetUpper.find(L"CP1250") != std::wstring::npos ||
+        charsetUpper.find(L"WINDOWS-1250") != std::wstring::npos)
+        return 1250;
+
+    return 0; // неизвестно
+}
+
+std::wstring BytesToWide(const std::vector<uint8_t>& bytes, const std::wstring& charset)
+{
+    if (bytes.empty()) return std::wstring();
+
+    std::wstring up = ToUpperASCII(Trim(charset));
+    UINT cp = CharsetToCodepage(up);
+
+    // UTF-16 (LE/BE) — распознаём BOM или явный charset
+    if (cp == 1200) {
+        // Проверим BOM: FF FE (LE) или FE FF (BE)
+        if (bytes.size() >= 2) {
+            if (bytes[0] == 0xFF && bytes[1] == 0xFE) {
+                // UTF-16 LE
+                size_t n = (bytes.size() - 2) / 2;
+                std::wstring w; w.resize(n);
+                memcpy(&w[0], &bytes[2], n * 2);
+                return w;
+            }
+            if (bytes[0] == 0xFE && bytes[1] == 0xFF) {
+                // UTF-16 BE → LE
+                size_t n = (bytes.size() - 2) / 2;
+                std::wstring w; w.resize(n);
+                for (size_t i = 0; i < n; ++i) {
+                    wchar_t ch = wchar_t((bytes[2 + i*2] << 8) | bytes[2 + i*2 + 1]);
+                    w[i] = ch;
+                }
+                return w;
+            }
+        }
+        // без BOM — предполагаем LE
+        if (bytes.size() % 2 == 0) {
+            std::wstring w; w.resize(bytes.size() / 2);
+            memcpy(&w[0], &bytes[0], bytes.size());
+            return w;
+        }
+        // fallback на UTF-8 есл
