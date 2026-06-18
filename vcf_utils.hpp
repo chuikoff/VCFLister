@@ -3,6 +3,7 @@
 #include <vector>
 #include <cwctype>
 #include <algorithm>
+#include <windows.h>
 
 std::wstring Trim(const std::wstring& s);
 std::wstring ToUpperASCII(const std::wstring& s);

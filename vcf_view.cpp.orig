@@ -1,4 +1,4 @@
-﻿// vcf_view.cpp — левый список + правый блок: фото (сверху) + EDIT (ниже)
+// vcf_view.cpp — левый список + правый блок: фото (сверху) + EDIT (ниже)
 // Вывод ВСЕХ полей vCard (v2.1/v3/v4) c локализацией ключей/TYPE (RU/EN по языку TC)
 // 2.1: поддержка QUOTED-PRINTABLE + CHARSET, склейка мягких переносов, PHOTO;ENCODING=BASE64 многострочный
 #define UNICODE
@@ -22,8 +22,6 @@
 #include <locale>  // Добавлено для std::iswspace и локалей (хотя <cwctype> покрывает базовое)
 
 #include "vcf_view.hpp"
-#include "vcf_theme.hpp"
-#include "vcf_utils.hpp"
 
 // Заглушки на расширения
 struct AndroidCustom { std::wstring rawType; std::vector<std::wstring> slots; };
@@ -39,6 +37,80 @@ namespace detail_detect {
         static constexpr bool value = std::is_same<decltype(test<T>(0)), std::true_type>::value;
     };
 }
+
+// ===================== THEME (Auto + INI override) + язык TC =====================
+static std::wstring g_iniPath;
+static bool g_dark = false;
+static bool g_tcRu = false; // язык TC: русский/не-русский
+
+static HBRUSH   g_hbrBk = nullptr;
+static COLORREF g_clrBk, g_clrTxt, g_clrSub, g_clrGrid, g_clrSeparator;
+static COLORREF g_clrListBg, g_clrListSel;
+
+static void SafeDelBrush(HBRUSH& b) { if (b) { DeleteObject(b); b = nullptr; } }
+
+static bool ReadRegDWORD(HKEY root, const wchar_t* subkey, const wchar_t* name, DWORD& out) {
+    HKEY h; if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &h) != ERROR_SUCCESS) return false;
+    DWORD type = 0, size = sizeof(DWORD);
+    LONG r = RegGetValueW(h, nullptr, name, RRF_RT_REG_DWORD, &type, &out, &size);
+    RegCloseKey(h); return r == ERROR_SUCCESS;
+}
+static bool DetectSystemDark() {
+    DWORD v = 1; // 1=Light, 0=Dark
+    if (ReadRegDWORD(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", v))
+        return v == 0;
+    return false;
+}
+static int ReadIniDarkMode() {
+    if (g_iniPath.empty()) return 2;
+    wchar_t buf[16]{};
+    GetPrivateProfileStringW(L"VCFLister", L"Dark", L"2", buf, 16, g_iniPath.c_str());
+    if (buf[0] == L'0') return 0;
+    if (buf[0] == L'1') return 1;
+    return 2;
+}
+// Определяем язык TC по [Configuration] LanguageIni=...
+static bool DetectTCRussian() {
+    if (g_iniPath.empty()) return false;
+    wchar_t buf[MAX_PATH]{};
+    GetPrivateProfileStringW(L"Configuration", L"LanguageIni", L"", buf, MAX_PATH, g_iniPath.c_str());
+    std::wstring s = buf;
+    std::wstring low; low.resize(s.size());
+    std::transform(s.begin(), s.end(), low.begin(), ::towlower);
+    if (low.find(L"rus") != std::wstring::npos || low.find(L"russian") != std::wstring::npos)
+        return true;
+    return false;
+}
+
+static void RecomputeTheme() {
+    const int ini = ReadIniDarkMode();
+    const bool sysDark = DetectSystemDark();
+    g_dark = (ini == 2) ? sysDark : (ini == 1);
+    g_tcRu = DetectTCRussian();
+
+    if (g_dark) {
+        g_clrBk = RGB(32, 32, 32);
+        g_clrTxt = RGB(220, 220, 220);
+        g_clrSub = RGB(160, 160, 160);
+        g_clrGrid = RGB(64, 64, 64);
+        g_clrSeparator = RGB(70, 70, 70);
+        g_clrListBg = RGB(28, 28, 28);
+        g_clrListSel = RGB(60, 80, 120);
+    }
+    else {
+        g_clrBk = RGB(255, 255, 255);
+        g_clrTxt = RGB(30, 30, 30);
+        g_clrSub = RGB(110, 110, 110);
+        g_clrGrid = RGB(220, 220, 220);
+        g_clrSeparator = RGB(200, 200, 200);
+        g_clrListBg = RGB(248, 248, 248);
+        g_clrListSel = RGB(219, 234, 254);
+    }
+    SafeDelBrush(g_hbrBk);
+    g_hbrBk = CreateSolidBrush(g_clrBk);
+}
+extern "C" void VCFView_SetIniPath(const wchar_t* iniPath) { if (iniPath && *iniPath) g_iniPath = iniPath; RecomputeTheme(); }
+extern "C" void VCFView_RefreshTheme(HWND hWnd) { RecomputeTheme(); if (IsWindow(hWnd)) InvalidateRect(hWnd, nullptr, TRUE); }
 
 // ===================== Helpers =====================
 using namespace Gdiplus;
@@ -75,6 +147,12 @@ static std::wstring FallbackEmail_NotesAware(const Contact& c) {
         for (const auto& n : c.notes) { std::wstring f = ExtractEmailFromText(n); if (!f.empty()) return f; }
     }
     return L"";
+}
+
+static std::wstring ToUpperASCII(const std::wstring& s) {
+    std::wstring t = s;
+    std::transform(t.begin(), t.end(), t.begin(), [](wchar_t c) { return (c >= L'a' && c <= L'z') ? (wchar_t)(c - 32) : c; });
+    return t;
 }
 
 // === Кодеки для vCard 2.1: quoted-printable и конверсия к Unicode ===
@@ -174,9 +252,6 @@ static std::wstring LocalizeKey(const std::wstring& keyRaw, bool ru) {
         {L"X-MAIDENNAME",             {L"Maiden Name",            L"Девичья фамилия"}},
         {L"X-PHONETIC-MIDDLE-NAME",   {L"Phonetic Middle Name",   L"Фонетическое отчество"}},
         {L"X-PHONETIC-ORG",           {L"Phonetic Organization Name", L"Фонетическое название организации"}},
-        {L"X-PHONETIC-FIRST-NAME",    {L"Phonetic First Name",    L"Фонетическое имя"}},
-        {L"X-PHONETIC-LAST-NAME",     {L"Phonetic Last Name",     L"Фонетическая фамилия"}},
-        {L"X-MAIDENNAME",             {L"Maiden Name",            L"Девичья фамилия"}},
         {L"X-SOCIALPROFILE",          {L"Social Profile",         L"Социальный профиль"}},
     };
     auto it = mapKeys.find(up);
@@ -229,6 +304,38 @@ static std::wstring LocalizeTypeToken(const std::wstring& typeRaw, bool ru) {
 }
 
 // ===================== ВЫВОД ВСЕХ ПОЛЕЙ из сырого блока =====================
+static std::vector<std::wstring> SplitLines(const std::wstring& block) {
+    std::vector<std::wstring> lines; lines.reserve(64);
+    size_t i = 0, n = block.size();
+    while (i < n) {
+        size_t j = block.find_first_of(L"\r\n", i);
+        if (j == std::wstring::npos) { lines.push_back(block.substr(i)); break; }
+        lines.push_back(block.substr(i, j - i));
+        if (j < n && block[j] == L'\r') ++j;
+        if (j < n && block[j] == L'\n') ++j;
+        i = j;
+    }
+    return lines;
+}
+static std::vector<std::wstring> UnfoldVCard_Folded(const std::vector<std::wstring>& lines) {
+    // Склейка folded-строк: если следующая начинается с SP/HT, приклеиваем к предыдущей
+    std::vector<std::wstring> out;
+    for (const auto& L : lines) {
+        if (!out.empty() && !L.empty() && (L[0] == L' ' || L[0] == L'\t')) {
+            out.back() += L.substr(1);
+        }
+        else {
+            out.push_back(L);
+        }
+    }
+    return out;
+}
+static std::wstring Trim(const std::wstring& s) {
+    size_t a = 0, b = s.size();
+    while (a < b && iswspace(s[a])) ++a;
+    while (b > a && iswspace(s[b - 1])) --b;
+    return s.substr(a, b - a);
+}
 static bool IsSection(const std::wstring& s, const wchar_t* key) {
     std::wstring t = s; std::transform(t.begin(), t.end(), t.begin(), ::towupper);
     std::wstring k = key; std::transform(k.begin(), k.end(), k.begin(), ::towupper);
@@ -339,10 +446,6 @@ static std::wstring BuildLocalizedHead(const std::wstring& headRaw, bool ru) {
         else if (pname == L"PREF" || pname == L"ENCODING" || pname == L"CHARSET" || pname == L"VALUE") {
             continue;
         }
-        else if (pname == L"X-SERVICE-TYPE") {
-            // для IMPP и подобных
-            types.push_back(Trim(pval));
-        }
     }
 
     std::wstring label = LocalizeKey(key, ru);
@@ -381,9 +484,9 @@ static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
     int val = 0, valb = -8;
     for (wchar_t wc : wsrc) {
         if (wc == L'=' || wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') continue;
-        if (wc > 255) continue; // игнорируем невалидные вместо полного отказа (повышает совместимость)
+        if (wc > 255) return {}; // невалидный символ
         int d = T[(unsigned char)wc];
-        if (d == -1) continue;  // игнорируем не-base64 символы вместо abort (больше шансов на успех для реальных vcf)
+        if (d == -1) return {};  // не base64
         val = (val << 6) + d;
         valb += 6;
         if (valb >= 0) {
@@ -406,20 +509,12 @@ static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw
 
         size_t colon = L.find(L':'); if (colon == std::wstring::npos) continue;
         std::wstring head = Trim(L.substr(0, colon));
-        std::wstring headUpFull = ToUpperASCII(head);
-        size_t dot = headUpFull.find(L'.');
-        std::wstring headUpStripped = (dot != std::wstring::npos) ? headUpFull.substr(dot + 1) : headUpFull;
-        if (headUpStripped.rfind(L"PHOTO", 0) != 0) continue;
+        std::wstring headUp = ToUpperASCII(head);
+        size_t dot = headUp.find(L'.'); if (dot != std::wstring::npos) headUp = headUp.substr(dot + 1);
+        if (headUp.rfind(L"PHOTO", 0) != 0) continue;
 
-        // Собираем значение (передаём полный заголовок для ENCODING)
-        std::wstring val = CollectValuePossiblyMultiline(lines, i, headUpFull);
-        // Доп. очистка base64 — помогает с v2.1 folded + странными токенами вроде ;JPEG (см. contacts (6).vcf)
-        std::wstring b64clean;
-        b64clean.reserve(val.size());
-        for (wchar_t c : val) {
-            if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
-                (c >= L'0' && c <= L'9') || c == L'+' || c == L'/' || c == L'=') b64clean += c;
-        }
+        // Собираем значение (для BASE64 многострочное)
+        std::wstring val = CollectValuePossiblyMultiline(lines, i, headUp);
         // Случай data:... тоже поддержим (v3/v4)
         std::vector<BYTE> bytes;
         std::wstring vUp = ToUpperASCII(val);
@@ -428,14 +523,12 @@ static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw
             size_t comma = val.find(L',');
             if (comma != std::wstring::npos) {
                 std::wstring b64 = val.substr(comma + 1);
-                // clean for safety
-                std::wstring bc; for (wchar_t c : b64) if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='+'||c=='/'||c=='=') bc+=c;
-                bytes = Base64Decode(bc.empty() ? b64 : bc);
+                bytes = Base64Decode(b64);
             }
         }
         else {
             // BASE64 (2.1/3/4)
-            bytes = Base64Decode(b64clean.empty() ? val : b64clean);
+            bytes = Base64Decode(val);
         }
 
         if (!bytes.empty()) {
@@ -445,15 +538,12 @@ static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw
             memcpy(p, bytes.data(), bytes.size());
             GlobalUnlock(hMem);
             IStream* pStream = nullptr;
-            // FALSE so we control lifetime; free after FromStream has copied data
             if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) == S_OK) {
                 std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromStream(pStream));
                 pStream->Release();
-                // Do NOT GlobalFree here when using TRUE: the stream owns the HGLOBAL and will free it when the bitmap is destroyed.
                 if (bmp && bmp->GetLastStatus() == Ok) return bmp;
-            } else {
-                GlobalFree(hMem);
             }
+            GlobalFree(hMem);
         }
         // URL мы не загружаем
         break; // берём только первый PHOTO
@@ -461,82 +551,10 @@ static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw
     return nullptr;
 }
 
-// Создать Bitmap из сырых байтов изображения
-static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytes) {
-    if (bytes.empty()) return nullptr;
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
-    if (!hMem) return nullptr;
-    void* p = GlobalLock(hMem);
-    memcpy(p, bytes.data(), bytes.size());
-    GlobalUnlock(hMem);
-    IStream* pStream = nullptr;
-    // FALSE so we control; free after Bitmap has (hopefully) copied the data
-    if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) != S_OK) {
-        GlobalFree(hMem);
-        return nullptr;
-    }
-    std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromStream(pStream));
-    pStream->Release();
-    // Do NOT GlobalFree here when using TRUE: the stream owns the HGLOBAL and will free it when the bitmap is destroyed.
-    if (bmp && bmp->GetLastStatus() == Ok) return bmp;
-    return nullptr;
-}
-
-// Быстрая проверка: есть ли PHOTO в raw-блоке
-static bool RawBlockHasPhoto(const std::wstring& raw) {
-    auto lines0 = SplitLines(raw);
-    auto lines = UnfoldVCard_Folded(lines0);
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const std::wstring& L = lines[i];
-        if (L.empty()) continue;
-        if (IsSection(L, L"BEGIN:VCARD") || IsSection(L, L"END:VCARD") || IsSection(L, L"VERSION")) continue;
-        size_t colon = L.find(L':'); if (colon == std::wstring::npos) continue;
-        std::wstring head = Trim(L.substr(0, colon));
-        std::wstring headUp = ToUpperASCII(head);
-        size_t dot = headUp.find(L'.');
-        if (dot != std::wstring::npos) headUp = headUp.substr(dot + 1);
-        if (headUp.rfind(L"PHOTO", 0) == 0) return true;
-    }
-    return false;
-}
-
 // ===================== Сборка текста с локализацией и X-ABLabel значениями =====================
 static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
     auto lines0 = SplitLines(raw);
     auto lines = UnfoldVCard_Folded(lines0);
-
-    // Pre-collect X-ABLABELs to attach nice labels to itemN. fields instead of separate "Label:" lines
-    std::map<std::wstring, std::wstring> itemLabels;
-    for (size_t j = 0; j < lines.size(); ++j) {
-        const std::wstring& LL = lines[j];
-        if (LL.empty()) continue;
-        size_t ppos = LL.find(L':');
-        if (ppos == std::wstring::npos) continue;
-        std::wstring h = Trim(LL.substr(0, ppos));
-        std::wstring hUp = ToUpperASCII(h);
-        if (hUp.find(L"X-ABLABEL") == std::wstring::npos) continue;
-        size_t jj = j;
-        std::wstring v = CollectValuePossiblyMultiline(lines, jj, hUp);
-        // translate like before
-        std::wstring vUp = ToUpperASCII(v);
-        auto stripApple = [](std::wstring s) -> std::wstring {
-            if (s.find(L"_$!<") == 0 && s.size() > 4 && s.rfind(L">!$_") == s.size()-4) return s.substr(4, s.size()-8);
-            if (s.find(L"$!<") == 0 && s.rfind(L">!$") == s.size()-3) return s.substr(3, s.size()-6);
-            return s;
-        };
-        std::wstring norm = stripApple(vUp);
-        std::wstring translated = norm; // fallback raw
-        if (norm == L"HomePage") translated = ru ? L"Домашняя страница" : L"Home page";
-        else if (norm == L"Anniversary") translated = ru ? L"Годовщина" : L"Anniversary";
-        else if (norm == L"Mother") translated = ru ? L"Мать" : L"Mother";
-        else if (norm == L"Father") translated = ru ? L"Отец" : L"Father";
-        // find item prefix for this label
-        size_t d = h.find(L'.');
-        if (d != std::wstring::npos) {
-            std::wstring item = h.substr(0, d+1); // "item1."
-            itemLabels[item] = translated;
-        }
-    }
 
     std::wstring out;
     for (size_t i = 0; i < lines.size(); ++i) {
@@ -551,64 +569,7 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
 
         std::wstring head = Trim(L.substr(0, pos));
         std::wstring headUp = ToUpperASCII(head);
-        // Skip PHOTO fields — displayed separately in the photo panel
-        if (headUp.rfind(L"PHOTO", 0) == 0) continue;
-        // Skip X-ABLABEL lines themselves (we attach their value to the item field above)
-        if (headUp.find(L"X-ABLABEL") != std::wstring::npos) continue;
-
         std::wstring val = CollectValuePossiblyMultiline(lines, i, headUp);
-
-        // Clean structured fields: remove empty ;;; parts for nicer display (N, ADR etc.)
-        if (headUp.find(L"N") == 0 || headUp.find(L"ADR") == 0) {
-            std::vector<std::wstring> parts;
-            size_t start = 0;
-            while (start <= val.size()) {
-                size_t semi = val.find(L';', start);
-                if (semi == std::wstring::npos) { parts.push_back(Trim(val.substr(start))); break; }
-                parts.push_back(Trim(val.substr(start, semi - start)));
-                start = semi + 1;
-            }
-            std::wstring cleaned;
-            for (auto& p : parts) {
-                if (!p.empty()) {
-                    if (!cleaned.empty()) cleaned += (headUp.find(L"N") == 0 ? L" " : L", ");
-                    cleaned += p;
-                }
-            }
-            if (!cleaned.empty()) val = cleaned;
-        }
-
-        // Skip empty N/FN lines (e.g. N:;;;; or FN: ) to avoid "Name: " or "Full name: "
-        if (val.empty() && (headUp.find(L"N") == 0 || headUp == L"FN")) continue;
-
-        // Clean ugly Android custom lines a bit (strip vnd prefix and trailing ;;;;;;;;; )
-        if (headUp.find(L"X-ANDROID-CUSTOM") == 0) {
-            std::vector<std::wstring> parts;
-            size_t st = 0;
-            while (true) {
-                size_t s = val.find(L';', st);
-                if (s == std::wstring::npos) {
-                    parts.push_back(Trim(val.substr(st)));
-                    break;
-                }
-                parts.push_back(Trim(val.substr(st, s - st)));
-                st = s + 1;
-            }
-            if (!parts.empty()) {
-                std::wstring type = parts[0];
-                if (type.find(L"vnd.android.cursor.item/") == 0) type = type.substr(24);
-                std::wstring date = parts.size() > 1 ? parts[1] : L"";
-                std::wstring lbl = L"";
-                if (parts.size() > 3 && !parts[3].empty()) lbl = parts[3];
-                else if (parts.size() > 2 && !parts[2].empty() && parts[2] != L"0" && parts[2] != L"1") lbl = parts[2];
-                size_t scp = lbl.find(L';');
-                if (scp != std::wstring::npos) lbl = lbl.substr(0, scp);
-                std::wstring res = type;
-                if (!lbl.empty()) res += L": " + lbl;
-                if (!date.empty() && date != L"0" && date.find(L';') == std::wstring::npos) res += L" (" + date + L")";
-                val = res;
-            }
-        }
 
         // vCard 2.1: QUOTED-PRINTABLE + CHARSET
         std::wstring encVal;
@@ -629,23 +590,24 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             if (val.empty()) val = BytesToWide(bytes, 1251); // ещё раз, если UTF-8 не подошёл
         }
 
-        // Специальная обработка соцсетей для более чистого вида
-        if (headUp.find(L"X-SOCIALPROFILE") == 0) {
-            // Уже "Социальный профиль (twitter): url" из BuildLocalizedHead
-        }
-
-        std::wstring label = BuildLocalizedHead(head, ru);
-
-        // If this field has itemN. prefix and we have a custom label for it, use the nice label instead of standard key
-        size_t dotPos = head.find(L'.');
-        if (dotPos != std::wstring::npos) {
-            std::wstring item = head.substr(0, dotPos + 1);
-            auto it = itemLabels.find(item);
-            if (it != itemLabels.end()) {
-                label = it->second;
+        // Спец-перевод значений X-ABLabel (без слова "метка")
+        {
+            if (headUp.find(L"X-ABLABEL") == 0) {
+                std::wstring vUp = ToUpperASCII(val);
+                auto mapVal = [&](const wchar_t* token, const wchar_t* en, const wchar_t* ruWord) {
+                    if (vUp == ToUpperASCII(token)) { val = ru ? ruWord : en; return true; }
+                    return false;
+                    };
+                if (!mapVal(L"$!<HomePage>!$", L"Home page", L"Домашняя страница") &&
+                    !mapVal(L"$!<Anniversary>!$", L"Anniversary", L"Годовщина") &&
+                    !mapVal(L"$!<Mother>!$", L"Mother", L"Мать") &&
+                    !mapVal(L"$!<Father>!$", L"Father", L"Отец")) {
+                    // иначе оставить как есть
+                }
             }
         }
 
+        std::wstring label = BuildLocalizedHead(head, ru);
         out += label; out += L": "; out += val; out += L"\r\n";
     }
     return out;
@@ -673,6 +635,30 @@ struct ViewState {
     std::unique_ptr<Gdiplus::Bitmap> photo;  // изображение
     Fonts fonts;
 };
+
+// Экспорт для dllmain: установить сырые блоки
+extern "C" void VCFView_SetRawBlocks(HWND h, const std::vector<std::wstring>& rawBlocks) {
+    auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (!st) return;
+    st->rawBlocks = rawBlocks;
+
+    // обновим фото и текст
+    if (st->sel < st->rawBlocks.size()) {
+        st->photo = LoadPhotoFromRaw(st->rawBlocks[st->sel]);
+    }
+    else st->photo.reset();
+
+    if (IsWindow(st->hEdit)) {
+        std::wstring t = (st->sel < st->rawBlocks.size())
+            ? BuildFromRawBlock(st->rawBlocks[st->sel], g_tcRu)
+            : L"";
+        SendMessageW(st->hEdit, WM_SETTEXT, 0, (LPARAM)t.c_str());
+        SendMessageW(st->hEdit, EM_SETSEL, 0, 0);
+        SendMessageW(st->hEdit, EM_SCROLLCARET, 0, 0);
+    }
+
+    if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
+}
 
 // ===================== Копирование =====================
 static void SetClipboardTextW(HWND h, const std::wstring& text) {
@@ -730,12 +716,6 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
         std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
         if (name.empty()) name = L"(no name)";
 
-        // Индикатор фото
-        bool hasPhoto = false;
-        if (c.photo.has_value() || !c.photo_url.empty()) hasPhoto = true;
-        else if (idx < st->rawBlocks.size()) hasPhoto = RawBlockHasPhoto(st->rawBlocks[idx]);
-        if (hasPhoto) name += L" 📷";
-
         std::wstring sub;
         std::wstring pv = PrimaryPhone(c);
         if (!pv.empty()) sub = L"Tel: " + pv;
@@ -777,27 +757,10 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
 // ===================== EDIT и ФОТО: наполнение и поведение =====================
 static void UpdateRightPanel(ViewState* st) {
     if (!st) return;
-    // фото: приоритет — встроенное в Contact, затем rawBlocks
-    st->photo.reset();
-    if (st->sel < st->contacts.size()) {
-        const Contact& c = st->contacts[st->sel];
-        if (c.photo.has_value() && !c.photo->bytes.empty()) {
-            st->photo = BitmapFromMemory(c.photo->bytes);
-        }
-    }
-    if (!st->photo && st->sel < st->rawBlocks.size()) {
-        st->photo = LoadPhotoFromRaw(st->rawBlocks[st->sel]);
-    }
+    // фото
+    if (st->sel < st->rawBlocks.size()) st->photo = LoadPhotoFromRaw(st->rawBlocks[st->sel]);
+    else st->photo.reset();
     if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
-
-    // Force relayout of photo/edit area whenever photo data (re)loaded, to ensure non-zero height
-    if (st->hPhoto && IsWindow(st->hPhoto)) {
-        HWND mainH = GetParent(st->hPhoto);
-        if (mainH && IsWindow(mainH)) {
-            RECT rc; GetClientRect(mainH, &rc);
-            SendMessage(mainH, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
-        }
-    }
 
     // текст
     if (IsWindow(st->hEdit)) {
@@ -844,21 +807,6 @@ static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LP
             if (lister) { PostMessageW(lister, WM_KEYDOWN, VK_ESCAPE, 0); return 0; }
         }
         break;
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONUP:
-    case WM_RBUTTONDOWN:
-    case WM_RBUTTONUP:
-    case WM_MOUSEMOVE:  // for selection drag
-        {
-            LRESULT res = CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
-            // Redirect focus to main view window so TC lister can switch plugins/views (HEX, other plugins etc.)
-            // Selection remains visible thanks to ES_NOHIDESEL
-            HWND viewer = GetParent(hEdit);
-            if (viewer && IsWindow(viewer)) {
-                SetFocus(viewer);
-            }
-            return res;
-        }
     }
     return CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
 }
@@ -869,24 +817,20 @@ static LRESULT CALLBACK PhotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     auto* st = (ViewState*)GetWindowLongPtrW(parent, GWLP_USERDATA);
     switch (msg) {
     case WM_ERASEBKGND: {
-        // Paint will cover everything via double buffer; prevent default erase to reduce flicker
+        HDC dc = (HDC)wParam;
+        RECT rc; GetClientRect(hwnd, &rc);
+        FillRect(dc, &rc, g_hbrBk ? g_hbrBk : (HBRUSH)(COLOR_WINDOW + 1));
         return 1;
     }
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
         RECT rc; GetClientRect(hwnd, &rc);
-
-        // Double buffer the photo to reduce flicker (especially with larger size)
-        HDC memDC = CreateCompatibleDC(dc);
-        HBITMAP memBmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-        HGDIOBJ old = SelectObject(memDC, memBmp);
-
         HBRUSH bg = g_hbrBk ? g_hbrBk : (HBRUSH)(COLOR_WINDOW + 1);
-        FillRect(memDC, &rc, bg);
+        FillRect(dc, &rc, bg);
 
         if (st && st->photo) {
-            int maxW = std::min<int>(1000, rc.right - rc.left);
-            int maxH = std::min<int>(1000, rc.bottom - rc.top);
+            int maxW = std::min<int>(500, rc.right - rc.left);
+            int maxH = std::min<int>(500, rc.bottom - rc.top);
             UINT w = st->photo->GetWidth();
             UINT h = st->photo->GetHeight();
             if (w > 0 && h > 0) {
@@ -895,22 +839,14 @@ static LRESULT CALLBACK PhotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 double s = std::min<double>(1.0, std::min<double>(sx, sy));
                 int dw = static_cast<int>(static_cast<double>(w) * s);
                 int dh = static_cast<int>(static_cast<double>(h) * s);
-                // Align photo to top-left corner (as requested), keep aspect fit
-                int pad = 2;
-                int x = rc.left + pad;
-                int y = rc.top + pad;
+                int x = rc.left + ((rc.right - rc.left) - dw) / 2;
+                int y = rc.top + ((rc.bottom - rc.top) - dh) / 2;
 
-                Graphics g(memDC);
+                Graphics g(dc);
                 g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
                 g.DrawImage(st->photo.get(), Rect(x, y, dw, dh));
             }
         }
-
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
-        SelectObject(memDC, old);
-        DeleteObject(memBmp);
-        DeleteDC(memDC);
-
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -945,7 +881,7 @@ static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
         SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_POS; si.nPos = st->listScroll;
         SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
     }
-    InvalidateRect(h, nullptr, FALSE);
+    InvalidateRect(h, nullptr, TRUE);
 }
 
 // ===================== Window proc =====================
@@ -978,9 +914,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
 
         // EDIT ниже фото
-        // Убраны WS_VSCROLL | WS_HSCROLL — скроллбар теперь появляется только когда текст не влезает (по требованию)
-        st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY | ES_NOHIDESEL,
+        st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
             0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
         g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
@@ -1016,8 +951,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int ew = rc.right - ex - pad;
         if (ew < S(h, 100)) ew = std::max<int>(0, rc.right - (listW + pad));
 
-        // Фото: ширина = min(ew, 1000), высота по содержимому (≤1000). Размер увеличен в ~2 раза по запросу
-        int photoW = std::min<int>(ew, 1000);
+        // Фото: ширина = min(ew, 500), высота по содержимому (≤500)
+        int photoW = std::min<int>(ew, 500);
         int photoH = 0;
         if (st->photo) {
             UINT iw = st->photo->GetWidth();
@@ -1025,10 +960,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             double s = 1.0;
             if (iw > 0 && ih > 0) {
                 double sx = static_cast<double>(photoW) / static_cast<double>(iw);
-                double sy = 1000.0 / static_cast<double>(ih);
+                double sy = 500.0 / static_cast<double>(ih);
                 s = std::min<double>(1.0, std::min<double>(sx, sy));
             }
-            photoH = static_cast<int>(std::min<double>(1000.0, static_cast<double>(st->photo ? st->photo->GetHeight() : 0) * s));
+            photoH = static_cast<int>(std::min<double>(500.0, static_cast<double>(st->photo ? st->photo->GetHeight() : 0) * s));
         }
         int ey = pad;
         int sep = S(h, 8);
@@ -1039,8 +974,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int eh = rc.bottom - editY - pad;
         MoveWindow(st->hEdit, ex, editY, ew, std::max<int>(0, eh), TRUE);
 
-        InvalidateRect(h, nullptr, FALSE);
-        if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, FALSE);
+        InvalidateRect(h, nullptr, TRUE);
+        if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, TRUE);
         return 0;
     }
     case WM_VSCROLL: {
@@ -1063,7 +998,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             }
             pos = std::max<int>(0, std::min<int>(maxScroll, pos));
-            if (pos != st->listScroll) { st->listScroll = pos; InvalidateRect(h, nullptr, FALSE); }
+            if (pos != st->listScroll) { st->listScroll = pos; InvalidateRect(h, nullptr, TRUE); }
             SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_POS; si.nPos = st->listScroll;
             SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
             return 0;
@@ -1080,7 +1015,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             st->listScroll = std::max<int>(0, std::min<int>(maxScroll, st->listScroll + step));
             SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_POS; si.nPos = st->listScroll;
             SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
-            InvalidateRect(h, nullptr, FALSE);
+            InvalidateRect(h, nullptr, TRUE);
             return 0;
         }
         return 0;
@@ -1108,14 +1043,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int row = (y - pad) / rowH;
             if (row >= 0) {
                 size_t idx = (size_t)(st->listScroll + row);
-                if (idx < st->contacts.size()) { st->sel = idx; UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); return 0; }
+                if (idx < st->contacts.size()) { st->sel = idx; UpdateRightPanel(st); InvalidateRect(h, nullptr, TRUE); return 0; }
             }
         }
         return 0;
     }
     case WM_THEMECHANGED:
     case WM_SETTINGCHANGE:
-    case WM_SYSCOLORCHANGE: { RecomputeTheme(); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); return 0; }
+    case WM_SYSCOLORCHANGE: { RecomputeTheme(); UpdateRightPanel(st); InvalidateRect(h, nullptr, TRUE); return 0; }
 
                           // ПКМ по EDIT → «Копировать»
     case WM_CONTEXTMENU: {
@@ -1190,7 +1125,7 @@ HWND CreateVCFView(HWND parent, const std::vector<Contact>& contacts) {
         wc.lpszClassName = L"VCF_VIEW_CLASS"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClassW(&wc); reg = true;
     }
-    HWND h = CreateWindowExW(0, L"VCF_VIEW_CLASS", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND h = CreateWindowExW(0, L"VCF_VIEW_CLASS", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (h) VCFView_SetContacts(h, contacts);
     return h;
 }
@@ -1198,31 +1133,28 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
     st->contacts = contacts; st->sel = 0; st->listScroll = 0;
     UpdateRightPanel(st);
-    InvalidateRect(h, nullptr, FALSE);
-    // Force layout of photo/edit children now that photo may be available
-    RECT rc; GetClientRect(h, &rc);
-    SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+    InvalidateRect(h, nullptr, TRUE);
 }
-
-extern "C" void VCFView_SetRawBlocks(HWND h, const std::vector<std::wstring>& rawBlocks) {
-    auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
-    st->rawBlocks = rawBlocks;
-    UpdateRightPanel(st);
-    InvalidateRect(h, nullptr, FALSE);
-    // Force layout of photo/edit children now that photo may be available from raw
-    RECT rc; GetClientRect(h, &rc);
-    SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
-}
-
 size_t VCFView_Count(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); return st ? st->contacts.size() : 0; }
 size_t VCFView_GetSelection(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); return st ? st->sel : 0; }
 void VCFView_SetSelection(HWND h, size_t idx) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
-    if (idx < st->contacts.size()) { st->sel = idx; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); 
-        RECT rc; GetClientRect(h, &rc); SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom)); }
+    if (idx < st->contacts.size()) { st->sel = idx; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, TRUE); }
 }
 
 // Поиск — по разобранным полям (как было)
+static std::wstring LowerInvariant(const std::wstring& s) {
+    if (s.empty()) return s;
+    int need = LCMapStringW(LOCALE_INVARIANT, LCMAP_LOWERCASE, s.c_str(), -1, nullptr, 0);
+    if (need <= 0) { std::wstring t = s; std::transform(t.begin(), t.end(), t.begin(), ::towlower); return t; }
+    std::wstring out; out.resize(need);
+    LCMapStringW(LOCALE_INVARIANT, LCMAP_LOWERCASE, s.c_str(), -1, &out[0], need);
+    if (!out.empty() && out.back() == L'\0') out.pop_back();
+    return out;
+}
+static bool isWordBoundary(const std::wstring& s, size_t pos) { return (pos == 0) || !iswalnum(s[pos - 1]); }
+static bool isWordBoundary2(const std::wstring& s, size_t pos) { return (pos >= s.size()) || !iswalnum(s[pos]); }
+
 bool VCFView_SearchEx(HWND h, const std::wstring& needle, size_t startIndex, bool backwards, bool /*matchCase*/, bool wholeWord, bool wrap) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
     if (!st || st->contacts.empty() || needle.empty()) return false;
@@ -1250,7 +1182,7 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle, size_t startIndex, boo
         size_t pos = hay.find(n);
         while (pos != std::wstring::npos) {
             if (!wholeWord || (isWordBoundary(hay, pos) && isWordBoundary2(hay, pos + n.size()))) {
-                st->sel = i; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE);
+                st->sel = i; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, TRUE);
                 return true;
             }
             pos = hay.find(n, pos + 1);

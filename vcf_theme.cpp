@@ -2,22 +2,14 @@
 #include <algorithm>
 #include <windows.h>
 
-// ====== сюда ВСТАВЬ дословно твой блок из vcf_view.cpp ======
-//   - g_iniPath / g_dark / g_tcRu
-//   - g_hbrBk, g_clр*, SafeDelBrush
-//   - ReadRegDWORD, DetectSystemDark, ReadIniDarkMode, DetectTCRussian
-//   - RecomputeTheme
-//   - extern "C" void VCFView_SetIniPath(...)
-//   - extern "C" void VCFView_RefreshTheme(...)
 // =============================================================
-// ===================== THEME (Auto + INI override) + язык TC =====================
-static std::wstring g_iniPath;
-static bool g_dark = false;
-static bool g_tcRu = false; // язык TC: русский/не-русский
-
-static HBRUSH   g_hbrBk = nullptr;
-static COLORREF g_clrBk, g_clrTxt, g_clrSub, g_clrGrid, g_clrSeparator;
-static COLORREF g_clrListBg, g_clrListSel;
+// ===================== THEME (Auto + INI override) + СЏР·С‹Рє TC =====================
+std::wstring g_iniPath;
+bool g_dark = false;
+bool g_tcRu = false;
+HBRUSH   g_hbrBk = nullptr;
+COLORREF g_clrBk, g_clrTxt, g_clrSub, g_clrGrid, g_clrSeparator;
+COLORREF g_clrListBg, g_clrListSel;
 
 void SafeDelBrush(HBRUSH& b) { if (b) { DeleteObject(b); b = nullptr; } }
 
@@ -41,7 +33,7 @@ static int ReadIniDarkMode() {
     if (buf[0] == L'1') return 1;
     return 2;
 }
-// Определяем язык TC по [Configuration] LanguageIni=...
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ TC пїЅпїЅ [Configuration] LanguageIni=...
 static bool DetectTCRussian() {
     if (g_iniPath.empty()) return false;
     wchar_t buf[MAX_PATH]{};
@@ -54,7 +46,7 @@ static bool DetectTCRussian() {
     return false;
 }
 
-static void RecomputeTheme() {
+void RecomputeTheme() {
     const int ini = ReadIniDarkMode();
     const bool sysDark = DetectSystemDark();
     g_dark = (ini == 2) ? sysDark : (ini == 1);
@@ -84,4 +76,4 @@ static void RecomputeTheme() {
 extern "C" void VCFView_SetIniPath(const wchar_t* iniPath) { if (iniPath && *iniPath) g_iniPath = iniPath; RecomputeTheme(); }
 extern "C" void VCFView_RefreshTheme(HWND hWnd) { RecomputeTheme(); if (IsWindow(hWnd)) InvalidateRect(hWnd, nullptr, TRUE); }
 
-// ВНИМАНИЕ: НИЧЕГО в логике не меняем.
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ: пїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ.

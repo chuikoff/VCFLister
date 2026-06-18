@@ -1,7 +1,5 @@
 // dllmain.cpp — Total Commander Lister plugin (VCF Lister)
 // Добавлено: передаём в viewer сырьевые блоки vCard для полного вывода всех полей (v3/v4)
-#define UNICODE
-#define _UNICODE
 #define NOMINMAX
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
@@ -16,6 +14,7 @@
 
 #include "vcf_parser.hpp"
 #include "vcf_view.hpp"
+#include "vcf_utils.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Минимум из listplug.h
@@ -101,8 +100,11 @@ static std::wstring ReadWholeFileAsWide(const wchar_t* path) {
         (unsigned char)buf[2] == 0xBF) {
         return tryMbToW(buf.data() + 3, (int)buf.size() - 3, CP_UTF8, true);
     }
-    // строгий UTF-8 → 1251 → OEM → ACP
+    // строгий UTF-8 (без BOM) → нестрогий UTF-8 → 1251 → OEM → ACP
     std::wstring w = tryMbToW(buf.data(), (int)buf.size(), CP_UTF8, true);
+    if (!w.empty()) return w;
+    // пробуем UTF-8 без строгой проверки (для файлов UTF-8 без BOM)
+    w = tryMbToW(buf.data(), (int)buf.size(), CP_UTF8, false);
     if (!w.empty()) return w;
     w = tryMbToW(buf.data(), (int)buf.size(), 1251);
     if (!w.empty()) return w;
@@ -128,7 +130,21 @@ static std::vector<std::wstring> SplitVCardBlocks(const std::wstring& text) {
         }
         e = text.find_first_of(L"\r\n", e); // до конца строки после END:VCARD
         if (e == std::wstring::npos) e = n;
-        out.push_back(text.substr(b, e - b));
+        std::wstring block = text.substr(b, e - b);
+        // Skip completely empty cards (only BEGIN/END/VERSION, common in some exports)
+        auto cl = UnfoldVCard_Folded(SplitLines(block));
+        bool hasContent = false;
+        for (auto& cll : cl) {
+            std::wstring t = Trim(cll);
+            if (t.empty()) continue;
+            std::wstring tu = ToUpperASCII(t);
+            if (tu.find(L"BEGIN:") == 0 || tu.find(L"END:") == 0 || tu.find(L"VERSION:") == 0) continue;
+            hasContent = true;
+            break;
+        }
+        if (hasContent) {
+            out.push_back(block);
+        }
         i = e;
     }
     return out;
@@ -161,8 +177,18 @@ static int Impl_ListLoadNextW(HWND ParentWin, HWND PluginWin, const wchar_t* Fil
     std::vector<Contact> contacts = ParseVCard(text);
     std::vector<std::wstring> rawBlocks = SplitVCardBlocks(text);
 
+    // Ensure the view is properly updated with new contacts and raw blocks
     VCFView_SetContacts(PluginWin, contacts);
     VCFView_SetRawBlocks(PluginWin, rawBlocks);
+    
+    // Ensure the selection and display are properly reset/updated
+    if (!contacts.empty()) {
+        VCFView_SetSelection(PluginWin, 0); // Set selection to first contact
+    } else {
+        // If no contacts, still ensure the display is refreshed
+        InvalidateRect(PluginWin, NULL, TRUE);
+    }
+    
     return LISTPLUGIN_OK;
 }
 

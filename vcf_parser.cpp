@@ -12,6 +12,7 @@
 #include <type_traits> // <-- добавлено для SFINAE-хелперов
 
 #include "vcf_parser.hpp"
+#include "vcf_utils.hpp"
 
 // ---------- helpers ----------
 static inline std::wstring trim(const std::wstring& s) {
@@ -77,7 +78,7 @@ static std::vector<uint8_t> Base64Decode(const std::string& s) {
     int v = 0, vb = -8;
     for (unsigned char c : s) {
         if (c <= ' ') continue; // пропускаем пробелы/CRLF/TAB
-        if (c == '=') break;
+        if (c == '=') continue; // пропускаем padding = (не break, чтобы полностью декодировать)
         int d = val(c);
         if (d < 0) continue;
         v = (v << 6) | d;
@@ -277,7 +278,21 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         auto up = upper(raw);
 
         if (up == L"BEGIN:VCARD") { inCard = true; cur = Contact(); continue; }
-        if (up == L"END:VCARD") { if (inCard) { contacts.push_back(cur); cur = Contact(); inCard = false; } continue; }
+        if (up == L"END:VCARD") { 
+            if (inCard) { 
+                // Skip empty cards (only BEGIN/END, no real fields) - to keep sync with rawBlocks filter
+                bool hasData = !cur.fn.empty() || !cur.n_given.empty() || !cur.n_family.empty() ||
+                               !cur.org.empty() || !cur.title.empty() || !cur.url.empty() || !cur.bday.empty() ||
+                               !cur.note.empty() || !cur.phones.empty() || !cur.emails.empty() || !cur.addrs.empty() ||
+                               cur.photo.has_value() || !cur.notes.empty() || !cur.androidCustoms.empty();
+                if (hasData) {
+                    contacts.push_back(cur); 
+                }
+                cur = Contact(); 
+                inCard = false; 
+            } 
+            continue; 
+        }
         if (!inCard) continue;
 
         size_t colon = raw.find(L':');
@@ -289,7 +304,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         auto parts = split(left, L';');
         if (parts.empty()) continue;
 
-        std::wstring name = basePropName(upper(parts[0]));
+        std::wstring propName = basePropName(upper(parts[0]));
         std::vector<std::wstring> params;
         for (size_t i = 1; i < parts.size(); ++i) params.push_back(parts[i]);
 
@@ -328,44 +343,44 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         }
 
         // ----- раскладываем по полям -----
-        if (name == L"N") {
+        if (propName == L"N") {
             auto vs = split(value, L';');
             if (vs.size() >= 1) cur.n_family = unescape(decodeTextValue(vs[0], encQP, charset));
             if (vs.size() >= 2) cur.n_given = unescape(decodeTextValue(vs[1], encQP, charset));
         }
-        else if (name == L"FN") {
+        else if (propName == L"FN") {
             cur.fn = unescape(decodeTextValue(value, encQP, charset));
         }
-        else if (name == L"ORG") {
+        else if (propName == L"ORG") {
             cur.org = unescape(decodeTextValue(value, encQP, charset));
         }
-        else if (name == L"TITLE") {
+        else if (propName == L"TITLE") {
             cur.title = unescape(decodeTextValue(value, encQP, charset));
         }
-        else if (name == L"URL") {
+        else if (propName == L"URL") {
             cur.url = unescape(decodeTextValue(value, encQP, charset));
         }
-        else if (name == L"BDAY") {
+        else if (propName == L"BDAY") {
             cur.bday = unescape(decodeTextValue(value, encQP, charset));
         }
-        else if (name == L"NOTE") {
-            // РАНЬШЕ: перезатирали одно поле note (терялись много NOTE)  [исходник: см. блок NOTE] 
+        else if (propName == L"NOTE") {
+            // РАНЬШЕ: перезатирали одно поле note (терялись много NOTE)  [исходник: см. блок NOTE]
             // ТЕПЕРЬ: накапливаем все заметки (или конкатенируем, если в модели нет vector<notes>)
             addNote(cur, unescape(decodeTextValue(value, encQP, charset)));
         }
-        else if (name == L"TEL") {
+        else if (propName == L"TEL") {
             Phone p;
             p.number = unescape(decodeTextValue(value, encQP, charset));
             p.types = parseTypes(params);
             if (!p.number.empty()) cur.phones.push_back(std::move(p));
         }
-        else if (name == L"EMAIL") {
+        else if (propName == L"EMAIL") {
             Email e;
             e.addr = unescape(decodeTextValue(value, encQP, charset));
             e.types = parseTypes(params);
             if (!e.addr.empty()) cur.emails.push_back(std::move(e));
         }
-        else if (name == L"ADR") {
+        else if (propName == L"ADR") {
             auto vs = split(unescape(decodeTextValue(value, encQP, charset)), L';');
             std::wstring joined;
             for (auto& part : vs) {
@@ -378,7 +393,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                 cur.addrs.push_back(std::move(a));
             }
         }
-        else if (name == L"PHOTO") {
+        else if (propName == L"PHOTO") {
             // 1) PHOTO;VALUE=URL:...
             if (photoIsURL) {
                 cur.photo_url = unescape(decodeTextValue(value, encQP, charset));
@@ -387,10 +402,12 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             else if (photoIsBase64) {
                 // склеим возможные продолжения (начинаются с пробела/таба)
                 size_t j = idx;
+                std::wstring fullValue = value;
+                
                 while (j + 1 < lines.size()) {
                     const std::wstring& nxt = lines[j + 1];
                     if (!nxt.empty() && (nxt[0] == L' ' || nxt[0] == L'\t')) {
-                        value.append(nxt.c_str() + 1);
+                        fullValue.append(nxt.c_str() + 1);
                         ++j;
                     }
                     else break;
@@ -398,25 +415,94 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                 idx = j;
 
                 // wstring -> ASCII (base64 ASCII-only)
-                std::string b64; b64.reserve(value.size());
-                for (wchar_t wc : value) if (wc <= 0x7F) b64.push_back((char)wc);
+                std::string b64; b64.reserve(fullValue.size());
+                for (wchar_t wc : fullValue) if (wc <= 0x7F) b64.push_back((char)wc);
 
                 auto bytes = Base64Decode(b64);
                 setEmbeddedPhoto(cur, std::move(bytes));
             }
+            // 3) Добавим более широкую обработку фото в BASE64 формате, даже если не указано ENCODING=BASE64
+            else {
+                // Сначала проверим, нужно ли склеить многострочные данные (для случая без ENCODING=BASE64)
+                size_t j = idx;
+                std::wstring fullValue = value;
+                
+                // Проверим, начинаются ли следующие строки с пробела/таба (возможные продолжения BASE64 данных)
+                while (j + 1 < lines.size()) {
+                    const std::wstring& nxt = lines[j + 1];
+                    if (!nxt.empty() && (nxt[0] == L' ' || nxt[0] == L'\t')) {
+                        fullValue.append(nxt.c_str() + 1);
+                        ++j;
+                    }
+                    else break;
+                }
+                
+                // Обновим индекс, если были найдены продолжения
+                if (j > idx) {
+                    idx = j;
+                }
+                
+                // Удалим пробельные символы и проверим, похожи ли данные на BASE64
+                std::wstring cleanValue = fullValue;
+                cleanValue.erase(std::remove_if(cleanValue.begin(), cleanValue.end(),
+                    [](wchar_t c) { return c == L'\r' || c == L'\n' || c == L' ' || c == L'\t'; }), cleanValue.end());
+                
+                // Проверим, является ли значение похожим на BASE64 (содержит допустимые символы и имеет подходящую длину)
+                bool looksLikeBase64 = true;
+                size_t validChars = 0;
+                for (wchar_t c : cleanValue) {
+                    if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
+                        (c >= L'0' && c <= L'9') || c == L'+' || c == L'/' || c == L'=') {
+                        validChars++;
+                    } else {
+                        // Разрешаем только BASE64-символы
+                        if (c != L'\r' && c != L'\n' && c != L' ' && c != L'\t') {
+                            looksLikeBase64 = false;
+                            break;
+                        }
+                    }
+                }
+                
+                // Если строка содержит BASE64-символы и длина подходящая, пробуем декодировать
+                if (looksLikeBase64 && validChars > 0 && cleanValue.length() > 10) {
+                    // Проверим, что длина кратна 4 (для BASE64) или может быть дополнена до кратной 4
+                    std::wstring paddedValue = cleanValue;
+                    while (paddedValue.length() % 4 != 0) {
+                        paddedValue += L'=';
+                    }
+                    
+                    std::string b64; b64.reserve(paddedValue.size());
+                    for (wchar_t wc : paddedValue) if (wc <= 0x7F) b64.push_back((char)wc);
+                    
+                    auto bytes = Base64Decode(b64);
+                    if (!bytes.empty()) {
+                        setEmbeddedPhoto(cur, std::move(bytes));
+                    }
+                    else {
+                        // Если BASE64 декодирование не удалось, но значение выглядит как URL, сохраняем как URL
+                        if (fullValue.length() > 7 && (fullValue.substr(0, 7) == L"http://" || fullValue.substr(0, 8) == L"https://")) {
+                            cur.photo_url = fullValue;
+                        }
+                    }
+                }
+                // Если BASE64 декодирование не удалось, но значение выглядит как URL, сохраняем как URL
+                else if (fullValue.length() > 7 && (fullValue.substr(0, 7) == L"http://" || fullValue.substr(0, 8) == L"https://")) {
+                    cur.photo_url = fullValue;
+                }
+            }
         }
-        else if (name == L"X-ANDROID-CUSTOM") {
+        else if (propName == L"X-ANDROID-CUSTOM") {
             // Пример: X-ANDROID-CUSTOM:vnd.android.cursor.item/nickname;John;\;escaped\;;...
-            std::wstring raw = unescape(decodeTextValue(value, encQP, charset));
+            std::wstring raw_val = unescape(decodeTextValue(value, encQP, charset));
             std::wstring rawType;
             std::vector<std::wstring> slots;
-            size_t p = raw.find(L':');
+            size_t p = raw_val.find(L':');
             if (p != std::wstring::npos) {
-                rawType = raw.substr(0, p);
-                slots = splitSemicolonEscaped(raw.substr(p + 1));
+                rawType = raw_val.substr(0, p);
+                slots = splitSemicolonEscaped(raw_val.substr(p + 1));
             }
             else {
-                slots = splitSemicolonEscaped(raw);
+                slots = splitSemicolonEscaped(raw_val);
             }
             // положим (если есть место в модели; иначе тихий no-op)
             addAndroidCustom(cur, rawType, slots);

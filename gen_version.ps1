@@ -12,7 +12,7 @@ function Write-Header-Atomic($path, $text) {
 }
 
 # --- 1) Базовая версия из git-тэга (major.minor.patch) ---
-$major = 1; $minor = 0; $patch = 0
+$major = 2; $minor = 0; $patch = 0
 try {
     $tag = (git describe --tags --abbrev=0).Trim()   # vX.Y.Z
     if ($tag -match "^v(\d+)\.(\d+)\.(\d+)$") {
@@ -20,7 +20,7 @@ try {
         $minor = [int]$matches[2]
         $patch = [int]$matches[3]
     }
-} catch { }  # если git/tags нет — останется 1.0.0
+} catch { }  # если git/tags нет — останется 1.5.0
 
 $base = "$major.$minor.$patch"
 
@@ -66,7 +66,7 @@ $hdr = @"
 #define VCF_LISTER_FILEVER        $major,$minor,$patch,$build
 #define VCF_LISTER_PRODUCTVER     $major,$minor,$patch,$build
 #define VCF_LISTER_STRFILEVER     L"$versionStr"
-#define VCF_LISTER_STRPRODUCTVER  L"$versionStr"
+#define VCF_LISTER_STRPRODUCTVER L"$versionStr"
 
 #define VCF_LISTER_VERSION_STR           "$versionStr"
 #define VCF_LISTER_GIT_SHA               "$gitShaStr"
