@@ -1,0 +1,18 @@
+Для компиляции проекта VCFLister:
+
+1. Откройте файл решения VCFLister.sln в Visual Studio
+2. Выберите конфигурацию (Debug или Release) и платформу (x86 или x64)
+3. Нажмите "Собрать решение" (Build -> Build Solution) или нажмите Ctrl+Shift+B
+
+Альтернативно, можно использовать Developer Command Prompt от Visual Studio:
+1. Запустите "Developer Command Prompt for VS" от имени администратора
+2. Перейдите в директорию проекта
+3. Выполните команду:
+   msbuild VCFLister.sln /p:Configuration=Debug /p:Platform="x64"
+
+Или для Release конфигурации:
+   msbuild VCFLister.sln /p:Configuration=Release /p:Platform="x64"
+
+Изменения, которые были внесены:
+- В файле vcf_view.cpp в функции BuildFromRawBlock добавлена проверка для исключения PHOTO полей из текстового вывода
+- Теперь фото отображается отдельно, а в текстовом поле отображаются только текстовые поля контакта

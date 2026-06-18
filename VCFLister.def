@@ -1,9 +1,15 @@
 LIBRARY "VCFLister"
 EXPORTS
-    ListGetDetectString   = _ListGetDetectString@8
-    ListLoad              = _ListLoad@12
-    ListLoadNext          = _ListLoadNext@16
-    ListCloseWindow       = _ListCloseWindow@4
-    ListSearchText        = _ListSearchText@12
-    ListSendCommand       = _ListSendCommand@12
-    ListSetDefaultParams  = _ListSetDefaultParams@4
+    ; Unicode
+    ListGetDetectStringW
+    ListLoadW
+    ListCloseWindow
+    ListSearchTextW
+    ListSendCommand
+    ListSetDefaultParams
+
+    ; ANSI (Win32)
+    ListGetDetectString
+    ListLoad
+    ListLoadNext
+    ListSearchText
