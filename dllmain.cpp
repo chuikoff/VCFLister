@@ -131,20 +131,8 @@ static std::vector<std::wstring> SplitVCardBlocks(const std::wstring& text) {
         e = text.find_first_of(L"\r\n", e); // до конца строки после END:VCARD
         if (e == std::wstring::npos) e = n;
         std::wstring block = text.substr(b, e - b);
-        // Skip completely empty cards (only BEGIN/END/VERSION, common in some exports)
-        auto cl = UnfoldVCard_Folded(SplitLines(block));
-        bool hasContent = false;
-        for (auto& cll : cl) {
-            std::wstring t = Trim(cll);
-            if (t.empty()) continue;
-            std::wstring tu = ToUpperASCII(t);
-            if (tu.find(L"BEGIN:") == 0 || tu.find(L"END:") == 0 || tu.find(L"VERSION:") == 0) continue;
-            hasContent = true;
-            break;
-        }
-        if (hasContent) {
-            out.push_back(block);
-        }
+        // Show ALL cards, even completely empty ones (user request). Keep sync with parser.
+        out.push_back(block);
         i = e;
     }
     return out;

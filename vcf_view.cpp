@@ -164,6 +164,7 @@ static std::wstring LocalizeKey(const std::wstring& keyRaw, bool ru) {
         {L"KEY",          {L"Key",               L"Ключ"}},
         {L"PRODID",       {L"Product ID",        L"Идентификатор продукта"}},
         {L"VERSION",      {L"Version",           L"Версия"}},
+        {L"GENDER",       {L"Gender",            L"Пол"}},
 
         // Доп. ключи
         {L"X-ABDATE",                 {L"Additional Date",        L"Дополнительная дата"}},
@@ -245,7 +246,8 @@ static bool HeaderHasParam(const std::wstring& headUp, const std::wstring& pname
         if (eq != std::wstring::npos) {
             std::wstring name = Trim(token.substr(0, eq));
             if (name == pname) {
-                if (pValueOut) *pValueOut = Trim(token.substr(eq + 1));
+                std::wstring v = Trim(token.substr(eq + 1));
+                if (pValueOut) *pValueOut = unquote(v);
                 return true;
             }
         }
@@ -295,10 +297,23 @@ static std::wstring CollectValuePossiblyMultiline(const std::vector<std::wstring
         }
     }
     else if (isB64) {
-        // Для Base64: добавляем все следующие строки, пока в строке нет ':' (новое свойство)
+        // Для Base64 (особенно PHOTO): собираем продолжения.
+        // Останавливаемся только на строках, которые выглядят как начало нового свойства vCard (WORD:),
+        // чтобы не обрываться на случайных ':' внутри загрязнённых/плохих данных.
         while (i + 1 < lines.size()) {
             const std::wstring& nxt = lines[i + 1];
-            if (nxt.find(L':') != std::wstring::npos) break; // похоже, начало нового свойства
+            if (nxt.find(L':') != std::wstring::npos) {
+                std::wstring nt = Trim(nxt);
+                size_t cp = nt.find(L':');
+                if (cp != std::wstring::npos) {
+                    std::wstring prop = Trim(nt.substr(0, cp));
+                    // Простая эвристика: property name состоит из допустимых символов и выглядит как ключ
+                    bool looksLikeProp = !prop.empty() &&
+                        prop.find_first_not_of(L"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") == std::wstring::npos &&
+                        prop.size() >= 2;
+                    if (looksLikeProp) break;
+                }
+            }
             ++i;
             val += Trim(nxt);
         }
@@ -324,15 +339,16 @@ static std::wstring BuildLocalizedHead(const std::wstring& headRaw, bool ru) {
     for (size_t k = 1; k < parts.size(); ++k) {
         std::wstring p = parts[k];
         size_t eq = p.find(L'=');
-        if (eq == std::wstring::npos) { if (!p.empty()) types.push_back(p); continue; }
+        if (eq == std::wstring::npos) { if (!p.empty()) types.push_back(unquote(p)); continue; }
         std::wstring pname = ToUpperASCII(Trim(p.substr(0, eq)));
         std::wstring pval = Trim(p.substr(eq + 1));
         if (pname == L"TYPE") {
+            std::wstring tv = unquote(pval);
             size_t j = 0;
-            while (j < pval.size()) {
-                size_t comma = pval.find(L',', j);
-                if (comma == std::wstring::npos) { types.push_back(Trim(pval.substr(j))); break; }
-                types.push_back(Trim(pval.substr(j, comma - j)));
+            while (j < tv.size()) {
+                size_t comma = tv.find(L',', j);
+                if (comma == std::wstring::npos) { types.push_back(Trim(tv.substr(j))); break; }
+                types.push_back(Trim(tv.substr(j, comma - j)));
                 j = comma + 1;
             }
         }
@@ -380,10 +396,13 @@ static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
     std::vector<BYTE> out; out.reserve(wsrc.size() * 3 / 4);
     int val = 0, valb = -8;
     for (wchar_t wc : wsrc) {
-        if (wc == L'=' || wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') continue;
-        if (wc > 255) continue; // игнорируем невалидные вместо полного отказа (повышает совместимость)
+        if (wc == L'=' || wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') {
+            if (wc == L'=') break; // stop on padding, don't process further
+            continue;
+        }
+        if (wc > 255) continue;
         int d = T[(unsigned char)wc];
-        if (d == -1) continue;  // игнорируем не-base64 символы вместо abort (больше шансов на успех для реальных vcf)
+        if (d == -1) continue;
         val = (val << 6) + d;
         valb += 6;
         if (valb >= 0) {
@@ -395,6 +414,8 @@ static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
 }
 
 // Загрузка фото из raw (поддержка 2.1: многострочный Base64)
+static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytes);
+
 static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw) {
     auto lines0 = SplitLines(raw);
     auto lines = UnfoldVCard_Folded(lines0);
@@ -439,21 +460,8 @@ static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw
         }
 
         if (!bytes.empty()) {
-            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
-            if (!hMem) break;
-            void* p = GlobalLock(hMem);
-            memcpy(p, bytes.data(), bytes.size());
-            GlobalUnlock(hMem);
-            IStream* pStream = nullptr;
-            // FALSE so we control lifetime; free after FromStream has copied data
-            if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) == S_OK) {
-                std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromStream(pStream));
-                pStream->Release();
-                // Do NOT GlobalFree here when using TRUE: the stream owns the HGLOBAL and will free it when the bitmap is destroyed.
-                if (bmp && bmp->GetLastStatus() == Ok) return bmp;
-            } else {
-                GlobalFree(hMem);
-            }
+            // Delegate to common loader (fixes ownership/stream timing for reliable decode+render)
+            return BitmapFromMemory(bytes);
         }
         // URL мы не загружаем
         break; // берём только первый PHOTO
@@ -467,18 +475,46 @@ static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
     if (!hMem) return nullptr;
     void* p = GlobalLock(hMem);
+    if (!p) {
+        GlobalFree(hMem);
+        return nullptr;
+    }
     memcpy(p, bytes.data(), bytes.size());
     GlobalUnlock(hMem);
     IStream* pStream = nullptr;
-    // FALSE so we control; free after Bitmap has (hopefully) copied the data
-    if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) != S_OK) {
+    if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) != S_OK) {  // TRUE: stream will free hMem on Release()
         GlobalFree(hMem);
         return nullptr;
     }
     std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromStream(pStream));
+    // Best-effort decode for real-world (sometimes slightly corrupt) vCard photos.
+    // Query dimensions even if status != Ok; many JPEGs with minor issues still report size.
+    bool good = false;
+    UINT w = 0, h = 0;
+    if (bmp) {
+        // Always try to get size — force materialization
+        w = bmp->GetWidth();
+        h = bmp->GetHeight();
+        if (w > 0 && h > 0) good = true;
+    }
+    if (good && w > 0 && h > 0) {
+        // Extra force: lock bits
+        BitmapData bd{};
+        Rect r(0, 0, (INT)w, (INT)h);
+        if (bmp->LockBits(&r, ImageLockModeRead, PixelFormat32bppARGB, &bd) == Ok) {
+            bmp->UnlockBits(&bd);
+        }
+        // Clone to a fully independent Bitmap (owns its own pixel buffer).
+        Bitmap* cloned = bmp->Clone(Rect(0, 0, (INT)w, (INT)h), PixelFormat32bppARGB);
+        if (cloned && cloned->GetLastStatus() == Ok) {
+            pStream->Release();
+            return std::unique_ptr<Gdiplus::Bitmap>(cloned);
+        }
+        // If clone failed but we have positive size, still try to return the original bmp (best effort)
+        pStream->Release();
+        return bmp;
+    }
     pStream->Release();
-    // Do NOT GlobalFree here when using TRUE: the stream owns the HGLOBAL and will free it when the bitmap is destroyed.
-    if (bmp && bmp->GetLastStatus() == Ok) return bmp;
     return nullptr;
 }
 
@@ -551,8 +587,21 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
 
         std::wstring head = Trim(L.substr(0, pos));
         std::wstring headUp = ToUpperASCII(head);
-        // Skip PHOTO fields — displayed separately in the photo panel
-        if (headUp.rfind(L"PHOTO", 0) == 0) continue;
+        // Strip itemN. / group prefix so checks work for Apple-style "item4.PHOTO", "item1.X-ABLABEL" etc.
+        {
+            size_t dot = headUp.find(L'.');
+            if (dot != std::wstring::npos) headUp = headUp.substr(dot + 1);
+        }
+        // Skip PHOTO fields — displayed separately in the photo panel.
+        // Only skip embedded/base64 photos (to avoid dumping huge base64 into text).
+        // URI photos (vCard 4 / some v3) should be shown as "Photo: https://..."
+        if (headUp.rfind(L"PHOTO", 0) == 0) {
+            std::wstring rawVal = (pos != std::wstring::npos && pos + 1 < L.size()) ? Trim(L.substr(pos + 1)) : L"";
+            bool isUriPhoto = rawVal.find(L"http://") == 0 || rawVal.find(L"https://") == 0 || rawVal.find(L"data:") == 0;
+            bool looksLikeBase64 = !isUriPhoto && (rawVal.size() > 60 || rawVal.find(L'/') == 0 || rawVal.find(L"9j") == 0);
+            if (!isUriPhoto && looksLikeBase64) continue;
+            // URI or short photo value -> let it through to be displayed
+        }
         // Skip X-ABLABEL lines themselves (we attach their value to the item field above)
         if (headUp.find(L"X-ABLABEL") != std::wstring::npos) continue;
 
@@ -646,6 +695,11 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             }
         }
 
+        // Special handling for the encoded custom fields in this vCard (from ez-vcard sample)
+        if (headUp.find(L"X-FCENCODED-") == 0) {
+            label = ru ? L"Связанное / Пользовательское" : L"Related / Custom";
+        }
+
         out += label; out += L": "; out += val; out += L"\r\n";
     }
     return out;
@@ -669,6 +723,9 @@ struct ViewState {
     HWND hScroll = nullptr;
     HWND hPhoto = nullptr;                  // окно превью фото
     HWND hEdit = nullptr;
+
+    int rightScroll = 0;
+    HWND hRightScroll = nullptr;            // scrollbar for right panel (large photo / long text)
 
     std::unique_ptr<Gdiplus::Bitmap> photo;  // изображение
     Fonts fonts;
@@ -728,7 +785,10 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
         const Contact& c = st->contacts[idx];
 
         std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
-        if (name.empty()) name = L"(no name)";
+        if (name.empty()) {
+            // Show empty cards explicitly
+            name = g_tcRu ? L"(пустая карточка)" : L"(empty card)";
+        }
 
         // Индикатор фото
         bool hasPhoto = false;
@@ -921,7 +981,8 @@ static LRESULT CALLBACK PhotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 // ===================== Выбор/скролл =====================
 static void EnsureSelVisible(HWND h, ViewState* st) {
     RECT rc; GetClientRect(h, &rc);
-    int innerH = rc.bottom - rc.top - S(h, 16);
+    int statusH = S(h, 18);
+    int innerH = (rc.bottom - statusH) - S(h, 16);
     int rowH = st->listItemH ? st->listItemH : S(h, 52);
     int per = std::max<int>(1, innerH / rowH);
     st->perPage = per;
@@ -937,7 +998,7 @@ static void EnsureSelVisible(HWND h, ViewState* st) {
 static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
     if (!st || st->contacts.empty()) return;
     if (idx >= st->contacts.size()) idx = st->contacts.size() - 1;
-    st->sel = idx; EnsureSelVisible(h, st);
+    st->sel = idx; st->rightScroll = 0; EnsureSelVisible(h, st);
 
     UpdateRightPanel(st);
 
@@ -973,14 +1034,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // Скролл слева
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
             0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+        // Правый скроллбар для карточки (большое фото или много текста)
+        st->hRightScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
+            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+
         // Фото сверху справа
         st->hPhoto = CreateWindowExW(0, kPhotoClass, L"", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
 
         // EDIT ниже фото
-        // Убраны WS_VSCROLL | WS_HSCROLL — скроллбар теперь появляется только когда текст не влезает (по требованию)
+        // Добавлен WS_VSCROLL для явного скроллбара в карточке при большом объёме данных
         st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY | ES_NOHIDESEL,
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY | ES_NOHIDESEL | WS_VSCROLL | WS_HSCROLL,
             0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
         g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
@@ -993,6 +1059,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (st->hEdit && IsWindow(st->hEdit)) DestroyWindow(st->hEdit);
             if (st->hPhoto && IsWindow(st->hPhoto)) DestroyWindow(st->hPhoto);
             if (st->hScroll && IsWindow(st->hScroll)) DestroyWindow(st->hScroll);
+            if (st->hRightScroll && IsWindow(st->hRightScroll)) DestroyWindow(st->hRightScroll);
             st->photo.reset();
             FreeFonts(st->fonts); delete st;
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
@@ -1006,9 +1073,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         RECT rc; GetClientRect(h, &rc);
         int listW = ListPaneWidth(h);
         int sbw = GetSystemMetrics(SM_CXVSCROLL);
-        int cy = HIWORD(l);
+        int statusH = S(h, 18);
+        int listContentH = rc.bottom - statusH;
 
-        MoveWindow(st->hScroll, listW - sbw, 0, sbw, cy, TRUE);
+        MoveWindow(st->hScroll, listW - sbw, 0, sbw, listContentH, TRUE);
 
         // Правая колонка
         int pad = S(h, 12);
@@ -1030,14 +1098,46 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             photoH = static_cast<int>(std::min<double>(1000.0, static_cast<double>(st->photo ? st->photo->GetHeight() : 0) * s));
         }
+        if (st->photo && photoH <= 0) photoH = 100; // min height to show the photo window
+
         int ey = pad;
         int sep = S(h, 8);
-        MoveWindow(st->hPhoto, ex, ey, photoW, (photoH > 0 ? photoH : 0), TRUE);
 
-        // EDIT: ниже фото
+        // Правый скролл для карточки: учитываем rightScroll для позиционирования содержимого
+        int rightScroll = st->rightScroll;
+        int rightScrollBarW = GetSystemMetrics(SM_CXVSCROLL);
+
+        // Позиция правого скроллбара (справа от правой колонки)
+        int rightAreaTop = pad;
+        int rightAreaH = rc.bottom - statusH - pad;  // примерно высота правой области с учётом статусбара слева
+        if (rightAreaH < 50) rightAreaH = 50;
+        MoveWindow(st->hRightScroll, ex + ew, rightAreaTop, rightScrollBarW, rightAreaH, TRUE);
+
+        // Позиционируем фото и EDIT с учётом скролла (для большого фото / длинного текста)
+        MoveWindow(st->hPhoto, ex, ey - rightScroll, photoW, (photoH > 0 ? photoH : 0), TRUE);
+
         int editY = ey + (photoH > 0 ? photoH + sep : 0);
-        int eh = rc.bottom - editY - pad;
-        MoveWindow(st->hEdit, ex, editY, ew, std::max<int>(0, eh), TRUE);
+        int eh = (rc.bottom - statusH) - editY - pad;
+        MoveWindow(st->hEdit, ex, editY - rightScroll, ew, std::max<int>(0, eh), TRUE);
+
+        // Обновляем диапазон правого скроллбара
+        int contentBottom = editY + std::max<int>(0, eh) + pad;
+        int maxScroll = std::max(0, contentBottom - rightAreaH);
+        SCROLLINFO rsi{};
+        rsi.cbSize = sizeof(rsi);
+        rsi.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        rsi.nMin = 0;
+        rsi.nMax = maxScroll;
+        rsi.nPage = rightAreaH / 2;  // примерно
+        rsi.nPos = std::min(rightScroll, maxScroll);
+        SetScrollInfo(st->hRightScroll, SB_CTL, &rsi, TRUE);
+        ShowWindow(st->hRightScroll, (maxScroll > 0) ? SW_SHOW : SW_HIDE);
+
+        // Если текущий скролл больше допустимого — подправим
+        if (rightScroll > maxScroll) {
+            st->rightScroll = maxScroll;
+            // переместим заново (повторный вызов layout не нужен, т.к. мы уже установили)
+        }
 
         InvalidateRect(h, nullptr, FALSE);
         if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, FALSE);
@@ -1068,6 +1168,38 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
             return 0;
         }
+        else if ((HWND)l == st->hRightScroll) {
+            // Скролл правой панели (карточка) — большое фото или длинный текст
+            RECT rc; GetClientRect(h, &rc);
+            int pad = S(h, 12);
+            int listW = ListPaneWidth(h);
+            int ex = listW + 1 + pad;
+            int ew = rc.right - ex - pad;
+            if (ew < S(h, 100)) ew = std::max<int>(0, rc.right - (listW + pad));
+            int statusH = S(h, 18);
+            int rightAreaH = rc.bottom - statusH - pad;
+            if (rightAreaH < 50) rightAreaH = 50;
+
+            int pos = st->rightScroll;
+            switch (LOWORD(w)) {
+            case SB_LINEUP:   pos -= 30; break;
+            case SB_LINEDOWN: pos += 30; break;
+            case SB_PAGEUP:   pos -= rightAreaH / 2; break;
+            case SB_PAGEDOWN: pos += rightAreaH / 2; break;
+            case SB_TOP:      pos = 0; break;
+            case SB_BOTTOM:   pos = 999999; break;
+            case SB_THUMBTRACK:
+            case SB_THUMBPOSITION: {
+                SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_TRACKPOS;
+                GetScrollInfo(st->hRightScroll, SB_CTL, &si); pos = si.nTrackPos; break;
+            }
+            }
+            st->rightScroll = std::max(0, pos);
+            SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+            InvalidateRect(h, nullptr, FALSE);
+            if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, FALSE);
+            return 0;
+        }
         break;
     }
     case WM_MOUSEWHEEL: {
@@ -1082,6 +1214,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
             InvalidateRect(h, nullptr, FALSE);
             return 0;
+        } else {
+            // Скролл правой карточки колесом мыши, если курсор над правой областью
+            int listW = ListPaneWidth(h);
+            if (pt.x > listW) {
+                int delta = GET_WHEEL_DELTA_WPARAM(w);
+                int step = (delta > 0) ? -40 : +40;
+                st->rightScroll = std::max(0, st->rightScroll + step);
+                RECT rc; GetClientRect(h, &rc);
+                SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+                InvalidateRect(h, nullptr, FALSE);
+                if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, FALSE);
+                return 0;
+            }
         }
         return 0;
     }
@@ -1108,7 +1253,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int row = (y - pad) / rowH;
             if (row >= 0) {
                 size_t idx = (size_t)(st->listScroll + row);
-                if (idx < st->contacts.size()) { st->sel = idx; UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); return 0; }
+                if (idx < st->contacts.size()) { st->sel = idx; st->rightScroll = 0; UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); return 0; }
             }
         }
         return 0;
@@ -1168,10 +1313,37 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         FillRect(mem, &rc, wbg);
 
         int listW = ListPaneWidth(h);
-        RenderList(mem, h, st, rc.left, rc.top, listW, rc.bottom - rc.top, st->listRc);
+        int statusH = S(h, 18);
+        int listH = rc.bottom - statusH;
+        RenderList(mem, h, st, rc.left, rc.top, listW, listH, st->listRc);
 
         HBRUSH sepBr = CreateSolidBrush(g_clrSeparator);
         RECT sep{ listW, rc.top, listW + 1, rc.bottom }; FillRect(mem, &sep, sepBr); DeleteObject(sepBr);
+
+        // Status bar under the list (total contacts count)
+        if (statusH > 0) {
+            RECT srect{ rc.left, rc.bottom - statusH, listW, rc.bottom };
+            HBRUSH sbr = CreateSolidBrush(g_clrListBg);
+            FillRect(mem, &srect, sbr); DeleteObject(sbr);
+
+            HFONT oldf = (HFONT)SelectObject(mem, st->fonts.hSmall);
+            SetBkMode(mem, TRANSPARENT);
+            SetTextColor(mem, g_clrSub);
+            std::wstring stxt = g_tcRu ? L"Контактов: " : L"Contacts: ";
+            stxt += std::to_wstring((int)st->contacts.size());
+            if (!st->contacts.empty()) {
+                stxt += g_tcRu ? L"  (" : L"  (";
+                stxt += std::to_wstring(st->sel + 1);
+                stxt += L"/";
+                stxt += std::to_wstring((int)st->contacts.size());
+                stxt += L")";
+            }
+            RECT tr = srect;
+            tr.left += S(h, 6);
+            tr.right -= S(h, 6);
+            DrawTextW(mem, stxt.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(mem, oldf);
+        }
 
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, oldBmp); DeleteObject(bmp); DeleteDC(mem);
@@ -1197,6 +1369,7 @@ HWND CreateVCFView(HWND parent, const std::vector<Contact>& contacts) {
 void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
     st->contacts = contacts; st->sel = 0; st->listScroll = 0;
+    st->rightScroll = 0;
     UpdateRightPanel(st);
     InvalidateRect(h, nullptr, FALSE);
     // Force layout of photo/edit children now that photo may be available
@@ -1207,6 +1380,7 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
 extern "C" void VCFView_SetRawBlocks(HWND h, const std::vector<std::wstring>& rawBlocks) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
     st->rawBlocks = rawBlocks;
+    st->rightScroll = 0;
     UpdateRightPanel(st);
     InvalidateRect(h, nullptr, FALSE);
     // Force layout of photo/edit children now that photo may be available from raw
@@ -1218,7 +1392,7 @@ size_t VCFView_Count(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_
 size_t VCFView_GetSelection(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); return st ? st->sel : 0; }
 void VCFView_SetSelection(HWND h, size_t idx) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
-    if (idx < st->contacts.size()) { st->sel = idx; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); 
+    if (idx < st->contacts.size()) { st->sel = idx; st->rightScroll = 0; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); 
         RECT rc; GetClientRect(h, &rc); SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom)); }
 }
 

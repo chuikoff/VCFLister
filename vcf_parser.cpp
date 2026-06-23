@@ -37,6 +37,13 @@ static std::vector<std::wstring> split(const std::wstring& s, wchar_t sep) {
     return out;
 }
 // расширено: обрабатываем также экранированный двоеточие '\:'
+static std::wstring unquote(const std::wstring& s) {
+    if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"') {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
 static std::wstring unescape(const std::wstring& s) {
     std::wstring r; r.reserve(s.size());
     for (size_t i = 0; i < s.size(); ++i) {
@@ -78,7 +85,7 @@ static std::vector<uint8_t> Base64Decode(const std::string& s) {
     int v = 0, vb = -8;
     for (unsigned char c : s) {
         if (c <= ' ') continue; // пропускаем пробелы/CRLF/TAB
-        if (c == '=') continue; // пропускаем padding = (не break, чтобы полностью декодировать)
+        if (c == '=') break; // stop on padding
         int d = val(c);
         if (d < 0) continue;
         v = (v << 6) | d;
@@ -197,7 +204,8 @@ static std::vector<std::wstring> parseTypes(const std::vector<std::wstring>& par
     for (auto& p : params) {
         auto P = upper(p);
         if (P.rfind(L"TYPE=", 0) == 0) {
-            auto list = split(P.substr(5), L',');
+            std::wstring tv = unquote(P.substr(5));
+            auto list = split(tv, L',');
             for (auto& t : list) {
                 auto tt = trim(t);
                 if (!tt.empty()) out.push_back(tt);
@@ -270,6 +278,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
 
     Contact cur;
     bool inCard = false;
+    bool hasProp = false;
 
     for (size_t idx = 0; idx < lines.size(); ++idx) {
         auto raw = trim(lines[idx]);
@@ -277,19 +286,14 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
 
         auto up = upper(raw);
 
-        if (up == L"BEGIN:VCARD") { inCard = true; cur = Contact(); continue; }
+        if (up == L"BEGIN:VCARD") { inCard = true; cur = Contact(); hasProp = false; continue; }
         if (up == L"END:VCARD") { 
             if (inCard) { 
-                // Skip empty cards (only BEGIN/END, no real fields) - to keep sync with rawBlocks filter
-                bool hasData = !cur.fn.empty() || !cur.n_given.empty() || !cur.n_family.empty() ||
-                               !cur.org.empty() || !cur.title.empty() || !cur.url.empty() || !cur.bday.empty() ||
-                               !cur.note.empty() || !cur.phones.empty() || !cur.emails.empty() || !cur.addrs.empty() ||
-                               cur.photo.has_value() || !cur.notes.empty() || !cur.androidCustoms.empty();
-                if (hasData) {
-                    contacts.push_back(cur); 
-                }
+                // Show empty cards too (as requested). Raw blocks and contacts stay in sync.
+                contacts.push_back(cur); 
                 cur = Contact(); 
                 inCard = false; 
+                hasProp = false;
             } 
             continue; 
         }
@@ -297,6 +301,7 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
 
         size_t colon = raw.find(L':');
         if (colon == std::wstring::npos) continue;
+        hasProp = true;
 
         std::wstring left = raw.substr(0, colon);
         std::wstring value = raw.substr(colon + 1);
@@ -318,15 +323,15 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
         for (auto& p : params) {
             auto P = upper(p);
             if (P.rfind(L"ENCODING=", 0) == 0) {
-                auto v = P.substr(9);
+                auto v = unquote(P.substr(9));
                 if (v == L"QUOTED-PRINTABLE" || v == L"QP") encQP = true;
                 if (v == L"BASE64" || v == L"B") photoIsBase64 = true;
             }
             else if (P.rfind(L"CHARSET=", 0) == 0) {
-                charset = p.substr(8);
+                charset = unquote(p.substr(8));
             }
             else if (P.rfind(L"VALUE=", 0) == 0) {
-                auto v = P.substr(6);
+                auto v = unquote(P.substr(6));
                 if (v == L"URL") photoIsURL = true;
             }
         }

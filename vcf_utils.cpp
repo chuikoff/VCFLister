@@ -56,3 +56,10 @@ std::wstring LowerInvariant(const std::wstring& s) {
     if (!out.empty() && out.back() == L'\0') out.pop_back();
     return out;
 }
+
+std::wstring unquote(const std::wstring& s) {
+    if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"') {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}

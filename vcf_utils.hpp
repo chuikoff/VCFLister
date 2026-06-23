@@ -9,6 +9,7 @@ std::wstring Trim(const std::wstring& s);
 std::wstring ToUpperASCII(const std::wstring& s);
 std::vector<std::wstring> SplitLines(const std::wstring& block);
 std::vector<std::wstring> UnfoldVCard_Folded(const std::vector<std::wstring>& lines);
+std::wstring unquote(const std::wstring& s);
 
 // case-insensitive utils
 std::wstring LowerInvariant(const std::wstring& s);
