@@ -23,8 +23,9 @@ std::vector<std::wstring> SplitLines(const std::wstring& block) {
         size_t j = block.find_first_of(L"\r\n", i);
         if (j == std::wstring::npos) { lines.push_back(block.substr(i)); break; }
         lines.push_back(block.substr(i, j - i));
-        if (j < n && block[j] == L'\r') ++j;
-        if (j < n && block[j] == L'\n') ++j;
+        // Consume a full line ending. Some exports (old iOS) use CR+CRLF ("\r\r\n")
+        // — treat any run of CR/LF as a single separator so we don't invent empty lines.
+        while (j < n && (block[j] == L'\r' || block[j] == L'\n')) ++j;
         i = j;
     }
     return lines;
@@ -32,12 +33,21 @@ std::vector<std::wstring> SplitLines(const std::wstring& block) {
 
 std::vector<std::wstring> UnfoldVCard_Folded(const std::vector<std::wstring>& lines) {
     std::vector<std::wstring> out;
-    for (const auto& L : lines) {
-        if (!out.empty() && !L.empty() && (L[0] == L' ' || L[0] == L'\t')) {
+    out.reserve(lines.size());
+    for (const auto& Lraw : lines) {
+        // Trim trailing CR leftover if any; keep leading space/tab (folding marker)
+        std::wstring L = Lraw;
+        while (!L.empty() && (L.back() == L'\r' || L.back() == L'\n')) L.pop_back();
+
+        // Skip pure-empty lines — they break folding (continuation would attach to "")
+        if (L.empty()) continue;
+
+        if (!out.empty() && (L[0] == L' ' || L[0] == L'\t')) {
+            // RFC 2425 / 6350 folded line: leading WSP is not part of value
             out.back() += L.substr(1);
         }
         else {
-            out.push_back(L);
+            out.push_back(std::move(L));
         }
     }
     return out;

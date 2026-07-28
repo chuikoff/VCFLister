@@ -287,6 +287,24 @@ static std::wstring CollectValuePossiblyMultiline(const std::vector<std::wstring
             std::wstring up = ToUpperASCII(e);
             if (up == L"BASE64" || up == L"B") isB64 = true;
         }
+        // PHOTO;TYPE=JPEG without ENCODING, or bare ;JPEG / ;PNG (Android v2.1)
+        if (!isB64) {
+            std::wstring prop = headUp;
+            size_t sc = prop.find(L';');
+            std::wstring name = sc == std::wstring::npos ? prop : prop.substr(0, sc);
+            size_t dot = name.find(L'.');
+            if (dot != std::wstring::npos) name = name.substr(dot + 1);
+            if (name.rfind(L"PHOTO", 0) == 0) {
+                // first chars of value look like base64 JPEG/PNG
+                std::wstring v0 = val;
+                while (!v0.empty() && iswspace(v0[0])) v0.erase(v0.begin());
+                if (v0.rfind(L"/9j/", 0) == 0 || v0.rfind(L"iVBOR", 0) == 0 || v0.size() > 40)
+                    isB64 = true;
+                if (headUp.find(L"JPEG") != std::wstring::npos || headUp.find(L"PNG") != std::wstring::npos
+                    || headUp.find(L"GIF") != std::wstring::npos || headUp.find(L"BMP") != std::wstring::npos)
+                    isB64 = true;
+            }
+        }
     }
 
     if (isQP) {
@@ -401,13 +419,23 @@ static const int* GetB64Table() {
 
 static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
     const int* T = GetB64Table();
-    std::vector<BYTE> out; out.reserve(wsrc.size() * 3 / 4);
-    int val = 0, valb = -8;
+    // Collect alphabet only
+    std::string alph;
+    alph.reserve(wsrc.size());
     for (wchar_t wc : wsrc) {
-        if (wc == L'=') break; // padding / end
+        if (wc == L'=') break;
         if (wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') continue;
         if (wc > 255) continue;
-        int d = T[(unsigned char)wc];
+        if (T[(unsigned char)wc] < 0) continue;
+        alph.push_back((char)wc);
+    }
+    // Invalid length % 4 == 1 → drop trailing junk char (common in phone exports)
+    while (alph.size() % 4 == 1 && !alph.empty()) alph.pop_back();
+
+    std::vector<BYTE> out; out.reserve(alph.size() * 3 / 4);
+    int val = 0, valb = -8;
+    for (char c : alph) {
+        int d = T[(unsigned char)c];
         if (d < 0) continue;
         val = (val << 6) + d;
         valb += 6;
@@ -669,6 +697,7 @@ static bool IsNoiseField(const std::wstring& headUp) {
         L"X-IMAGEHASH",
         L"X-ABUID",
         L"X-ABSHOWAS",
+        L"X-ABADR",   // Apple address sub-label; not useful as a card field
         L"UID",
         L"PRODID",
         L"CLIENTPIDMAP",
@@ -680,8 +709,13 @@ static bool IsNoiseField(const std::wstring& headUp) {
 }
 
 static bool LooksLikeBinaryBlob(const std::wstring& v) {
-    if (v.size() < 80) return false;
-    // long base64-ish payload (Apple X-ADDRESSING-GRAMMAR etc.)
+    if (v.size() < 60) return false;
+    // JPEG/PNG base64 signature (photo dump into text)
+    std::wstring t = v;
+    while (!t.empty() && iswspace(t[0])) t.erase(t.begin());
+    if (t.rfind(L"/9j/", 0) == 0 || t.rfind(L"iVBOR", 0) == 0) return true;
+
+    // long base64-ish payload (Apple X-ADDRESSING-GRAMMAR / orphan PHOTO folds)
     size_t b64 = 0, total = 0;
     for (wchar_t c : v) {
         if (c == L'\r' || c == L'\n' || c == L' ') continue;
@@ -690,7 +724,7 @@ static bool LooksLikeBinaryBlob(const std::wstring& v) {
             (c >= L'0' && c <= L'9') || c == L'+' || c == L'/' || c == L'=' || c == L'-' || c == L'_')
             ++b64;
     }
-    return total >= 80 && b64 * 10 >= total * 9;
+    return total >= 60 && b64 * 10 >= total * 9;
 }
 
 // ===================== Сборка текста с локализацией и X-ABLabel значениями =====================
@@ -761,7 +795,11 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         if (IsSection(L, L"VERSION"))       continue;
 
         size_t pos = L.find(L':');
-        if (pos == std::wstring::npos) { out += L; out += L"\r\n"; continue; }
+        // Orphan PHOTO folds / pure base64 lines (no "KEY:") — never dump into card text
+        if (pos == std::wstring::npos) {
+            if (LooksLikeBinaryBlob(L)) continue;
+            continue; // ignore non-property lines
+        }
 
         std::wstring head = Trim(L.substr(0, pos));
         std::wstring headUp = ToUpperASCII(head);
@@ -776,21 +814,33 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         // Only skip embedded/base64 photos (to avoid dumping huge base64 into text).
         // URI photos (vCard 4 / some v3) should be shown as "Photo: https://..."
         if (headUp.rfind(L"PHOTO", 0) == 0) {
-            std::wstring rawVal = (pos != std::wstring::npos && pos + 1 < L.size()) ? Trim(L.substr(pos + 1)) : L"";
-            bool isUriPhoto = rawVal.find(L"http://") == 0 || rawVal.find(L"https://") == 0 || rawVal.find(L"data:") == 0;
-            bool looksLikeBase64 = !isUriPhoto && (rawVal.size() > 60 || rawVal.find(L'/') == 0 || rawVal.find(L"9j") == 0);
-            if (!isUriPhoto && looksLikeBase64) continue;
-            // URI or short photo value -> let it through to be displayed
+            // Always consume multi-line base64 body so following fields stay aligned
+            std::wstring skipVal = CollectValuePossiblyMultiline(lines, i, ToUpperASCII(head));
+            (void)skipVal;
+            std::wstring rawVal = (pos + 1 < L.size()) ? Trim(L.substr(pos + 1)) : L"";
+            bool isUriPhoto = rawVal.rfind(L"http://", 0) == 0 || rawVal.rfind(L"https://", 0) == 0
+                || rawVal.rfind(L"data:", 0) == 0;
+            if (!isUriPhoto) continue; // embedded / base64 → photo panel only
+            // URI photo: fall through after collect already advanced i — re-read value
+            // (already consumed; emit URI form)
+            if (!skipVal.empty() && (skipVal.rfind(L"http://", 0) == 0 || skipVal.rfind(L"https://", 0) == 0)) {
+                out += (ru ? L"Фото: " : L"Photo: ");
+                out += skipVal;
+                out += L"\r\n";
+            }
+            continue;
         }
         // Skip X-ABLABEL lines themselves (we attach their value to the item field above)
         if (headUp.find(L"X-ABLABEL") != std::wstring::npos) continue;
 
-        std::wstring val = CollectValuePossiblyMultiline(lines, i, headUp);
+        std::wstring val = CollectValuePossiblyMultiline(lines, i, ToUpperASCII(head));
         if (LooksLikeBinaryBlob(val)) continue;
         if (val.empty()) continue;
 
-        // Clean structured fields: remove empty ;;; parts for nicer display (N, ADR etc.)
-        if (headUp.find(L"N") == 0 || headUp.find(L"ADR") == 0) {
+        // Clean structured fields: remove empty ;;; parts for nicer display (N, ADR, ORG)
+        if (headUp == L"N" || headUp.rfind(L"N;", 0) == 0
+            || headUp == L"ADR" || headUp.rfind(L"ADR;", 0) == 0
+            || headUp == L"ORG" || headUp.rfind(L"ORG;", 0) == 0) {
             std::vector<std::wstring> parts;
             size_t start = 0;
             while (start <= val.size()) {
@@ -800,13 +850,34 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
                 start = semi + 1;
             }
             std::wstring cleaned;
+            bool isName = (headUp == L"N" || headUp.rfind(L"N;", 0) == 0);
             for (auto& p : parts) {
+                // ADR may contain \n escapes
+                for (size_t k = 0; k + 1 < p.size(); ++k) {
+                    if (p[k] == L'\\' && (p[k + 1] == L'n' || p[k + 1] == L'N')) {
+                        p.replace(k, 2, L", ");
+                    }
+                }
                 if (!p.empty()) {
-                    if (!cleaned.empty()) cleaned += (headUp.find(L"N") == 0 ? L" " : L", ");
+                    if (!cleaned.empty()) cleaned += (isName ? L" " : L", ");
                     cleaned += p;
                 }
             }
             if (!cleaned.empty()) val = cleaned;
+        }
+        // Unescape common vCard text escapes in free-form values
+        {
+            std::wstring u;
+            u.reserve(val.size());
+            for (size_t k = 0; k < val.size(); ++k) {
+                if (val[k] == L'\\' && k + 1 < val.size()) {
+                    wchar_t n = val[k + 1];
+                    if (n == L'n' || n == L'N') { u += L'\n'; ++k; continue; }
+                    if (n == L',' || n == L';' || n == L'\\') { u += n; ++k; continue; }
+                }
+                u += val[k];
+            }
+            val = std::move(u);
         }
 
         // Skip empty N/FN lines (e.g. N:;;;; or FN: ) to avoid "Name: " or "Full name: "
@@ -1784,7 +1855,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hPhoto = CreateWindowExW(0, kPhotoClass, L"", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
 
-        // EDIT above photo: wrap text, no own scrollbars (outer hRightScroll scrolls card)
+        // EDIT below photo: wrap text, no own scrollbars (outer hRightScroll scrolls card)
         st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
             ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
             0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
@@ -1842,7 +1913,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         MoveWindow(st->hScroll, listW - sbw, listTop, sbw, listContentH, TRUE);
 
-        // --- Right column: TEXT first, PHOTO below (#11); one outer vertical scroll (#7/#13) ---
+        // --- Right column: PHOTO on top, TEXT below; one outer vertical scroll ---
         int pad = S(h, 12);
         int ex = listW + 1 + pad;
         int rightScrollBarW = sbw;
@@ -1853,7 +1924,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (ew < S(h, 80))
             ew = std::max<int>(0, (int)rc.right - ex - rightScrollBarW);
 
-        // Cap photo size so it doesn't dominate the card (unified after text)
+        // Cap photo size so huge images don't dominate the card
         int photoMaxW = std::min<int>(ew, S(h, 360));
         int photoMaxH = S(h, 360);
         int photoW = photoMaxW;
@@ -1873,29 +1944,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
 
         int sep = S(h, 8);
-        int photoBlock = (photoH > 0) ? (sep + photoH) : 0;
+        int photoBlock = (photoH > 0) ? (photoH + sep) : 0;
 
-        // Measure full text height at target width (tall probe inside MeasureEditContentHeight)
+        // Measure full text height at target width
         int measured = MeasureEditContentHeight(st->hEdit, ew);
         if (measured < S(h, 80)) measured = S(h, 80);
 
-        // If content + photo fit in the viewport, grow EDIT to use free space
-        // (avoids clipped text when measure is slightly low and empty gap below).
-        // If not, use full measured height and outer scrollbar.
+        // If photo + text fit, grow EDIT into free space (no clipped text / empty gap)
         int pads = pad * 2;
-        int fitH = rightAreaH - pads - photoBlock; // max edit height while keeping photo in view
+        int fitH = rightAreaH - pads - photoBlock;
         if (fitH < S(h, 80)) fitH = S(h, 80);
 
         int eh = measured;
-        int contentH = pad + measured + photoBlock + pad;
+        int contentH = pad + photoBlock + measured + pad;
         if (contentH <= rightAreaH) {
-            // Expand text box into unused screen space; keep photo visible at bottom
             eh = std::max(measured, fitH);
             contentH = rightAreaH;
         }
 
-        int editY = pad;
-        int photoY = editY + eh + (photoH > 0 ? sep : 0);
+        // Photo first (top), then text
+        int photoY = pad;
+        int editY = pad + photoBlock;
 
         int maxScroll = std::max<int>(0, contentH - rightAreaH);
         if (st->rightScroll > maxScroll) st->rightScroll = maxScroll;
@@ -1911,8 +1980,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 (int)rc.right - rightScrollBarW, rightAreaTop,
                 rightScrollBarW, rightAreaH, TRUE);
         }
-        // Text on top, photo under it — both moved by outer rightScroll
-        MoveWindow(st->hEdit, ex, editY - rightScroll, ew, eh, TRUE);
         if (st->hPhoto) {
             if (photoH > 0) {
                 ShowWindow(st->hPhoto, SW_SHOW);
@@ -1922,6 +1989,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 ShowWindow(st->hPhoto, SW_HIDE);
             }
         }
+        MoveWindow(st->hEdit, ex, editY - rightScroll, ew, eh, TRUE);
 
         SCROLLINFO rsi{};
         rsi.cbSize = sizeof(rsi);
