@@ -143,15 +143,19 @@ static std::string w2ascii(const std::wstring& w) {
     return s;
 }
 
-// Quoted-Printable decode to bytes; handles soft breaks "=\r\n" / "=\n"
+// Quoted-Printable decode to bytes; handles soft breaks "=\r\n" / "=\n" / trailing '='
 static std::vector<unsigned char> decodeQP(const std::string& in) {
     std::vector<unsigned char> out; out.reserve(in.size());
     const size_t n = in.size();
     for (size_t i = 0; i < n; ) {
         unsigned char c = (unsigned char)in[i];
         if (c == '=') {
-            if (i + 1 < n && in[i + 1] == '\r' && i + 2 < n && in[i + 2] == '\n') { i += 3; continue; }
-            if (i + 1 < n && in[i + 1] == '\n') { i += 2; continue; }
+            // soft line break: "=\r\n", "=\n", or lone trailing '=' at end of value (vCard 2.1)
+            if (i + 1 >= n) break; // trailing soft-break marker — drop it
+            if (in[i + 1] == '\r' && i + 2 < n && in[i + 2] == '\n') { i += 3; continue; }
+            if (in[i + 1] == '\n' || in[i + 1] == '\r') { i += 2; continue; }
+            // whitespace after '=' can appear after unfold/join glitches
+            if (in[i + 1] == ' ' || in[i + 1] == '\t') { i += 2; continue; }
             auto hex = [&](char x)->int {
                 if (x >= '0' && x <= '9') return x - '0';
                 if (x >= 'A' && x <= 'F') return 10 + (x - 'A');
@@ -162,6 +166,8 @@ static std::vector<unsigned char> decodeQP(const std::string& in) {
                 int h1 = hex(in[i + 1]), h2 = hex(in[i + 2]);
                 if (h1 >= 0 && h2 >= 0) { out.push_back((unsigned char)((h1 << 4) | h2)); i += 3; continue; }
             }
+            // incomplete '=' at end → soft break, not literal
+            if (i + 1 == n - 1 && hex(in[i + 1]) >= 0) break;
             out.push_back('=');
             ++i;
         }
@@ -182,11 +188,38 @@ static std::wstring mbToWide(const unsigned char* data, int len, UINT cp) {
     return w;
 }
 
+// Strip leftover QP soft-break markers and trailing whitespace after decode
+static std::wstring stripQpArtifacts(std::wstring s) {
+    while (!s.empty()) {
+        wchar_t c = s.back();
+        if (c == L'=' || c == L' ' || c == L'\t' || c == L'\r' || c == L'\n')
+            s.pop_back();
+        else
+            break;
+    }
+    // also remove orphan soft-break '=' stuck mid-string before newline (rare after bad joins)
+    std::wstring r; r.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == L'=' && i + 1 < s.size() && (s[i + 1] == L'\n' || s[i + 1] == L'\r'))
+            continue;
+        r.push_back(s[i]);
+    }
+    return r;
+}
+
 static std::wstring decodeTextValue(const std::wstring& wval, bool isQP, const std::wstring& charset) {
-    if (!isQP) return wval;
+    if (!isQP) {
+        // Even without ENCODING=QP, some exports leave a trailing soft-break '=' on FN/N
+        if (!wval.empty() && wval.back() == L'=') {
+            std::wstring t = wval;
+            while (!t.empty() && t.back() == L'=') t.pop_back();
+            return t;
+        }
+        return wval;
+    }
     std::string ascii = w2ascii(wval);
     auto bytes = decodeQP(ascii);
-    return mbToWide(bytes.data(), (int)bytes.size(), codepageFromCharset(charset));
+    return stripQpArtifacts(mbToWide(bytes.data(), (int)bytes.size(), codepageFromCharset(charset)));
 }
 
 // item1.EMAIL -> EMAIL
@@ -336,15 +369,44 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             }
         }
 
-        // Для vCard 2.1 + QP: склеиваем последующие строки БЕЗ двоеточия — это продолжение QP
+        // Для vCard 2.1 + QP: soft-break '=' в конце строки + продолжения без нового свойства
         if (encQP) {
             while (idx + 1 < lines.size()) {
+                bool soft = !value.empty() && value.back() == L'=';
                 const std::wstring& nextRaw = lines[idx + 1];
-                if (nextRaw.find(L':') != std::wstring::npos) break;
-                value += L"\n";
-                value += nextRaw;
-                ++idx;
+                std::wstring nextTrim = trim(nextRaw);
+                if (nextTrim.empty()) { ++idx; continue; }
+
+                // Следующая строка похожа на новое свойство? (FN:, TEL;TYPE=...:, N;CHARSET=...:)
+                bool looksLikeNewProp = false;
+                if (nextTrim[0] != L'=') {
+                    size_t cp = nextTrim.find(L':');
+                    if (cp != std::wstring::npos && cp > 0) {
+                        std::wstring head = nextTrim.substr(0, cp);
+                        // head: letters/digits/;/=/-/.  no spaces
+                        looksLikeNewProp = head.find_first_of(L" \t") == std::wstring::npos &&
+                            head.find_first_of(L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") != std::wstring::npos;
+                    }
+                }
+
+                if (soft) {
+                    value.pop_back(); // drop soft-break '='
+                    if (looksLikeNewProp) break; // orphan soft-break before next field
+                    value += nextTrim;
+                    ++idx;
+                    continue;
+                }
+                // без soft-break: только явные продолжения QP (часто начинаются с =HH) или строки без ':'
+                if (looksLikeNewProp) break;
+                if (nextTrim[0] == L'=' || nextRaw.find(L':') == std::wstring::npos) {
+                    value += nextTrim;
+                    ++idx;
+                    continue;
+                }
+                break;
             }
+            // leftover trailing soft-break (no continuation)
+            while (!value.empty() && value.back() == L'=') value.pop_back();
         }
 
         // ----- раскладываем по полям -----
@@ -363,10 +425,37 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             cur.title = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (propName == L"URL") {
-            cur.url = unescape(decodeTextValue(value, encQP, charset));
+            std::wstring u = unescape(decodeTextValue(value, encQP, charset));
+            if (!u.empty()) {
+                if (cur.url.empty()) cur.url = u;
+                cur.urls.push_back(u);
+            }
         }
         else if (propName == L"BDAY") {
             cur.bday = unescape(decodeTextValue(value, encQP, charset));
+        }
+        else if (propName == L"GENDER") {
+            // v4: sex[;identity]  e.g. "M" or "M;Male" or "U"
+            cur.gender = unescape(decodeTextValue(value, encQP, charset));
+        }
+        else if (propName == L"LANG") {
+            std::wstring lg = unescape(decodeTextValue(value, encQP, charset));
+            if (!lg.empty()) {
+                if (cur.lang.empty()) cur.lang = lg;
+                cur.langs.push_back(lg);
+            }
+        }
+        else if (propName == L"KIND") {
+            cur.kind = unescape(decodeTextValue(value, encQP, charset));
+        }
+        else if (propName == L"MEMBER") {
+            std::wstring m = unescape(decodeTextValue(value, encQP, charset));
+            if (!m.empty()) cur.members.push_back(m);
+        }
+        else if (propName == L"X-GENDER") {
+            // legacy companion to GENDER
+            if (cur.gender.empty())
+                cur.gender = unescape(decodeTextValue(value, encQP, charset));
         }
         else if (propName == L"NOTE") {
             // РАНЬШЕ: перезатирали одно поле note (терялись много NOTE)  [исходник: см. блок NOTE]

@@ -10,6 +10,7 @@
 #include <vector>
 #include <fstream>
 #include <cstring>
+#include <cwchar>
 #include <excpt.h>  // Оставляем, но не используем
 
 #include "vcf_parser.hpp"
@@ -113,17 +114,34 @@ static std::wstring ReadWholeFileAsWide(const wchar_t* path) {
     return tryMbToW(buf.data(), (int)buf.size(), CP_ACP);
 }
 
-// Разбить исходный текст на блоки BEGIN:VCARD ... END:VCARD (v3/v4)
+// Case-insensitive find of ASCII keyword in wide text (vCard keys are case-insensitive per RFC)
+static size_t FindI(const std::wstring& text, const wchar_t* key, size_t from = 0) {
+    if (!key || !*key) return std::wstring::npos;
+    const size_t klen = wcslen(key);
+    if (from >= text.size() || klen == 0 || klen > text.size()) return std::wstring::npos;
+    for (size_t i = from; i + klen <= text.size(); ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < klen; ++j) {
+            wchar_t a = text[i + j];
+            wchar_t b = key[j];
+            if (a >= L'a' && a <= L'z') a = (wchar_t)(a - L'a' + L'A');
+            if (b >= L'a' && b <= L'z') b = (wchar_t)(b - L'a' + L'A');
+            if (a != b) { ok = false; break; }
+        }
+        if (ok) return i;
+    }
+    return std::wstring::npos;
+}
+
+// Разбить исходный текст на блоки BEGIN:VCARD ... END:VCARD (v2.1/v3/v4)
 static std::vector<std::wstring> SplitVCardBlocks(const std::wstring& text) {
     std::vector<std::wstring> out;
-    const std::wstring begin = L"BEGIN:VCARD";
-    const std::wstring end = L"END:VCARD";
 
     size_t i = 0, n = text.size();
     while (i < n) {
-        size_t b = text.find(begin, i);
+        size_t b = FindI(text, L"BEGIN:VCARD", i);
         if (b == std::wstring::npos) break;
-        size_t e = text.find(end, b);
+        size_t e = FindI(text, L"END:VCARD", b);
         if (e == std::wstring::npos) { // последний незакрытый — берём до конца
             out.push_back(text.substr(b));
             break;
