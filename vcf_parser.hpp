@@ -32,6 +32,14 @@ struct Contact {
     std::wstring bday;
     std::wstring note;
 
+    // vCard 4.0
+    std::wstring gender;                 // GENDER (e.g. M, F, O, N or "M;Male")
+    std::wstring lang;                   // LANG
+    std::wstring kind;                   // KIND (individual, group, org, location)
+    std::vector<std::wstring> members;   // MEMBER (group members, usually urn:uuid:...)
+    std::vector<std::wstring> langs;     // multiple LANG
+    std::vector<std::wstring> urls;      // multiple URL
+
     // comms
     std::vector<Phone>   phones;
     std::vector<Email>   emails;
@@ -42,12 +50,11 @@ struct Contact {
     std::wstring         photo_url;  // URL if provided
     // === multi NOTE + Android ===
     struct AndroidCustom {
-        std::wstring rawType;              // строка до ':'
-        std::vector<std::wstring> slots;   // части после ':', разделённые ';' (с учётом \;)
+        std::wstring rawType;
+        std::vector<std::wstring> slots;
     };
-    std::vector<std::wstring> notes;           // несколько NOTE
-    std::vector<AndroidCustom> androidCustoms; // X-ANDROID-CUSTOM
-
+    std::vector<std::wstring> notes;
+    std::vector<AndroidCustom> androidCustoms;
 };
 
 std::vector<Contact> ParseVCard(const std::wstring& text);

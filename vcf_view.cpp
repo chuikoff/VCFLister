@@ -11,7 +11,11 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <gdiplus.h>
+#include <commctrl.h>
+#include <wininet.h>
 #pragma comment(lib, "Gdiplus.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "wininet.lib")
 
 #include <vector>
 #include <string>
@@ -87,10 +91,12 @@ static std::vector<BYTE> DecodeQuotedPrintableToBytes(const std::wstring& wsrc) 
     for (size_t i = 0; i < src.size();) {
         char c = src[i];
         if (c == '=') {
-            // мягкий перенос строки?
+            // soft-break: "=\r\n", "=\n", or trailing '=' at end of value (vCard 2.1)
+            if (i + 1 >= src.size()) break;
             if (i + 1 < src.size()) {
                 if (src[i + 1] == '\r' && i + 2 < src.size() && src[i + 2] == '\n') { i += 3; continue; }
-                if (src[i + 1] == '\n') { i += 2; continue; }
+                if (src[i + 1] == '\n' || src[i + 1] == '\r') { i += 2; continue; }
+                if (src[i + 1] == ' ' || src[i + 1] == '\t') { i += 2; continue; }
             }
             // =HH
             if (i + 2 < src.size()) {
@@ -165,6 +171,10 @@ static std::wstring LocalizeKey(const std::wstring& keyRaw, bool ru) {
         {L"PRODID",       {L"Product ID",        L"Идентификатор продукта"}},
         {L"VERSION",      {L"Version",           L"Версия"}},
         {L"GENDER",       {L"Gender",            L"Пол"}},
+        {L"LANG",         {L"Language",          L"Язык"}},
+        {L"KIND",         {L"Kind",              L"Тип контакта"}},
+        {L"MEMBER",       {L"Member",            L"Участник"}},
+        {L"X-GENDER",     {L"Gender",            L"Пол"}},
 
         // Доп. ключи
         {L"X-ABDATE",                 {L"Additional Date",        L"Дополнительная дата"}},
@@ -177,7 +187,6 @@ static std::wstring LocalizeKey(const std::wstring& keyRaw, bool ru) {
         {L"X-PHONETIC-ORG",           {L"Phonetic Organization Name", L"Фонетическое название организации"}},
         {L"X-PHONETIC-FIRST-NAME",    {L"Phonetic First Name",    L"Фонетическое имя"}},
         {L"X-PHONETIC-LAST-NAME",     {L"Phonetic Last Name",     L"Фонетическая фамилия"}},
-        {L"X-MAIDENNAME",             {L"Maiden Name",            L"Девичья фамилия"}},
         {L"X-SOCIALPROFILE",          {L"Social Profile",         L"Социальный профиль"}},
     };
     auto it = mapKeys.find(up);
@@ -630,6 +639,31 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         // Skip empty N/FN lines (e.g. N:;;;; or FN: ) to avoid "Name: " or "Full name: "
         if (val.empty() && (headUp.find(L"N") == 0 || headUp == L"FN")) continue;
 
+        // vCard 4.0: nicer GENDER / KIND display values
+        if (headUp == L"GENDER" || headUp == L"X-GENDER") {
+            std::wstring g = val;
+            size_t sc = g.find(L';');
+            std::wstring sex = ToUpperASCII(Trim(sc != std::wstring::npos ? g.substr(0, sc) : g));
+            std::wstring id = (sc != std::wstring::npos) ? Trim(g.substr(sc + 1)) : L"";
+            std::wstring pretty = sex;
+            if (sex == L"M") pretty = ru ? L"Мужской" : L"Male";
+            else if (sex == L"F") pretty = ru ? L"Женский" : L"Female";
+            else if (sex == L"O") pretty = ru ? L"Другой" : L"Other";
+            else if (sex == L"N") pretty = ru ? L"Не указан" : L"None";
+            else if (sex == L"U") pretty = ru ? L"Неизвестно" : L"Unknown";
+            if (!id.empty() && id != pretty) pretty += L" (" + id + L")";
+            val = pretty;
+        }
+        else if (headUp == L"KIND") {
+            std::wstring k = ToUpperASCII(Trim(val));
+            if (k == L"INDIVIDUAL") val = ru ? L"Человек" : L"Individual";
+            else if (k == L"GROUP") val = ru ? L"Группа" : L"Group";
+            else if (k == L"ORG" || k == L"ORGANIZATION") val = ru ? L"Организация" : L"Organization";
+            else if (k == L"LOCATION") val = ru ? L"Место" : L"Location";
+            else if (k == L"DEVICE") val = ru ? L"Устройство" : L"Device";
+            else if (k == L"APPLICATION") val = ru ? L"Приложение" : L"Application";
+        }
+
         // Clean ugly Android custom lines a bit (strip vnd prefix and trailing ;;;;;;;;; )
         if (headUp.find(L"X-ANDROID-CUSTOM") == 0) {
             std::vector<std::wstring> parts;
@@ -708,8 +742,8 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
 // ===================== Состояние вьюера =====================
 static const wchar_t* kClass = L"VCF_VIEW_CLASS";
 static const wchar_t* kPhotoClass = L"VCF_PHOTO_VIEW";
+static const int kSplitHit = 4; // half-width of splitter hit zone (px at 96dpi)
 
-struct FieldHit { RECT rc{}; std::wstring label; std::wstring value; }; // неисп.
 struct ViewState {
     std::vector<Contact> contacts;           // для левого списка/поиска
     std::vector<std::wstring> rawBlocks;     // сырые vCard-блоки
@@ -727,9 +761,161 @@ struct ViewState {
     int rightScroll = 0;
     HWND hRightScroll = nullptr;            // scrollbar for right panel (large photo / long text)
 
+    // resizable splitter (list width at 96dpi; 0 = default)
+    int listPaneW96 = 0;
+    bool draggingSplit = false;
+    int splitX = 0;
+
+    // search highlight
+    std::wstring searchNeedle;
+    std::vector<unsigned char> matchFlags; // 1 = contact matches current search
+    int matchCount = 0;
+    int matchPos = 0; // 1-based index among matches for status
+
+    // tooltip for long names
+    HWND hTip = nullptr;
+    int tipRow = -1;
+
+    // settings (from TC ini)
+    bool loadPhotoUrl = false; // LoadPhotoUrl=1 enables HTTP photo fetch
+
     std::unique_ptr<Gdiplus::Bitmap> photo;  // изображение
     Fonts fonts;
 };
+
+static int ReadIniInt(const wchar_t* key, int defVal) {
+    if (g_iniPath.empty()) return defVal;
+    return (int)GetPrivateProfileIntW(L"VCFLister", key, defVal, g_iniPath.c_str());
+}
+static void WriteIniInt(const wchar_t* key, int val) {
+    if (g_iniPath.empty()) return;
+    wchar_t buf[32]; wsprintfW(buf, L"%d", val);
+    WritePrivateProfileStringW(L"VCFLister", key, buf, g_iniPath.c_str());
+}
+static void LoadViewSettings(ViewState* st) {
+    if (!st) return;
+    st->listPaneW96 = ReadIniInt(L"ListWidth", 0);
+    st->loadPhotoUrl = ReadIniInt(L"LoadPhotoUrl", 0) != 0;
+}
+static void SaveListWidth(ViewState* st, HWND h) {
+    if (!st || st->listPaneW96 <= 0) return;
+    WriteIniInt(L"ListWidth", st->listPaneW96);
+    (void)h;
+}
+
+// Download image bytes from http(s) URL (optional photo feature; default off)
+static std::vector<uint8_t> HttpGetBytes(const std::wstring& url, DWORD timeoutMs = 5000) {
+    std::vector<uint8_t> data;
+    if (url.size() < 8) return data;
+    std::wstring low = url; std::transform(low.begin(), low.end(), low.begin(), ::towlower);
+    if (low.rfind(L"http://", 0) != 0 && low.rfind(L"https://", 0) != 0) return data;
+
+    HINTERNET hNet = InternetOpenW(L"VCFLister/2.1", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!hNet) return data;
+    InternetSetOptionW(hNet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(hNet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(hNet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_CACHE_WRITE;
+    if (low.rfind(L"https://", 0) == 0) flags |= INTERNET_FLAG_SECURE;
+    HINTERNET hUrl = InternetOpenUrlW(hNet, url.c_str(), nullptr, 0, flags, 0);
+    if (!hUrl) { InternetCloseHandle(hNet); return data; }
+
+    BYTE buf[8192];
+    DWORD rd = 0;
+    const size_t kMax = 5 * 1024 * 1024;
+    while (InternetReadFile(hUrl, buf, sizeof(buf), &rd) && rd > 0) {
+        data.insert(data.end(), buf, buf + rd);
+        if (data.size() >= kMax) break;
+    }
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hNet);
+    return data;
+}
+
+static std::wstring ContactDisplayName(const Contact& c) {
+    std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
+    while (!name.empty() && (name.back() == L'=' || name.back() == L' ' || name.back() == L'\t'))
+        name.pop_back();
+    return name;
+}
+
+static bool ContactMatchesNeedle(const Contact& c, const std::wstring& needleNorm, bool wholeWord) {
+    if (needleNorm.empty()) return false;
+    auto norm = [&](const std::wstring& x) { return LowerInvariant(x); };
+    std::wstring hay;
+    auto add = [&](const std::wstring& s) { if (!s.empty()) { hay += L' '; hay += norm(s); } };
+    add(c.fn); add(c.n_given); add(c.n_family); add(c.org); add(c.title); add(c.bday); add(c.url); add(c.note);
+    add(c.gender); add(c.lang); add(c.kind);
+    for (auto& t : c.notes) add(t);
+    for (auto& t : c.phones) { add(t.number); for (auto& tp : t.types) add(tp); }
+    for (auto& e : c.emails) { add(e.addr); for (auto& tp : e.types) add(tp); }
+    for (auto& a : c.addrs) add(a.text);
+    for (auto& u : c.urls) add(u);
+    for (auto& lg : c.langs) add(lg);
+    for (auto& m : c.members) add(m);
+
+    size_t pos = hay.find(needleNorm);
+    while (pos != std::wstring::npos) {
+        if (!wholeWord || (isWordBoundary(hay, pos) && isWordBoundary2(hay, pos + needleNorm.size())))
+            return true;
+        pos = hay.find(needleNorm, pos + 1);
+    }
+    return false;
+}
+
+static void RebuildSearchFlags(ViewState* st, bool wholeWord = false) {
+    if (!st) return;
+    st->matchFlags.assign(st->contacts.size(), 0);
+    st->matchCount = 0;
+    st->matchPos = 0;
+    if (st->searchNeedle.empty()) return;
+    std::wstring n = LowerInvariant(st->searchNeedle);
+    for (size_t i = 0; i < st->contacts.size(); ++i) {
+        if (ContactMatchesNeedle(st->contacts[i], n, wholeWord)) {
+            st->matchFlags[i] = 1;
+            st->matchCount++;
+        }
+    }
+    if (st->sel < st->matchFlags.size() && st->matchFlags[st->sel]) {
+        int p = 0;
+        for (size_t i = 0; i <= st->sel; ++i) if (st->matchFlags[i]) ++p;
+        st->matchPos = p;
+    }
+}
+
+// Extract "value" part after first ':' from a detail line (for copy)
+static std::wstring ValueAfterColon(const std::wstring& line) {
+    size_t p = line.find(L':');
+    if (p == std::wstring::npos) return Trim(line);
+    return Trim(line.substr(p + 1));
+}
+
+static std::wstring GetEditCurrentLine(HWND hEdit) {
+    DWORD a = 0, b = 0;
+    SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+    int line = (int)SendMessageW(hEdit, EM_LINEFROMCHAR, a, 0);
+    int idx = (int)SendMessageW(hEdit, EM_LINEINDEX, line, 0);
+    if (idx < 0) return L"";
+    wchar_t buf[2048];
+    *(WORD*)buf = 2047;
+    int n = (int)SendMessageW(hEdit, EM_GETLINE, line, (LPARAM)buf);
+    if (n < 0) n = 0;
+    if (n > 2047) n = 2047;
+    buf[n] = 0;
+    return std::wstring(buf, n);
+}
+
+static std::wstring GetEditSelectionOrLine(HWND hEdit) {
+    DWORD a = 0, b = 0;
+    SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+    int len = GetWindowTextLengthW(hEdit);
+    if (len <= 0) return L"";
+    std::wstring all((size_t)len, L'\0');
+    GetWindowTextW(hEdit, &all[0], len + 1);
+    if (a != b && (int)b <= len) return all.substr(a, b - a);
+    return GetEditCurrentLine(hEdit);
+}
 
 // ===================== Копирование =====================
 static void SetClipboardTextW(HWND h, const std::wstring& text) {
@@ -748,8 +934,25 @@ static void SetClipboardTextW(HWND h, const std::wstring& text) {
 
 // ===================== Левая панель (список) =====================
 static int DlgSBW() { return GetSystemMetrics(SM_CXVSCROLL); }
-static int ListPaneWidth(HWND h) { return S(h, 260); }
-static void EnsureListMetrics(HWND h, ViewState* st) { if (!st->listItemH) st->listItemH = S(h, 52); }
+static int ListPaneWidth(HWND h) {
+    auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    int def96 = 300;
+    int w96 = (st && st->listPaneW96 > 0) ? st->listPaneW96 : def96;
+    int w = S(h, w96);
+    RECT rc{}; GetClientRect(h, &rc);
+    int minW = S(h, 160);
+    int maxW = std::max<int>(minW, (int)rc.right - S(h, 220));
+    if (w < minW) w = minW;
+    if (w > maxW) w = maxW;
+    return w;
+}
+static void EnsureListMetrics(HWND h, ViewState* st) { if (!st->listItemH) st->listItemH = S(h, 60); }
+static int SplitterX(HWND h) { return ListPaneWidth(h); }
+static bool HitSplitter(HWND h, int x) {
+    int sx = SplitterX(h);
+    int hit = S(h, kSplitHit);
+    return x >= sx - hit && x <= sx + hit;
+}
 
 static void UpdateListScrollbar(ViewState* st, int total) {
     if (!st->hScroll) return;
@@ -784,9 +987,8 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
         size_t idx = (size_t)(st->listScroll + row);
         const Contact& c = st->contacts[idx];
 
-        std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
+        std::wstring name = ContactDisplayName(c);
         if (name.empty()) {
-            // Show empty cards explicitly
             name = g_tcRu ? L"(пустая карточка)" : L"(empty card)";
         }
 
@@ -803,9 +1005,18 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
             std::wstring em = PrimaryEmail(c);
             if (!em.empty()) sub = L"Email: " + em;
         }
+        if (sub.empty() && !c.kind.empty()) {
+            sub = (g_tcRu ? L"Тип: " : L"Kind: ") + c.kind;
+        }
 
         RECT item{ x + pad, ycur, x + wList - pad, ycur + st->listItemH - S(h,2) };
-        HBRUSH ibg = CreateSolidBrush(idx == st->sel ? g_clrListSel : g_clrListBg);
+        COLORREF bgItem = g_clrListBg;
+        if (idx == st->sel) bgItem = g_clrListSel;
+        else if (idx < st->matchFlags.size() && st->matchFlags[idx]) {
+            // search match highlight
+            bgItem = g_dark ? RGB(48, 60, 40) : RGB(255, 249, 196);
+        }
+        HBRUSH ibg = CreateSolidBrush(bgItem);
         FillRect(dc, &item, ibg); DeleteObject(ibg);
 
         HPEN pen = CreatePen(PS_SOLID, 1, g_clrGrid); HGDIOBJ oldPen = SelectObject(dc, pen);
@@ -815,8 +1026,20 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
         HFONT old = (HFONT)SelectObject(dc, st->fonts.hNorm);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, g_clrTxt);
-        RECT nameRc = item; nameRc.left += S(h, 8); nameRc.top += S(h, 6); nameRc.right -= S(h, 6);
-        DrawTextW(dc, name.c_str(), (int)name.size(), &nameRc, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        // Имя: даём больше места по ширине, разрешаем перенос на 2 строки если имя очень длинное
+        RECT nameRc = item;
+        nameRc.left += S(h, 8);
+        nameRc.top += S(h, 4);
+        nameRc.right -= S(h, 4);
+        nameRc.bottom -= S(h, 18);  // макс. место под имя (sub займёт снизу)
+
+        // Измеряем реальную высоту имени (для плотного размещения sub)
+        RECT nameCalc = nameRc;
+        DrawTextW(dc, name.c_str(), (int)name.size(), &nameCalc, DT_LEFT | DT_NOPREFIX | DT_WORDBREAK | DT_CALCRECT);
+
+        int nameBottom = std::min<int>(nameCalc.bottom, nameRc.bottom);
+        DrawTextW(dc, name.c_str(), (int)name.size(), &nameRc, DT_LEFT | DT_NOPREFIX | DT_WORDBREAK | DT_END_ELLIPSIS);
 
         SelectObject(dc, st->fonts.hSmall);
         SetTextColor(dc, g_clrSub);
@@ -824,8 +1047,13 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
             std::wstring fb = FallbackEmail_NotesAware(c);
             if (!fb.empty()) sub = L"Email: " + fb;
         }
-        RECT subRc = nameRc; subRc.top = nameRc.top + S(h, 20);
+        RECT subRc = item;
+        subRc.left += S(h, 8);
+        subRc.top = nameBottom + S(h, 2);
+        subRc.right -= S(h, 4);
+        subRc.bottom -= S(h, 2);
         DrawTextW(dc, sub.c_str(), (int)sub.size(), &subRc, DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(dc, old); // restore font
 
         ycur += st->listItemH;
     }
@@ -837,16 +1065,42 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
 // ===================== EDIT и ФОТО: наполнение и поведение =====================
 static void UpdateRightPanel(ViewState* st) {
     if (!st) return;
-    // фото: приоритет — встроенное в Contact, затем rawBlocks
+    // фото: embedded → raw base64 → optional URL download
     st->photo.reset();
+    std::wstring photoUrl;
     if (st->sel < st->contacts.size()) {
         const Contact& c = st->contacts[st->sel];
         if (c.photo.has_value() && !c.photo->bytes.empty()) {
             st->photo = BitmapFromMemory(c.photo->bytes);
         }
+        photoUrl = c.photo_url;
     }
     if (!st->photo && st->sel < st->rawBlocks.size()) {
         st->photo = LoadPhotoFromRaw(st->rawBlocks[st->sel]);
+    }
+    // Optional HTTP(S) photo (ini LoadPhotoUrl=1). Default off — no network by default.
+    if (!st->photo && st->loadPhotoUrl) {
+        if (photoUrl.empty() && st->sel < st->rawBlocks.size()) {
+            // try extract first PHOTO:http from raw (BuildFromRawBlock skips embedded only)
+            auto lines = UnfoldVCard_Folded(SplitLines(st->rawBlocks[st->sel]));
+            for (auto& L : lines) {
+                size_t cpos = L.find(L':');
+                if (cpos == std::wstring::npos) continue;
+                std::wstring head = ToUpperASCII(Trim(L.substr(0, cpos)));
+                size_t d = head.find(L'.');
+                if (d != std::wstring::npos) head = head.substr(d + 1);
+                if (head.rfind(L"PHOTO", 0) != 0) continue;
+                std::wstring v = Trim(L.substr(cpos + 1));
+                if (v.rfind(L"http://", 0) == 0 || v.rfind(L"https://", 0) == 0) {
+                    photoUrl = v;
+                    break;
+                }
+            }
+        }
+        if (!photoUrl.empty()) {
+            auto bytes = HttpGetBytes(photoUrl);
+            if (!bytes.empty()) st->photo = BitmapFromMemory(bytes);
+        }
     }
     if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
 
@@ -870,17 +1124,23 @@ static void UpdateRightPanel(ViewState* st) {
             auto add = [&](const std::wstring& k, const std::wstring& v) { if (!v.empty()) { text += k; text += v; text += L"\r\n"; } };
             std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
             if (name.empty()) name = L"(no name)";
-            add(g_tcRu ? L"Имя" : L"Name", name);
-            add(g_tcRu ? L"Компания" : L"Organization", c.org);
-            add(g_tcRu ? L"Должность" : L"Role", c.title);
-            add(L"URL", c.url);
-            add(g_tcRu ? L"День рождения" : L"Birthday", c.bday);
-            for (auto& p : c.phones) if (!p.number.empty()) add(g_tcRu ? L"Телефон" : L"Phone", p.number);
-            bool any = false; for (auto& e : c.emails) { if (!e.addr.empty()) { add(L"Email", e.addr); any = true; } }
-            if (!any) { std::wstring fb = FallbackEmail_NotesAware(c); if (!fb.empty()) add(L"Email", fb); }
-            for (auto& a : c.addrs) if (!a.text.empty()) add(g_tcRu ? L"Адрес" : L"Address", a.text);
-            if constexpr (detail_detect::has_notes<Contact>::value) { for (auto& n : c.notes) add(g_tcRu ? L"Заметка" : L"Note", n); }
-            else if (!c.note.empty()) { add(g_tcRu ? L"Заметка" : L"Note", c.note); }
+            add(g_tcRu ? L"Имя: " : L"Name: ", name);
+            add(g_tcRu ? L"Тип контакта: " : L"Kind: ", c.kind);
+            add(g_tcRu ? L"Пол: " : L"Gender: ", c.gender);
+            add(g_tcRu ? L"Язык: " : L"Language: ", c.lang);
+            for (auto& lg : c.langs) if (lg != c.lang) add(g_tcRu ? L"Язык: " : L"Language: ", lg);
+            add(g_tcRu ? L"Компания: " : L"Organization: ", c.org);
+            add(g_tcRu ? L"Должность: " : L"Role: ", c.title);
+            if (!c.urls.empty()) { for (auto& u : c.urls) add(L"URL: ", u); }
+            else add(L"URL: ", c.url);
+            add(g_tcRu ? L"День рождения: " : L"Birthday: ", c.bday);
+            for (auto& m : c.members) add(g_tcRu ? L"Участник: " : L"Member: ", m);
+            for (auto& p : c.phones) if (!p.number.empty()) add(g_tcRu ? L"Телефон: " : L"Phone: ", p.number);
+            bool any = false; for (auto& e : c.emails) { if (!e.addr.empty()) { add(L"Email: ", e.addr); any = true; } }
+            if (!any) { std::wstring fb = FallbackEmail_NotesAware(c); if (!fb.empty()) add(L"Email: ", fb); }
+            for (auto& a : c.addrs) if (!a.text.empty()) add(g_tcRu ? L"Адрес: " : L"Address: ", a.text);
+            if constexpr (detail_detect::has_notes<Contact>::value) { for (auto& n : c.notes) add(g_tcRu ? L"Заметка: " : L"Note: ", n); }
+            else if (!c.note.empty()) { add(g_tcRu ? L"Заметка: " : L"Note: ", c.note); }
         }
         else {
             text = L"";
@@ -896,6 +1156,22 @@ static WNDPROC g_EditOldProc = nullptr;
 static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            HWND viewer = GetParent(hEdit);
+            HWND lister = viewer ? GetParent(viewer) : nullptr;
+            if (lister) { PostMessageW(lister, WM_KEYDOWN, VK_ESCAPE, 0); return 0; }
+        }
+        // Ctrl+C without selection → copy current line value (after ':')
+        if ((wParam == 'C' || wParam == 'c') && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            DWORD a = 0, b = 0;
+            SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+            if (a == b) {
+                HWND viewer = GetParent(hEdit);
+                std::wstring v = ValueAfterColon(GetEditCurrentLine(hEdit));
+                if (!v.empty() && viewer) { SetClipboardTextW(viewer, v); return 0; }
+            }
+        }
+        break;
     case WM_SYSKEYDOWN:
     case WM_CHAR:
         if (wParam == VK_ESCAPE) {
@@ -1031,6 +1307,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             RegisterClassW(&wc); photoReg = true;
         }
 
+        LoadViewSettings(st);
+
+        // Tooltip for long contact names
+        INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
+        InitCommonControlsEx(&icc);
+        st->hTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+            WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            h, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (st->hTip) {
+            SetWindowPos(st->hTip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            TOOLINFOW ti{}; ti.cbSize = sizeof(ti);
+            ti.uFlags = TTF_SUBCLASS | TTF_TRANSPARENT;
+            ti.hwnd = h; ti.uId = 1;
+            ti.lpszText = (LPWSTR)L"";
+            GetClientRect(h, &ti.rect);
+            SendMessageW(st->hTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            SendMessageW(st->hTip, TTM_SETMAXTIPWIDTH, 0, 400);
+            SendMessageW(st->hTip, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
+        }
+
         // Скролл слева
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
             0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -1060,6 +1357,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (st->hPhoto && IsWindow(st->hPhoto)) DestroyWindow(st->hPhoto);
             if (st->hScroll && IsWindow(st->hScroll)) DestroyWindow(st->hScroll);
             if (st->hRightScroll && IsWindow(st->hRightScroll)) DestroyWindow(st->hRightScroll);
+            if (st->hTip && IsWindow(st->hTip)) DestroyWindow(st->hTip);
             st->photo.reset();
             FreeFonts(st->fonts); delete st;
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
@@ -1074,17 +1372,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int listW = ListPaneWidth(h);
         int sbw = GetSystemMetrics(SM_CXVSCROLL);
         int statusH = S(h, 18);
-        int listContentH = rc.bottom - statusH;
+        int listContentH = std::max<int>(0, (int)rc.bottom - statusH);
 
         MoveWindow(st->hScroll, listW - sbw, 0, sbw, listContentH, TRUE);
 
-        // Правая колонка
+        // Правая колонка (статусбар только слева — справа используем всю высоту)
         int pad = S(h, 12);
         int ex = listW + 1 + pad;
-        int ew = rc.right - ex - pad;
-        if (ew < S(h, 100)) ew = std::max<int>(0, rc.right - (listW + pad));
+        int rightScrollBarW = sbw;
+        int rightAreaTop = pad;
+        int rightAreaH = std::max<int>(50, (int)rc.bottom - pad - pad);
 
-        // Фото: ширина = min(ew, 1000), высота по содержимому (≤1000). Размер увеличен в ~2 раза по запросу
+        // Ширина контента: резервируем место под правый скроллбар (прижат к правому краю окна)
+        int ew = (int)rc.right - ex - pad - rightScrollBarW;
+        if (ew < S(h, 80)) {
+            // Узкое окно — скроллбар может перекрыть pad
+            ew = std::max<int>(0, (int)rc.right - ex - rightScrollBarW);
+        }
+
+        // Фото: ширина = min(ew, 1000), высота по содержимому (≤1000)
         int photoW = std::min<int>(ew, 1000);
         int photoH = 0;
         if (st->photo) {
@@ -1096,48 +1402,44 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 double sy = 1000.0 / static_cast<double>(ih);
                 s = std::min<double>(1.0, std::min<double>(sx, sy));
             }
-            photoH = static_cast<int>(std::min<double>(1000.0, static_cast<double>(st->photo ? st->photo->GetHeight() : 0) * s));
+            photoH = static_cast<int>(std::min<double>(1000.0, static_cast<double>(ih) * s));
         }
         if (st->photo && photoH <= 0) photoH = 100; // min height to show the photo window
 
         int ey = pad;
         int sep = S(h, 8);
-
-        // Правый скролл для карточки: учитываем rightScroll для позиционирования содержимого
-        int rightScroll = st->rightScroll;
-        int rightScrollBarW = GetSystemMetrics(SM_CXVSCROLL);
-
-        // Позиция правого скроллбара (справа от правой колонки)
-        int rightAreaTop = pad;
-        int rightAreaH = rc.bottom - statusH - pad;  // примерно высота правой области с учётом статусбара слева
-        if (rightAreaH < 50) rightAreaH = 50;
-        MoveWindow(st->hRightScroll, ex + ew, rightAreaTop, rightScrollBarW, rightAreaH, TRUE);
-
-        // Позиционируем фото и EDIT с учётом скролла (для большого фото / длинного текста)
-        MoveWindow(st->hPhoto, ex, ey - rightScroll, photoW, (photoH > 0 ? photoH : 0), TRUE);
-
         int editY = ey + (photoH > 0 ? photoH + sep : 0);
-        int eh = (rc.bottom - statusH) - editY - pad;
-        MoveWindow(st->hEdit, ex, editY - rightScroll, ew, std::max<int>(0, eh), TRUE);
 
-        // Обновляем диапазон правого скроллбара
-        int contentBottom = editY + std::max<int>(0, eh) + pad;
-        int maxScroll = std::max(0, contentBottom - rightAreaH);
+        // Высота EDIT: заполняет остаток viewport; при большом фото — минимум, чтобы можно было доскроллить к тексту
+        int minEditH = S(h, 100);
+        int remaining = rightAreaH - (editY - pad);
+        int eh = remaining;
+        if (eh < minEditH && photoH > 0) eh = minEditH;
+        if (eh < 0) eh = 0;
+
+        // Полная высота контента карточки (для диапазона скролла)
+        int contentH = (editY - pad) + eh + pad; // от верха области до низа EDIT + pad
+        int maxScroll = std::max<int>(0, contentH - rightAreaH);
+        if (st->rightScroll > maxScroll) st->rightScroll = maxScroll;
+        if (st->rightScroll < 0) st->rightScroll = 0;
+        int rightScroll = st->rightScroll;
+
+        MoveWindow(st->hRightScroll, (int)rc.right - rightScrollBarW, rightAreaTop, rightScrollBarW, rightAreaH, TRUE);
+
+        // Позиционируем фото и EDIT с учётом скролла
+        MoveWindow(st->hPhoto, ex, ey - rightScroll, photoW, (photoH > 0 ? photoH : 0), TRUE);
+        MoveWindow(st->hEdit, ex, editY - rightScroll, ew, eh, TRUE);
+
+        // SCROLLINFO: nMax = contentH, nPage = viewport → max pos ≈ contentH - nPage
         SCROLLINFO rsi{};
         rsi.cbSize = sizeof(rsi);
-        rsi.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        rsi.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
         rsi.nMin = 0;
-        rsi.nMax = maxScroll;
-        rsi.nPage = rightAreaH / 2;  // примерно
-        rsi.nPos = std::min(rightScroll, maxScroll);
+        rsi.nMax = std::max<int>(0, contentH - 1);
+        rsi.nPage = (UINT)std::max<int>(1, rightAreaH);
+        rsi.nPos = rightScroll;
         SetScrollInfo(st->hRightScroll, SB_CTL, &rsi, TRUE);
         ShowWindow(st->hRightScroll, (maxScroll > 0) ? SW_SHOW : SW_HIDE);
-
-        // Если текущий скролл больше допустимого — подправим
-        if (rightScroll > maxScroll) {
-            st->rightScroll = maxScroll;
-            // переместим заново (повторный вызов layout не нужен, т.к. мы уже установили)
-        }
 
         InvalidateRect(h, nullptr, FALSE);
         if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, FALSE);
@@ -1172,29 +1474,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             // Скролл правой панели (карточка) — большое фото или длинный текст
             RECT rc; GetClientRect(h, &rc);
             int pad = S(h, 12);
-            int listW = ListPaneWidth(h);
-            int ex = listW + 1 + pad;
-            int ew = rc.right - ex - pad;
-            if (ew < S(h, 100)) ew = std::max<int>(0, rc.right - (listW + pad));
-            int statusH = S(h, 18);
-            int rightAreaH = rc.bottom - statusH - pad;
-            if (rightAreaH < 50) rightAreaH = 50;
+            int rightAreaH = std::max<int>(50, (int)rc.bottom - pad - pad);
+
+            SCROLLINFO cur{}; cur.cbSize = sizeof(cur); cur.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+            GetScrollInfo(st->hRightScroll, SB_CTL, &cur);
+            int maxPos = std::max<int>(0, (int)cur.nMax - (int)cur.nPage + 1);
 
             int pos = st->rightScroll;
             switch (LOWORD(w)) {
             case SB_LINEUP:   pos -= 30; break;
             case SB_LINEDOWN: pos += 30; break;
-            case SB_PAGEUP:   pos -= rightAreaH / 2; break;
-            case SB_PAGEDOWN: pos += rightAreaH / 2; break;
+            case SB_PAGEUP:   pos -= std::max<int>(1, rightAreaH / 2); break;
+            case SB_PAGEDOWN: pos += std::max<int>(1, rightAreaH / 2); break;
             case SB_TOP:      pos = 0; break;
-            case SB_BOTTOM:   pos = 999999; break;
+            case SB_BOTTOM:   pos = maxPos; break;
             case SB_THUMBTRACK:
             case SB_THUMBPOSITION: {
                 SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_TRACKPOS;
                 GetScrollInfo(st->hRightScroll, SB_CTL, &si); pos = si.nTrackPos; break;
             }
             }
-            st->rightScroll = std::max(0, pos);
+            st->rightScroll = std::max<int>(0, std::min<int>(maxPos, pos));
             SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
             InvalidateRect(h, nullptr, FALSE);
             if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, FALSE);
@@ -1220,7 +1520,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (pt.x > listW) {
                 int delta = GET_WHEEL_DELTA_WPARAM(w);
                 int step = (delta > 0) ? -40 : +40;
-                st->rightScroll = std::max(0, st->rightScroll + step);
+                SCROLLINFO cur{}; cur.cbSize = sizeof(cur); cur.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+                if (st->hRightScroll) GetScrollInfo(st->hRightScroll, SB_CTL, &cur);
+                int maxPos = std::max<int>(0, (int)cur.nMax - (int)cur.nPage + 1);
+                st->rightScroll = std::max<int>(0, std::min<int>(maxPos, st->rightScroll + step));
                 RECT rc; GetClientRect(h, &rc);
                 SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
                 InvalidateRect(h, nullptr, FALSE);
@@ -1231,6 +1534,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_KEYDOWN: {
+        // Ctrl+C: copy selection / line value / contact name
+        if (st && (GetKeyState(VK_CONTROL) & 0x8000) && (w == 'C' || w == 'c')) {
+            HWND focus = GetFocus();
+            if (focus == st->hEdit) {
+                DWORD a = 0, b = 0; SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+                if (a != b) SendMessageW(st->hEdit, WM_COPY, 0, 0);
+                else SetClipboardTextW(h, ValueAfterColon(GetEditCurrentLine(st->hEdit)));
+                return 0;
+            }
+            if (st->sel < st->contacts.size()) {
+                std::wstring n = ContactDisplayName(st->contacts[st->sel]);
+                if (!n.empty()) SetClipboardTextW(h, n);
+                return 0;
+            }
+        }
         if (!st || st->contacts.empty()) return 0;
         size_t sel = st->sel, count = st->contacts.size(); bool handled = false;
         switch (w) {
@@ -1244,50 +1562,186 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (handled) { SetSelectionAndReveal(h, st, sel); return 0; }
         break;
     }
+    case WM_SETCURSOR: {
+        if (st && LOWORD(l) == HTCLIENT) {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
+            if (st->draggingSplit || HitSplitter(h, pt.x)) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+                return TRUE;
+            }
+        }
+        break;
+    }
     case WM_LBUTTONDOWN: {
         if (!st) break;
         int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
+        RECT rcClient{}; GetClientRect(h, &rcClient);
+        int statusH = S(h, 18);
+        // Splitter drag
+        if (HitSplitter(h, x)) {
+            st->draggingSplit = true;
+            SetCapture(h);
+            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+            return 0;
+        }
+        // Клики по статусбару не выбирают контакты
+        if (y >= rcClient.bottom - statusH) return 0;
         int pad = S(h, 8), listW = ListPaneWidth(h) - GetSystemMetrics(SM_CXVSCROLL);
         if (x >= pad && x < listW - pad) {
-            int rowH = st->listItemH ? st->listItemH : S(h, 52);
+            int rowH = st->listItemH ? st->listItemH : S(h, 60);
             int row = (y - pad) / rowH;
-            if (row >= 0) {
+            if (row >= 0 && row < st->perPage) {
                 size_t idx = (size_t)(st->listScroll + row);
                 if (idx < st->contacts.size()) { st->sel = idx; st->rightScroll = 0; UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); return 0; }
             }
         }
         return 0;
     }
+    case WM_MOUSEMOVE: {
+        if (!st) break;
+        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
+        if (st->draggingSplit) {
+            RECT rc; GetClientRect(h, &rc);
+            int minW = S(h, 160), maxW = std::max<int>(minW, (int)rc.right - S(h, 220));
+            int w = x;
+            if (w < minW) w = minW;
+            if (w > maxW) w = maxW;
+            st->listPaneW96 = MulDiv(w, 96, Dpi(h));
+            if (st->listPaneW96 < 160) st->listPaneW96 = 160;
+            SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        // Tooltip for long list names
+        if (st->hTip) {
+            RECT rcClient{}; GetClientRect(h, &rcClient);
+            int statusH = S(h, 18);
+            int listW = ListPaneWidth(h);
+            int pad = S(h, 8);
+            int tipRow = -1;
+            std::wstring tipText;
+            if (x < listW && y < rcClient.bottom - statusH) {
+                int rowH = st->listItemH ? st->listItemH : S(h, 60);
+                int row = (y - pad) / rowH;
+                if (row >= 0 && row < st->perPage) {
+                    size_t idx = (size_t)(st->listScroll + row);
+                    if (idx < st->contacts.size()) {
+                        tipRow = (int)idx;
+                        tipText = ContactDisplayName(st->contacts[idx]);
+                        if (tipText.empty()) tipText = g_tcRu ? L"(пустая карточка)" : L"(empty card)";
+                        // only show if likely truncated (long name)
+                        if (tipText.size() < 28) tipText.clear();
+                    }
+                }
+            }
+            if (tipRow != st->tipRow) {
+                st->tipRow = tipRow;
+                TOOLINFOW ti{}; ti.cbSize = sizeof(ti);
+                ti.hwnd = h; ti.uId = 1;
+                ti.lpszText = tipText.empty() ? (LPWSTR)L"" : (LPWSTR)tipText.c_str();
+                SendMessageW(st->hTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+                if (!tipText.empty()) {
+                    ti.rect = st->listRc;
+                    SendMessageW(st->hTip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+                }
+            }
+        }
+        break;
+    }
+    case WM_LBUTTONUP: {
+        if (st && st->draggingSplit) {
+            st->draggingSplit = false;
+            ReleaseCapture();
+            SaveListWidth(st, h);
+            return 0;
+        }
+        break;
+    }
+    case WM_CAPTURECHANGED: {
+        if (st) st->draggingSplit = false;
+        break;
+    }
     case WM_THEMECHANGED:
     case WM_SETTINGCHANGE:
-    case WM_SYSCOLORCHANGE: { RecomputeTheme(); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); return 0; }
+    case WM_SYSCOLORCHANGE: {
+        RecomputeTheme();
+        if (st) LoadViewSettings(st);
+        UpdateRightPanel(st);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
 
-                          // ПКМ по EDIT → «Копировать»
+    // ПКМ → копирование (список / EDIT)
     case WM_CONTEXTMENU: {
         if (!st) break;
-        HWND hSrc = (HWND)w; POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        HWND hSrc = (HWND)w;
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (pt.x == -1 && pt.y == -1) { // keyboard
+            GetCursorPos(&pt);
+        }
+        POINT ptClient = pt; ScreenToClient(h, &ptClient);
+
+        // Right-click on list: copy name / phone / email
+        int listW = ListPaneWidth(h);
+        if (hSrc == h && ptClient.x < listW && st->sel < st->contacts.size()) {
+            const Contact& c = st->contacts[st->sel];
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 10, g_tcRu ? L"Копировать имя" : L"Copy name");
+            AppendMenuW(m, MF_STRING, 11, g_tcRu ? L"Копировать телефон" : L"Copy phone");
+            AppendMenuW(m, MF_STRING, 12, g_tcRu ? L"Копировать email" : L"Copy email");
+            AppendMenuW(m, MF_STRING, 13, g_tcRu ? L"Копировать карточку" : L"Copy card text");
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, nullptr);
+            DestroyMenu(m);
+            if (cmd == 10) {
+                std::wstring n = ContactDisplayName(c);
+                if (!n.empty()) SetClipboardTextW(h, n);
+            } else if (cmd == 11) {
+                std::wstring p = PrimaryPhone(c);
+                if (!p.empty()) SetClipboardTextW(h, p);
+            } else if (cmd == 12) {
+                std::wstring e = PrimaryEmail(c);
+                if (e.empty()) e = FallbackEmail_NotesAware(c);
+                if (!e.empty()) SetClipboardTextW(h, e);
+            } else if (cmd == 13 && IsWindow(st->hEdit)) {
+                int len = GetWindowTextLengthW(st->hEdit);
+                std::wstring all((size_t)std::max(0, len), L'\0');
+                if (len > 0) GetWindowTextW(st->hEdit, &all[0], len + 1);
+                SetClipboardTextW(h, all);
+            }
+            return 0;
+        }
+
         if (hSrc == st->hEdit || (hSrc == h)) {
-            if (hSrc == h) { // попали ли в EDIT?
+            if (hSrc == h) {
                 RECT rcE{}; GetWindowRect(st->hEdit, &rcE);
                 if (!(pt.x >= rcE.left && pt.x < rcE.right && pt.y >= rcE.top && pt.y < rcE.bottom)) break;
             }
-            HMENU m = CreatePopupMenu(); AppendMenuW(m, MF_STRING, 1, L"\u041A\u043E\u043F\u0438\u0440\u043E\u0432\u0430\u0442\u044C");
-            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, nullptr); DestroyMenu(m);
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, g_tcRu ? L"Копировать" : L"Copy");
+            AppendMenuW(m, MF_STRING, 2, g_tcRu ? L"Копировать строку (значение)" : L"Copy line value");
+            AppendMenuW(m, MF_STRING, 3, g_tcRu ? L"Копировать всё" : L"Copy all");
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, nullptr);
+            DestroyMenu(m);
             if (cmd == 1) {
                 DWORD a = 0, b = 0; SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
                 if (a != b) SendMessageW(st->hEdit, WM_COPY, 0, 0);
                 else {
-                    int len = GetWindowTextLengthW(st->hEdit);
-                    std::wstring all(len, L'\0');
-                    GetWindowTextW(st->hEdit, &all[0], len + 1);
-                    SetClipboardTextW(h, all);
+                    std::wstring line = GetEditCurrentLine(st->hEdit);
+                    SetClipboardTextW(h, ValueAfterColon(line));
                 }
+            } else if (cmd == 2) {
+                std::wstring line = GetEditSelectionOrLine(st->hEdit);
+                SetClipboardTextW(h, ValueAfterColon(line));
+            } else if (cmd == 3) {
+                int len = GetWindowTextLengthW(st->hEdit);
+                std::wstring all((size_t)std::max(0, len), L'\0');
+                if (len > 0) GetWindowTextW(st->hEdit, &all[0], len + 1);
+                SetClipboardTextW(h, all);
             }
             return 0;
         }
         break;
     }
-
     case WM_CTLCOLORDLG:
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORLISTBOX:
@@ -1317,10 +1771,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int listH = rc.bottom - statusH;
         RenderList(mem, h, st, rc.left, rc.top, listW, listH, st->listRc);
 
+        // Splitter (slightly wider visual so it's obvious and draggable)
+        int splitW = std::max(2, S(h, 3));
         HBRUSH sepBr = CreateSolidBrush(g_clrSeparator);
-        RECT sep{ listW, rc.top, listW + 1, rc.bottom }; FillRect(mem, &sep, sepBr); DeleteObject(sepBr);
+        RECT sep{ listW - splitW / 2, rc.top, listW + splitW / 2 + 1, rc.bottom };
+        FillRect(mem, &sep, sepBr); DeleteObject(sepBr);
 
-        // Status bar under the list (total contacts count)
+        // Status bar under the list (total contacts + search matches)
         if (statusH > 0) {
             RECT srect{ rc.left, rc.bottom - statusH, listW, rc.bottom };
             HBRUSH sbr = CreateSolidBrush(g_clrListBg);
@@ -1332,16 +1789,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             std::wstring stxt = g_tcRu ? L"Контактов: " : L"Contacts: ";
             stxt += std::to_wstring((int)st->contacts.size());
             if (!st->contacts.empty()) {
-                stxt += g_tcRu ? L"  (" : L"  (";
+                stxt += L"  (";
                 stxt += std::to_wstring(st->sel + 1);
                 stxt += L"/";
                 stxt += std::to_wstring((int)st->contacts.size());
                 stxt += L")";
             }
+            if (!st->searchNeedle.empty()) {
+                stxt += g_tcRu ? L"  |  Найдено: " : L"  |  Found: ";
+                stxt += std::to_wstring(st->matchCount);
+                if (st->matchCount > 0 && st->matchPos > 0) {
+                    stxt += L" (";
+                    stxt += std::to_wstring(st->matchPos);
+                    stxt += L"/";
+                    stxt += std::to_wstring(st->matchCount);
+                    stxt += L")";
+                }
+            }
             RECT tr = srect;
             tr.left += S(h, 6);
             tr.right -= S(h, 6);
-            DrawTextW(mem, stxt.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            DrawTextW(mem, stxt.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
             SelectObject(mem, oldf);
         }
 
@@ -1370,9 +1838,13 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
     st->contacts = contacts; st->sel = 0; st->listScroll = 0;
     st->rightScroll = 0;
+    st->searchNeedle.clear();
+    st->matchFlags.clear();
+    st->matchCount = 0;
+    st->matchPos = 0;
+    LoadViewSettings(st);
     UpdateRightPanel(st);
     InvalidateRect(h, nullptr, FALSE);
-    // Force layout of photo/edit children now that photo may be available
     RECT rc; GetClientRect(h, &rc);
     SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
 }
@@ -1383,7 +1855,6 @@ extern "C" void VCFView_SetRawBlocks(HWND h, const std::vector<std::wstring>& ra
     st->rightScroll = 0;
     UpdateRightPanel(st);
     InvalidateRect(h, nullptr, FALSE);
-    // Force layout of photo/edit children now that photo may be available from raw
     RECT rc; GetClientRect(h, &rc);
     SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
 }
@@ -1396,43 +1867,69 @@ void VCFView_SetSelection(HWND h, size_t idx) {
         RECT rc; GetClientRect(h, &rc); SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom)); }
 }
 
-// Поиск — по разобранным полям (как было)
+// Поиск — по разобранным полям; подсветка совпадений + счётчик в статусбаре
 bool VCFView_SearchEx(HWND h, const std::wstring& needle, size_t startIndex, bool backwards, bool /*matchCase*/, bool wholeWord, bool wrap) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
     if (!st || st->contacts.empty() || needle.empty()) return false;
 
+    st->searchNeedle = needle;
+    RebuildSearchFlags(st, wholeWord);
+
     auto norm = [&](const std::wstring& x) { return LowerInvariant(x); };
     std::wstring n = norm(needle);
-
-    auto buildHay = [&](const Contact& c) {
-        std::wstring hstr;
-        auto add = [&](const std::wstring& s) { if (!s.empty()) { hstr += L" "; hstr += norm(s); } };
-        add(c.fn); add(c.n_given); add(c.n_family); add(c.org); add(c.title); add(c.bday); add(c.url); add(c.note);
-        if constexpr (detail_detect::has_notes<Contact>::value) { for (auto& t : c.notes) add(t); }
-        for (auto& t : c.phones) { add(t.number); for (auto& tp : t.types) add(tp); }
-        for (auto& e : c.emails) { add(e.addr);   for (auto& tp : e.types) add(tp); }
-        for (auto& a : c.addrs) { add(a.text); }
-        return hstr;
-        };
 
     const size_t count = st->contacts.size();
     auto nextIndex = [&](size_t i)->size_t { return backwards ? (i == 0 ? count - 1 : i - 1) : (i + 1 == count ? 0 : i + 1); };
 
     size_t i = startIndex % count, first = i;
     do {
-        std::wstring hay = buildHay(st->contacts[i]);
-        size_t pos = hay.find(n);
-        while (pos != std::wstring::npos) {
-            if (!wholeWord || (isWordBoundary(hay, pos) && isWordBoundary2(hay, pos + n.size()))) {
-                st->sel = i; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE);
+        if (i < st->matchFlags.size() && st->matchFlags[i]) {
+            // verify whole-word against same helper
+            if (ContactMatchesNeedle(st->contacts[i], n, wholeWord)) {
+                st->sel = i;
+                st->rightScroll = 0;
+                // update matchPos among matches
+                int p = 0;
+                for (size_t k = 0; k <= i; ++k) if (k < st->matchFlags.size() && st->matchFlags[k]) ++p;
+                st->matchPos = p;
+                EnsureSelVisible(h, st);
+                UpdateRightPanel(st);
+                // highlight needle in EDIT text if present
+                if (IsWindow(st->hEdit)) {
+                    int len = GetWindowTextLengthW(st->hEdit);
+                    if (len > 0) {
+                        std::wstring all((size_t)len, L'\0');
+                        GetWindowTextW(st->hEdit, &all[0], len + 1);
+                        std::wstring low = LowerInvariant(all);
+                        size_t pos = low.find(n);
+                        if (pos != std::wstring::npos)
+                            SendMessageW(st->hEdit, EM_SETSEL, (WPARAM)pos, (LPARAM)(pos + n.size()));
+                    }
+                }
+                InvalidateRect(h, nullptr, FALSE);
                 return true;
             }
-            pos = hay.find(n, pos + 1);
         }
         i = nextIndex(i);
     } while (wrap && i != first);
 
+    InvalidateRect(h, nullptr, FALSE); // still show match highlights even if wrap failed mid-way
     return false;
 }
 
-bool VCFView_CopyActive(HWND) { return false; }
+bool VCFView_CopyActive(HWND h) {
+    auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (!st) return false;
+    if (IsWindow(st->hEdit)) {
+        DWORD a = 0, b = 0;
+        SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+        if (a != b) { SendMessageW(st->hEdit, WM_COPY, 0, 0); return true; }
+        std::wstring v = ValueAfterColon(GetEditCurrentLine(st->hEdit));
+        if (!v.empty()) { SetClipboardTextW(h, v); return true; }
+    }
+    if (st->sel < st->contacts.size()) {
+        std::wstring n = ContactDisplayName(st->contacts[st->sel]);
+        if (!n.empty()) { SetClipboardTextW(h, n); return true; }
+    }
+    return false;
+}
