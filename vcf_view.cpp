@@ -401,17 +401,14 @@ static const int* GetB64Table() {
 
 static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
     const int* T = GetB64Table();
-
     std::vector<BYTE> out; out.reserve(wsrc.size() * 3 / 4);
     int val = 0, valb = -8;
     for (wchar_t wc : wsrc) {
-        if (wc == L'=' || wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') {
-            if (wc == L'=') break; // stop on padding, don't process further
-            continue;
-        }
+        if (wc == L'=') break; // padding / end
+        if (wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') continue;
         if (wc > 255) continue;
         int d = T[(unsigned char)wc];
-        if (d == -1) continue;
+        if (d < 0) continue;
         val = (val << 6) + d;
         valb += 6;
         if (valb >= 0) {
@@ -420,6 +417,118 @@ static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
         }
     }
     return out;
+}
+
+// BlackBerry and some phone exports produce JPEGs where APP0/APP1 length
+// overruns into the next marker (e.g. DQT). GDI+ then reports
+// "Quantization table not defined" and fails. Clamp segment lengths so
+// markers stay visible; append EOI if truncated.
+static void RepairJpegBytes(std::vector<uint8_t>& data) {
+    if (data.size() < 4) return;
+    if (!(data[0] == 0xFF && data[1] == 0xD8)) return; // not JPEG
+
+    std::vector<uint8_t> out;
+    out.reserve(data.size() + 4);
+    out.push_back(0xFF);
+    out.push_back(0xD8);
+    size_t i = 2;
+    auto push_range = [&](size_t a, size_t b) {
+        if (b > data.size()) b = data.size();
+        if (a < b) out.insert(out.end(), data.begin() + (ptrdiff_t)a, data.begin() + (ptrdiff_t)b);
+    };
+
+    while (i + 1 < data.size()) {
+        // seek FF
+        if (data[i] != 0xFF) {
+            size_t j = i;
+            while (j < data.size() && data[j] != 0xFF) ++j;
+            // skip stray non-marker bytes between segments
+            i = j;
+            continue;
+        }
+        // skip fill 0xFF
+        while (i + 1 < data.size() && data[i] == 0xFF && data[i + 1] == 0xFF) ++i;
+        if (i + 1 >= data.size()) break;
+        uint8_t mt = data[i + 1];
+        if (mt == 0x00) { // escaped FF in entropy — shouldn't appear outside SOS
+            i += 2;
+            continue;
+        }
+        if (mt == 0xD9) { // EOI
+            out.push_back(0xFF);
+            out.push_back(0xD9);
+            data.swap(out);
+            return;
+        }
+        if (mt == 0xD8) { // extra SOI
+            out.push_back(0xFF);
+            out.push_back(0xD8);
+            i += 2;
+            continue;
+        }
+        // RST / TEM without length
+        if ((mt >= 0xD0 && mt <= 0xD7) || mt == 0x01) {
+            out.push_back(0xFF);
+            out.push_back(mt);
+            i += 2;
+            continue;
+        }
+        if (i + 3 >= data.size()) {
+            push_range(i, data.size());
+            break;
+        }
+        unsigned n = (unsigned(data[i + 2]) << 8) | unsigned(data[i + 3]);
+        if (n < 2) { i += 2; continue; }
+
+        size_t segDataStart = i + 4;
+        size_t claimedEnd = i + 2 + n; // exclusive
+
+        // For APPn / COM: if a real marker appears before claimedEnd, clamp length
+        bool isAppOrCom = (mt >= 0xE0 && mt <= 0xEF) || mt == 0xFE;
+        if (isAppOrCom && claimedEnd > segDataStart) {
+            size_t limit = std::min(claimedEnd, data.size());
+            for (size_t j = segDataStart; j + 1 < limit; ++j) {
+                if (data[j] == 0xFF) {
+                    uint8_t m2 = data[j + 1];
+                    if (m2 != 0x00 && m2 != 0xFF) {
+                        // clamp segment to end at j
+                        unsigned newN = (unsigned)(j - (i + 2));
+                        if (newN >= 2) {
+                            out.push_back(0xFF);
+                            out.push_back(mt);
+                            out.push_back((uint8_t)((newN >> 8) & 0xFF));
+                            out.push_back((uint8_t)(newN & 0xFF));
+                            push_range(segDataStart, j);
+                            i = j;
+                            goto next_seg;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (claimedEnd > data.size()) {
+            // truncated segment — copy rest
+            push_range(i, data.size());
+            break;
+        }
+        push_range(i, claimedEnd);
+        i = claimedEnd;
+
+        if (mt == 0xDA) {
+            // entropy-coded scan: copy remaining bytes
+            push_range(i, data.size());
+            break;
+        }
+    next_seg:;
+    }
+
+    // Ensure EOI for truncated BlackBerry photos (scan cut off)
+    if (out.size() < 2 || !(out[out.size() - 2] == 0xFF && out[out.size() - 1] == 0xD9)) {
+        out.push_back(0xFF);
+        out.push_back(0xD9);
+    }
+    data.swap(out);
 }
 
 // Загрузка фото из raw (поддержка 2.1: многострочный Base64)
@@ -479,51 +588,57 @@ static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw
 }
 
 // Создать Bitmap из сырых байтов изображения
-static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytes) {
-    if (bytes.empty()) return nullptr;
-    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
-    if (!hMem) return nullptr;
-    void* p = GlobalLock(hMem);
-    if (!p) {
-        GlobalFree(hMem);
-        return nullptr;
-    }
-    memcpy(p, bytes.data(), bytes.size());
-    GlobalUnlock(hMem);
-    IStream* pStream = nullptr;
-    if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) != S_OK) {  // TRUE: stream will free hMem on Release()
-        GlobalFree(hMem);
-        return nullptr;
-    }
-    std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromStream(pStream));
-    // Best-effort decode for real-world (sometimes slightly corrupt) vCard photos.
-    // Query dimensions even if status != Ok; many JPEGs with minor issues still report size.
-    bool good = false;
-    UINT w = 0, h = 0;
-    if (bmp) {
-        // Always try to get size — force materialization
-        w = bmp->GetWidth();
-        h = bmp->GetHeight();
-        if (w > 0 && h > 0) good = true;
-    }
-    if (good && w > 0 && h > 0) {
-        // Extra force: lock bits
-        BitmapData bd{};
-        Rect r(0, 0, (INT)w, (INT)h);
-        if (bmp->LockBits(&r, ImageLockModeRead, PixelFormat32bppARGB, &bd) == Ok) {
-            bmp->UnlockBits(&bd);
+static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytesIn) {
+    if (bytesIn.empty()) return nullptr;
+
+    // Work on a mutable copy — may repair JPEG headers (BlackBerry etc.)
+    std::vector<uint8_t> bytes = bytesIn;
+    if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8)
+        RepairJpegBytes(bytes);
+
+    auto tryLoad = [](const std::vector<uint8_t>& data) -> std::unique_ptr<Gdiplus::Bitmap> {
+        if (data.empty()) return nullptr;
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, data.size());
+        if (!hMem) return nullptr;
+        void* p = GlobalLock(hMem);
+        if (!p) { GlobalFree(hMem); return nullptr; }
+        memcpy(p, data.data(), data.size());
+        GlobalUnlock(hMem);
+        IStream* pStream = nullptr;
+        if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) != S_OK) {
+            GlobalFree(hMem);
+            return nullptr;
         }
-        // Clone to a fully independent Bitmap (owns its own pixel buffer).
-        Bitmap* cloned = bmp->Clone(Rect(0, 0, (INT)w, (INT)h), PixelFormat32bppARGB);
-        if (cloned && cloned->GetLastStatus() == Ok) {
+        std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromStream(pStream));
+        bool good = false;
+        UINT w = 0, h = 0;
+        if (bmp) {
+            w = bmp->GetWidth();
+            h = bmp->GetHeight();
+            if (w > 0 && h > 0) good = true;
+        }
+        if (good) {
+            BitmapData bd{};
+            Rect r(0, 0, (INT)w, (INT)h);
+            if (bmp->LockBits(&r, ImageLockModeRead, PixelFormat32bppARGB, &bd) == Ok)
+                bmp->UnlockBits(&bd);
+            Bitmap* cloned = bmp->Clone(Rect(0, 0, (INT)w, (INT)h), PixelFormat32bppARGB);
+            if (cloned && cloned->GetLastStatus() == Ok) {
+                pStream->Release();
+                return std::unique_ptr<Gdiplus::Bitmap>(cloned);
+            }
             pStream->Release();
-            return std::unique_ptr<Gdiplus::Bitmap>(cloned);
+            return bmp;
         }
-        // If clone failed but we have positive size, still try to return the original bmp (best effort)
         pStream->Release();
-        return bmp;
-    }
-    pStream->Release();
+        return nullptr;
+    };
+
+    if (auto bmp = tryLoad(bytes)) return bmp;
+
+    // Last resort: original bytes without repair
+    if (bytes.data() != bytesIn.data() || bytes.size() != bytesIn.size())
+        return tryLoad(bytesIn);
     return nullptr;
 }
 
