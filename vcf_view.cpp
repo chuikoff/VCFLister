@@ -898,43 +898,74 @@ static int FindVisibleRow(const ViewState* st, size_t contactIdx) {
     return -1;
 }
 
-// Full text height of multiline EDIT (no internal V-scroll — outer card scroll only)
+// Outer window height needed so all multiline text is visible (no inner V-scroll).
+// Uses real EDIT layout (EM_POSFROMCHAR) + DrawText / line-count fallbacks.
 static int MeasureEditContentHeight(HWND hEdit, int widthPx) {
     if (!hEdit || !IsWindow(hEdit) || widthPx <= 8) return 40;
     int len = GetWindowTextLengthW(hEdit);
     if (len <= 0) return 40;
 
-    // Prefer actual EDIT metrics after width is applied (matches wrap of multiline control)
-    RECT client{};
-    GetClientRect(hEdit, &client);
-    // Temporarily ensure width for EM_GETLINECOUNT-based estimate
-    int lineCount = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
-    HDC dc = GetDC(hEdit);
+    // Font line height
     int lineH = 16;
+    HDC dc = GetDC(hEdit);
+    HFONT hf = (HFONT)SendMessageW(hEdit, WM_GETFONT, 0, 0);
+    HFONT oldF = nullptr;
     if (dc) {
-        HFONT hf = (HFONT)SendMessageW(hEdit, WM_GETFONT, 0, 0);
-        HFONT old = hf ? (HFONT)SelectObject(dc, hf) : nullptr;
+        oldF = hf ? (HFONT)SelectObject(dc, hf) : nullptr;
         TEXTMETRICW tm{};
-        if (GetTextMetricsW(dc, &tm)) lineH = tm.tmHeight + tm.tmExternalLeading;
-        // DrawText fallback for wrapped long lines (EM_GETLINECOUNT undercounts before layout)
+        if (GetTextMetricsW(dc, &tm))
+            lineH = tm.tmHeight + tm.tmExternalLeading;
+    }
+
+    // Non-client (edge) overhead: MoveWindow sets outer size, text lives in client
+    RECT wr{}, cr{};
+    GetWindowRect(hEdit, &wr);
+    GetClientRect(hEdit, &cr);
+    int ncH = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+    if (ncH < 0) ncH = 0;
+    if (ncH == 0) ncH = 2 * GetSystemMetrics(SM_CYEDGE) + 2; // WS_EX_CLIENTEDGE estimate
+
+    // Force a tall layout at the target width so wrapping/line count match the real card
+    const int probeH = 16000;
+    SetWindowPos(hEdit, nullptr, 0, 0, widthPx, probeH,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+
+    int byPos = 0;
+    // Y of last character (client coords) — most accurate when char is laid out
+    LRESULT pos = SendMessageW(hEdit, EM_POSFROMCHAR, (WPARAM)(len > 0 ? len - 1 : 0), 0);
+    if (pos != (LRESULT)-1) {
+        int y = (int)(short)HIWORD((DWORD)pos);
+        // include full last line + padding
+        byPos = y + lineH + 8;
+    }
+
+    int lineCount = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
+    if (lineCount < 1) lineCount = 1;
+    int byLines = lineCount * lineH + 12;
+
+    int byDraw = 0;
+    if (dc) {
         std::wstring text((size_t)len, L'\0');
         GetWindowTextW(hEdit, &text[0], len + 1);
-        RECT rc{ 0, 0, std::max(8, widthPx - 12), 0 };
+        // EDIT client is a bit narrower than window width
+        int textW = std::max(8, widthPx - ncH - 8);
+        RECT rc{ 0, 0, textW, 0 };
         DrawTextW(dc, text.c_str(), len, &rc,
             DT_LEFT | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX | DT_EDITCONTROL | DT_EXPANDTABS);
-        int byDraw = (rc.bottom - rc.top) + 16;
-        if (old) SelectObject(dc, old);
+        byDraw = (rc.bottom - rc.top) + 12;
+        if (oldF) SelectObject(dc, oldF);
         ReleaseDC(hEdit, dc);
-        int byLines = (lineCount > 0 ? lineCount : 1) * lineH + 16;
-        int h = std::max(byDraw, byLines);
-        if (h < 40) h = 40;
-        if (h > 20000) h = 20000;
-        return h;
+        dc = nullptr;
     }
-    int h = (lineCount > 0 ? lineCount : 1) * lineH + 16;
-    if (h < 40) h = 40;
-    if (h > 20000) h = 20000;
-    return h;
+    if (dc) { if (oldF) SelectObject(dc, oldF); ReleaseDC(hEdit, dc); }
+
+    // Client content height, then convert to outer window height
+    int clientH = std::max(byPos, std::max(byLines, byDraw));
+    if (clientH < lineH + 8) clientH = lineH + 8;
+    int outerH = clientH + ncH + 4;
+    if (outerH < 40) outerH = 40;
+    if (outerH > 20000) outerH = 20000;
+    return outerH;
 }
 
 static int ReadIniInt(const wchar_t* key, int defVal) {
@@ -1727,18 +1758,30 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
 
         int sep = S(h, 8);
-        // Assign width first so multiline wrap / EM_GETLINECOUNT are correct
-        if (st->hEdit) {
-            // temporary height; real height after measure
-            MoveWindow(st->hEdit, ex, pad, ew, S(h, 200), FALSE);
+        int photoBlock = (photoH > 0) ? (sep + photoH) : 0;
+
+        // Measure full text height at target width (tall probe inside MeasureEditContentHeight)
+        int measured = MeasureEditContentHeight(st->hEdit, ew);
+        if (measured < S(h, 80)) measured = S(h, 80);
+
+        // If content + photo fit in the viewport, grow EDIT to use free space
+        // (avoids clipped text when measure is slightly low and empty gap below).
+        // If not, use full measured height and outer scrollbar.
+        int pads = pad * 2;
+        int fitH = rightAreaH - pads - photoBlock; // max edit height while keeping photo in view
+        if (fitH < S(h, 80)) fitH = S(h, 80);
+
+        int eh = measured;
+        int contentH = pad + measured + photoBlock + pad;
+        if (contentH <= rightAreaH) {
+            // Expand text box into unused screen space; keep photo visible at bottom
+            eh = std::max(measured, fitH);
+            contentH = rightAreaH;
         }
-        int eh = MeasureEditContentHeight(st->hEdit, ew);
-        if (eh < S(h, 80)) eh = S(h, 80);
 
         int editY = pad;
         int photoY = editY + eh + (photoH > 0 ? sep : 0);
 
-        int contentH = pad + eh + (photoH > 0 ? sep + photoH : 0) + pad;
         int maxScroll = std::max<int>(0, contentH - rightAreaH);
         if (st->rightScroll > maxScroll) st->rightScroll = maxScroll;
         if (st->rightScroll < 0) st->rightScroll = 0;
