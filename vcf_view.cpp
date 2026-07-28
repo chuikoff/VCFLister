@@ -545,6 +545,39 @@ static bool RawBlockHasPhoto(const std::wstring& raw) {
     return false;
 }
 
+// Technical / binary Apple & iOS fields that should not appear as card text
+static bool IsNoiseField(const std::wstring& headUp) {
+    static const wchar_t* noise[] = {
+        L"X-ADDRESSING-GRAMMAR",
+        L"X-SHARED-PHOTO-DISPLAY-PREF",
+        L"X-IMAGETYPE",
+        L"X-IMAGEHASH",
+        L"X-ABUID",
+        L"X-ABSHOWAS",
+        L"UID",
+        L"PRODID",
+        L"CLIENTPIDMAP",
+    };
+    for (auto* n : noise) {
+        if (headUp.rfind(n, 0) == 0) return true;
+    }
+    return false;
+}
+
+static bool LooksLikeBinaryBlob(const std::wstring& v) {
+    if (v.size() < 80) return false;
+    // long base64-ish payload (Apple X-ADDRESSING-GRAMMAR etc.)
+    size_t b64 = 0, total = 0;
+    for (wchar_t c : v) {
+        if (c == L'\r' || c == L'\n' || c == L' ') continue;
+        ++total;
+        if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
+            (c >= L'0' && c <= L'9') || c == L'+' || c == L'/' || c == L'=' || c == L'-' || c == L'_')
+            ++b64;
+    }
+    return total >= 80 && b64 * 10 >= total * 9;
+}
+
 // ===================== Сборка текста с локализацией и X-ABLabel значениями =====================
 static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
     auto lines0 = SplitLines(raw);
@@ -552,6 +585,13 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
 
     // Pre-collect X-ABLABELs to attach nice labels to itemN. fields instead of separate "Label:" lines
     std::map<std::wstring, std::wstring> itemLabels;
+    auto stripApple = [](std::wstring s) -> std::wstring {
+        if (s.find(L"_$!<") == 0 && s.size() > 4 && s.rfind(L">!$_") == s.size() - 4)
+            return s.substr(4, s.size() - 8);
+        if (s.find(L"$!<") == 0 && s.rfind(L">!$") == s.size() - 3)
+            return s.substr(3, s.size() - 6);
+        return s;
+    };
     for (size_t j = 0; j < lines.size(); ++j) {
         const std::wstring& LL = lines[j];
         if (LL.empty()) continue;
@@ -562,24 +602,38 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         if (hUp.find(L"X-ABLABEL") == std::wstring::npos) continue;
         size_t jj = j;
         std::wstring v = CollectValuePossiblyMultiline(lines, jj, hUp);
-        // translate like before
-        std::wstring vUp = ToUpperASCII(v);
-        auto stripApple = [](std::wstring s) -> std::wstring {
-            if (s.find(L"_$!<") == 0 && s.size() > 4 && s.rfind(L">!$_") == s.size()-4) return s.substr(4, s.size()-8);
-            if (s.find(L"$!<") == 0 && s.rfind(L">!$") == s.size()-3) return s.substr(3, s.size()-6);
-            return s;
-        };
-        std::wstring norm = stripApple(vUp);
-        std::wstring translated = norm; // fallback raw
-        if (norm == L"HomePage") translated = ru ? L"Домашняя страница" : L"Home page";
-        else if (norm == L"Anniversary") translated = ru ? L"Годовщина" : L"Anniversary";
-        else if (norm == L"Mother") translated = ru ? L"Мать" : L"Mother";
-        else if (norm == L"Father") translated = ru ? L"Отец" : L"Father";
-        // find item prefix for this label
+        // Keep original casing for custom labels (e.g. «Домашние контакты», «День ангела»)
+        std::wstring pretty = stripApple(v);
+        std::wstring key = ToUpperASCII(pretty);
+        if (key == L"HOMEPAGE") pretty = ru ? L"Домашняя страница" : L"Home page";
+        else if (key == L"ANNIVERSARY") pretty = ru ? L"Годовщина" : L"Anniversary";
+        else if (key == L"MOTHER") pretty = ru ? L"Мать" : L"Mother";
+        else if (key == L"FATHER") pretty = ru ? L"Отец" : L"Father";
+        else if (key == L"BROTHER") pretty = ru ? L"Брат" : L"Brother";
+        else if (key == L"SISTER") pretty = ru ? L"Сестра" : L"Sister";
+        else if (key == L"SPOUSE") pretty = ru ? L"Супруг(а)" : L"Spouse";
+        else if (key == L"CHILD") pretty = ru ? L"Ребёнок" : L"Child";
+        else if (key == L"FRIEND") pretty = ru ? L"Друг" : L"Friend";
+        else if (key == L"MANAGER") pretty = ru ? L"Руководитель" : L"Manager";
         size_t d = h.find(L'.');
         if (d != std::wstring::npos) {
-            std::wstring item = h.substr(0, d+1); // "item1."
-            itemLabels[item] = translated;
+            itemLabels[h.substr(0, d + 1)] = pretty;
+        }
+    }
+
+    // Prefer FN; skip structured N when it equals FN (Apple often has N:;Name;;; + FN:Name)
+    std::wstring fnVal;
+    for (size_t j = 0; j < lines.size(); ++j) {
+        const std::wstring& LL = lines[j];
+        size_t ppos = LL.find(L':');
+        if (ppos == std::wstring::npos) continue;
+        std::wstring hUp = ToUpperASCII(Trim(LL.substr(0, ppos)));
+        size_t dot = hUp.find(L'.');
+        if (dot != std::wstring::npos) hUp = hUp.substr(dot + 1);
+        if (hUp == L"FN" || hUp.rfind(L"FN;", 0) == 0) {
+            size_t jj = j;
+            fnVal = Trim(CollectValuePossiblyMultiline(lines, jj, hUp));
+            break;
         }
     }
 
@@ -601,6 +655,8 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             size_t dot = headUp.find(L'.');
             if (dot != std::wstring::npos) headUp = headUp.substr(dot + 1);
         }
+        // Skip technical / binary Apple fields
+        if (IsNoiseField(headUp)) continue;
         // Skip PHOTO fields — displayed separately in the photo panel.
         // Only skip embedded/base64 photos (to avoid dumping huge base64 into text).
         // URI photos (vCard 4 / some v3) should be shown as "Photo: https://..."
@@ -615,6 +671,8 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         if (headUp.find(L"X-ABLABEL") != std::wstring::npos) continue;
 
         std::wstring val = CollectValuePossiblyMultiline(lines, i, headUp);
+        if (LooksLikeBinaryBlob(val)) continue;
+        if (val.empty()) continue;
 
         // Clean structured fields: remove empty ;;; parts for nicer display (N, ADR etc.)
         if (headUp.find(L"N") == 0 || headUp.find(L"ADR") == 0) {
@@ -637,7 +695,9 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         }
 
         // Skip empty N/FN lines (e.g. N:;;;; or FN: ) to avoid "Name: " or "Full name: "
-        if (val.empty() && (headUp.find(L"N") == 0 || headUp == L"FN")) continue;
+        if (val.empty() && (headUp == L"N" || headUp.rfind(L"N;", 0) == 0 || headUp == L"FN")) continue;
+        if ((headUp == L"N" || headUp.rfind(L"N;", 0) == 0) && !fnVal.empty() && val == fnVal)
+            continue;
 
         // vCard 4.0: nicer GENDER / KIND display values
         if (headUp == L"GENDER" || headUp == L"X-GENDER") {
@@ -843,19 +903,36 @@ static int MeasureEditContentHeight(HWND hEdit, int widthPx) {
     if (!hEdit || !IsWindow(hEdit) || widthPx <= 8) return 40;
     int len = GetWindowTextLengthW(hEdit);
     if (len <= 0) return 40;
-    std::wstring text((size_t)len, L'\0');
-    GetWindowTextW(hEdit, &text[0], len + 1);
+
+    // Prefer actual EDIT metrics after width is applied (matches wrap of multiline control)
+    RECT client{};
+    GetClientRect(hEdit, &client);
+    // Temporarily ensure width for EM_GETLINECOUNT-based estimate
+    int lineCount = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
     HDC dc = GetDC(hEdit);
-    if (!dc) return 40;
-    HFONT hf = (HFONT)SendMessageW(hEdit, WM_GETFONT, 0, 0);
-    HFONT old = hf ? (HFONT)SelectObject(dc, hf) : nullptr;
-    RECT rc{ 0, 0, widthPx - 8, 0 };
-    DrawTextW(dc, text.c_str(), len, &rc, DT_LEFT | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX | DT_EDITCONTROL | DT_EXPANDTABS);
-    if (old) SelectObject(dc, old);
-    ReleaseDC(hEdit, dc);
-    int h = (rc.bottom - rc.top) + 12;
+    int lineH = 16;
+    if (dc) {
+        HFONT hf = (HFONT)SendMessageW(hEdit, WM_GETFONT, 0, 0);
+        HFONT old = hf ? (HFONT)SelectObject(dc, hf) : nullptr;
+        TEXTMETRICW tm{};
+        if (GetTextMetricsW(dc, &tm)) lineH = tm.tmHeight + tm.tmExternalLeading;
+        // DrawText fallback for wrapped long lines (EM_GETLINECOUNT undercounts before layout)
+        std::wstring text((size_t)len, L'\0');
+        GetWindowTextW(hEdit, &text[0], len + 1);
+        RECT rc{ 0, 0, std::max(8, widthPx - 12), 0 };
+        DrawTextW(dc, text.c_str(), len, &rc,
+            DT_LEFT | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX | DT_EDITCONTROL | DT_EXPANDTABS);
+        int byDraw = (rc.bottom - rc.top) + 16;
+        if (old) SelectObject(dc, old);
+        ReleaseDC(hEdit, dc);
+        int byLines = (lineCount > 0 ? lineCount : 1) * lineH + 16;
+        int h = std::max(byDraw, byLines);
+        if (h < 40) h = 40;
+        if (h > 20000) h = 20000;
+        return h;
+    }
+    int h = (lineCount > 0 ? lineCount : 1) * lineH + 16;
     if (h < 40) h = 40;
-    // hard cap so insane notes don't explode memory/layout
     if (h > 20000) h = 20000;
     return h;
 }
@@ -1561,11 +1638,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hPhoto = CreateWindowExW(0, kPhotoClass, L"", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
 
-        // EDIT below photo: wrap text (no HSCROLL). Height = full content; outer SBS_VERT
-        // hRightScroll moves photo+text together. ES_AUTOHSCROLL would disable wrap and leave
-        // only a horizontal bar at the bottom of the card — avoid that.
+        // EDIT above photo: wrap text, no own scrollbars (outer hRightScroll scrolls card)
         st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
-            ES_MULTILINE | ES_READONLY | ES_NOHIDESEL | ES_AUTOVSCROLL,
+            ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
             0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
         g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
@@ -1621,7 +1696,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         MoveWindow(st->hScroll, listW - sbw, listTop, sbw, listContentH, TRUE);
 
-        // --- Right column: one vertical scrollbar for photo + full text (#7) ---
+        // --- Right column: TEXT first, PHOTO below (#11); one outer vertical scroll (#7/#13) ---
         int pad = S(h, 12);
         int ex = listW + 1 + pad;
         int rightScrollBarW = sbw;
@@ -1632,48 +1707,63 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (ew < S(h, 80))
             ew = std::max<int>(0, (int)rc.right - ex - rightScrollBarW);
 
-        int photoW = std::min<int>(ew, 1000);
+        // Cap photo size so it doesn't dominate the card (unified after text)
+        int photoMaxW = std::min<int>(ew, S(h, 360));
+        int photoMaxH = S(h, 360);
+        int photoW = photoMaxW;
         int photoH = 0;
         if (st->photo) {
             UINT iw = st->photo->GetWidth();
             UINT ih = st->photo->GetHeight();
             double s = 1.0;
             if (iw > 0 && ih > 0) {
-                double sx = static_cast<double>(photoW) / static_cast<double>(iw);
-                double sy = 1000.0 / static_cast<double>(ih);
+                double sx = static_cast<double>(photoMaxW) / static_cast<double>(iw);
+                double sy = static_cast<double>(photoMaxH) / static_cast<double>(ih);
                 s = std::min<double>(1.0, std::min<double>(sx, sy));
+                photoW = std::max(1, (int)(iw * s));
+                photoH = std::max(1, (int)(ih * s));
             }
-            photoH = static_cast<int>(std::min<double>(1000.0, static_cast<double>(ih) * s));
+            if (photoH <= 0) photoH = S(h, 120);
         }
-        if (st->photo && photoH <= 0) photoH = 100;
 
-        int ey = pad;
         int sep = S(h, 8);
-        int editY = ey + (photoH > 0 ? photoH + sep : 0);
-
-        // Full wrapped text height — no inner scrollbars on EDIT
+        // Assign width first so multiline wrap / EM_GETLINECOUNT are correct
+        if (st->hEdit) {
+            // temporary height; real height after measure
+            MoveWindow(st->hEdit, ex, pad, ew, S(h, 200), FALSE);
+        }
         int eh = MeasureEditContentHeight(st->hEdit, ew);
         if (eh < S(h, 80)) eh = S(h, 80);
 
-        int contentH = (editY - pad) + eh + pad;
+        int editY = pad;
+        int photoY = editY + eh + (photoH > 0 ? sep : 0);
+
+        int contentH = pad + eh + (photoH > 0 ? sep + photoH : 0) + pad;
         int maxScroll = std::max<int>(0, contentH - rightAreaH);
         if (st->rightScroll > maxScroll) st->rightScroll = maxScroll;
         if (st->rightScroll < 0) st->rightScroll = 0;
         int rightScroll = st->rightScroll;
 
-        // Force vertical bar on the right edge (SBS_VERT; width=system thumb, height=panel)
         if (st->hRightScroll) {
-            // If a previous layout made width>height, re-apply SBS_VERT explicitly
             LONG_PTR style = GetWindowLongPtrW(st->hRightScroll, GWL_STYLE);
-            if (!(style & SBS_VERT) || (style & SBS_HORZ)) {
+            if (!(style & SBS_VERT)) {
                 SetWindowLongPtrW(st->hRightScroll, GWL_STYLE, (style & ~SBS_HORZ) | SBS_VERT | WS_CHILD);
             }
             MoveWindow(st->hRightScroll,
                 (int)rc.right - rightScrollBarW, rightAreaTop,
                 rightScrollBarW, rightAreaH, TRUE);
         }
-        MoveWindow(st->hPhoto, ex, ey - rightScroll, photoW, (photoH > 0 ? photoH : 0), TRUE);
+        // Text on top, photo under it — both moved by outer rightScroll
         MoveWindow(st->hEdit, ex, editY - rightScroll, ew, eh, TRUE);
+        if (st->hPhoto) {
+            if (photoH > 0) {
+                ShowWindow(st->hPhoto, SW_SHOW);
+                MoveWindow(st->hPhoto, ex, photoY - rightScroll, photoW, photoH, TRUE);
+            } else {
+                MoveWindow(st->hPhoto, ex, photoY - rightScroll, 0, 0, TRUE);
+                ShowWindow(st->hPhoto, SW_HIDE);
+            }
+        }
 
         SCROLLINFO rsi{};
         rsi.cbSize = sizeof(rsi);

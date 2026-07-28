@@ -1,0 +1,10 @@
+[plugininstall]
+description=VCFLister — viewer for VCF/vCard contacts (list + card + photo)
+type=wlx
+file=VCFLister.wlx
+file64=VCFLister.wlx64
+defaultdir=VCFLister
+defaultextension=vcf
+version=2.4
+author=chuikoff
+homepage=https://github.com/chuikoff/VCFLister

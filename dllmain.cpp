@@ -31,6 +31,9 @@
 #define lcp_ascii       8
 #define lcp_variable    12
 #define lcp_forceshow   16
+// TC 9.50+: dark mode flags for ListLoad / ListSendCommand(lc_newparams)
+#define lcp_darkmode         128
+#define lcp_darkmodenative   256
 #define lcs_findfirst   1
 #define lcs_matchcase   2
 #define lcs_wholewords  4
@@ -57,6 +60,14 @@ static HINSTANCE g_hInst = nullptr;
 // Из viewer-а
 extern "C" void VCFView_SetIniPath(const wchar_t* iniPath);
 extern "C" void VCFView_SetRawBlocks(HWND hView, const std::vector<std::wstring>& rawBlocks);
+extern "C" void VCFView_SetTCDarkMode(int dark, HWND hWnd);
+extern "C" void VCFView_RefreshTheme(HWND hWnd);
+
+static void ApplyShowFlagsTheme(HWND hView, int showFlags) {
+    // TC passes lcp_darkmode when cm_SwitchDarkMode / dark theme is active
+    const bool dark = (showFlags & lcp_darkmode) != 0 || (showFlags & lcp_darkmodenative) != 0;
+    VCFView_SetTCDarkMode(dark ? 1 : 0, hView);
+}
 
 // ANSI → UTF-16 (твоя версия с malloc, чтобы no unwinding)
 static std::wstring A2W(const char* s) {
@@ -158,7 +169,7 @@ static std::vector<std::wstring> SplitVCardBlocks(const std::wstring& text) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Общие Unicode-реализации
-static HWND Impl_ListLoadW(HWND ParentWin, const wchar_t* FileToLoad, int /*ShowFlags*/) {
+static HWND Impl_ListLoadW(HWND ParentWin, const wchar_t* FileToLoad, int ShowFlags) {
     if (!ParentWin || !FileToLoad) return nullptr;
     std::wstring text = ReadWholeFileAsWide(FileToLoad);
     if (text.empty()) return nullptr;
@@ -170,11 +181,14 @@ static HWND Impl_ListLoadW(HWND ParentWin, const wchar_t* FileToLoad, int /*Show
     std::vector<std::wstring> rawBlocks = SplitVCardBlocks(text);
 
     HWND hView = CreateVCFView(ParentWin, contacts);
-    if (hView) VCFView_SetRawBlocks(hView, rawBlocks);
+    if (hView) {
+        VCFView_SetRawBlocks(hView, rawBlocks);
+        ApplyShowFlagsTheme(hView, ShowFlags);
+    }
     return hView;
 }
 
-static int Impl_ListLoadNextW(HWND ParentWin, HWND PluginWin, const wchar_t* FileToLoad, int /*ShowFlags*/) {
+static int Impl_ListLoadNextW(HWND ParentWin, HWND PluginWin, const wchar_t* FileToLoad, int ShowFlags) {
     if (!ParentWin || !PluginWin || !FileToLoad) return LISTPLUGIN_ERROR;
 
     std::wstring text = ReadWholeFileAsWide(FileToLoad);
@@ -183,18 +197,16 @@ static int Impl_ListLoadNextW(HWND ParentWin, HWND PluginWin, const wchar_t* Fil
     std::vector<Contact> contacts = ParseVCard(text);
     std::vector<std::wstring> rawBlocks = SplitVCardBlocks(text);
 
-    // Ensure the view is properly updated with new contacts and raw blocks
     VCFView_SetContacts(PluginWin, contacts);
     VCFView_SetRawBlocks(PluginWin, rawBlocks);
-    
-    // Ensure the selection and display are properly reset/updated
+    ApplyShowFlagsTheme(PluginWin, ShowFlags);
+
     if (!contacts.empty()) {
-        VCFView_SetSelection(PluginWin, 0); // Set selection to first contact
+        VCFView_SetSelection(PluginWin, 0);
     } else {
-        // If no contacts, still ensure the display is refreshed
         InvalidateRect(PluginWin, NULL, TRUE);
     }
-    
+
     return LISTPLUGIN_OK;
 }
 
@@ -223,8 +235,12 @@ static int Impl_ListSearchTextW(HWND PluginWin, const wchar_t* SearchString, int
 }
 
 static int Impl_ListSendCommand(HWND PluginWin, int Command, int Parameter) {
-    (void)Parameter;
     if (!PluginWin) return 0;
+    // TC 9.50+: when user toggles cm_SwitchDarkMode, sends lc_newparams with dark flags
+    if (Command == lc_newparams) {
+        ApplyShowFlagsTheme(PluginWin, Parameter);
+        return 1;
+    }
     if (Command == lc_selectall) return 1;
     return 0;
 }
