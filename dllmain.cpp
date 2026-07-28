@@ -287,26 +287,35 @@ WLX_EXPORT void __stdcall ListCloseWindow(HWND ListWin) {
         // Игнорируем
     }
 }
-WLX_EXPORT int __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
+// TC Lister always uses ANSI ListGetDetectString for detect (x86 and x64).
+// Signature is void per WLX SDK; returning int breaks auto-install detect string (#9).
+WLX_EXPORT void __stdcall ListGetDetectString(char* DetectString, int maxlen) {
     __try {
-        if (!DetectString || maxlen <= 0) return 0;
-        const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
-        lstrcpynW(DetectString, ds, maxlen);
-        return 1;
+        if (!DetectString || maxlen <= 0) return;
+        // Standard TC detect: extension .vcf / .vcard
+        const char* ds = "EXT=\"VCF\" | EXT=\"VCARD\"";
+        lstrcpynA(DetectString, ds, maxlen);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
+    }
+}
+WLX_EXPORT void __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
+    __try {
+        if (!DetectString || maxlen <= 0) return;
+        const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
+        lstrcpynW(DetectString, ds, maxlen);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
 
 #else
 // x86: экспорт ANSI + Unicode без __try
 extern "C" {
-    int __stdcall ListGetDetectString(char* DetectString, int maxlen) {
+    void __stdcall ListGetDetectString(char* DetectString, int maxlen) {
+        if (!DetectString || maxlen <= 0) return;
         const char* ds = "EXT=\"VCF\" | EXT=\"VCARD\"";
-        if (!DetectString || maxlen <= 0) return 0;
-        strncpy_s(DetectString, maxlen, ds, _TRUNCATE);
-        return 1;
+        lstrcpynA(DetectString, ds, maxlen);
     }
     HWND __stdcall ListLoad(HWND ParentWin, char* FileToLoad, int ShowFlags) {
         std::wstring wfile = A2W(FileToLoad);
@@ -337,11 +346,13 @@ extern "C" {
     int __stdcall ListSearchTextW(HWND PluginWin, wchar_t* SearchString, int SearchParameter) {
         return Impl_ListSearchTextW(PluginWin, SearchString, SearchParameter);
     }
-    int __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
-        if (!DetectString || maxlen <= 0) return 0;
+    void __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
+        if (!DetectString || maxlen <= 0) return;
         const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
         lstrcpynW(DetectString, ds, maxlen);
-        return 1;
+    }
+    int __stdcall ListLoadNextW(HWND ParentWin, HWND PluginWin, wchar_t* FileToLoad, int ShowFlags) {
+        return Impl_ListLoadNextW(ParentWin, PluginWin, FileToLoad, ShowFlags);
     }
 }
 #endif

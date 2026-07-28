@@ -745,8 +745,9 @@ static const wchar_t* kPhotoClass = L"VCF_PHOTO_VIEW";
 static const int kSplitHit = 4; // half-width of splitter hit zone (px at 96dpi)
 
 struct ViewState {
-    std::vector<Contact> contacts;           // для левого списка/поиска
+    std::vector<Contact> contacts;           // все контакты файла
     std::vector<std::wstring> rawBlocks;     // сырые vCard-блоки
+    std::vector<size_t> visibleIdx;          // индексы после quick filter
     size_t sel = 0;
 
     int listScroll = 0;
@@ -757,20 +758,26 @@ struct ViewState {
     HWND hScroll = nullptr;
     HWND hPhoto = nullptr;                  // окно превью фото
     HWND hEdit = nullptr;
+    HWND hFilter = nullptr;                 // quick filter edit above list
+    HWND hPhotoOnly = nullptr;              // checkbox: only with photo
 
     int rightScroll = 0;
-    HWND hRightScroll = nullptr;            // scrollbar for right panel (large photo / long text)
+    HWND hRightScroll = nullptr;            // single scrollbar for photo+text card
 
     // resizable splitter (list width at 96dpi; 0 = default)
     int listPaneW96 = 0;
     bool draggingSplit = false;
     int splitX = 0;
 
-    // search highlight
+    // search highlight (TC F3)
     std::wstring searchNeedle;
     std::vector<unsigned char> matchFlags; // 1 = contact matches current search
     int matchCount = 0;
     int matchPos = 0; // 1-based index among matches for status
+
+    // quick filter (local, above list)
+    std::wstring filterText;
+    bool filterPhotoOnly = false;
 
     // tooltip for long names
     HWND hTip = nullptr;
@@ -782,6 +789,76 @@ struct ViewState {
     std::unique_ptr<Gdiplus::Bitmap> photo;  // изображение
     Fonts fonts;
 };
+
+static bool ContactHasPhoto(const ViewState* st, size_t idx) {
+    if (!st || idx >= st->contacts.size()) return false;
+    const Contact& c = st->contacts[idx];
+    if (c.photo.has_value() && !c.photo->bytes.empty()) return true;
+    if (!c.photo_url.empty()) return true;
+    if (idx < st->rawBlocks.size() && RawBlockHasPhoto(st->rawBlocks[idx])) return true;
+    return false;
+}
+
+static bool ContactMatchesNeedle(const Contact& c, const std::wstring& needleNorm, bool wholeWord);
+static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx);
+
+static void RebuildVisibleList(ViewState* st) {
+    if (!st) return;
+    st->visibleIdx.clear();
+    st->visibleIdx.reserve(st->contacts.size());
+    std::wstring f = LowerInvariant(st->filterText);
+    for (size_t i = 0; i < st->contacts.size(); ++i) {
+        if (st->filterPhotoOnly && !ContactHasPhoto(st, i)) continue;
+        if (!f.empty() && !ContactMatchesNeedle(st->contacts[i], f, false)) continue;
+        st->visibleIdx.push_back(i);
+    }
+    // keep selection if still visible; else select first visible
+    bool selVisible = false;
+    for (size_t v : st->visibleIdx) if (v == st->sel) { selVisible = true; break; }
+    if (!selVisible) {
+        st->sel = st->visibleIdx.empty() ? 0 : st->visibleIdx[0];
+        st->listScroll = 0;
+        st->rightScroll = 0;
+    }
+}
+
+static int VisibleCount(const ViewState* st) {
+    return st ? (int)st->visibleIdx.size() : 0;
+}
+
+static size_t VisibleContact(const ViewState* st, int visRow) {
+    if (!st || visRow < 0 || visRow >= (int)st->visibleIdx.size()) return (size_t)-1;
+    return st->visibleIdx[(size_t)visRow];
+}
+
+static int FindVisibleRow(const ViewState* st, size_t contactIdx) {
+    if (!st) return -1;
+    for (int i = 0; i < (int)st->visibleIdx.size(); ++i)
+        if (st->visibleIdx[(size_t)i] == contactIdx) return i;
+    return -1;
+}
+
+// Full text height of multiline EDIT (no internal V-scroll — outer card scroll only)
+static int MeasureEditContentHeight(HWND hEdit, int widthPx) {
+    if (!hEdit || !IsWindow(hEdit) || widthPx <= 8) return 40;
+    int len = GetWindowTextLengthW(hEdit);
+    if (len <= 0) return 40;
+    std::wstring text((size_t)len, L'\0');
+    GetWindowTextW(hEdit, &text[0], len + 1);
+    HDC dc = GetDC(hEdit);
+    if (!dc) return 40;
+    HFONT hf = (HFONT)SendMessageW(hEdit, WM_GETFONT, 0, 0);
+    HFONT old = hf ? (HFONT)SelectObject(dc, hf) : nullptr;
+    RECT rc{ 0, 0, widthPx - 8, 0 };
+    DrawTextW(dc, text.c_str(), len, &rc, DT_LEFT | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX | DT_EDITCONTROL | DT_EXPANDTABS);
+    if (old) SelectObject(dc, old);
+    ReleaseDC(hEdit, dc);
+    int h = (rc.bottom - rc.top) + 12;
+    if (h < 40) h = 40;
+    // hard cap so insane notes don't explode memory/layout
+    if (h > 20000) h = 20000;
+    return h;
+}
 
 static int ReadIniInt(const wchar_t* key, int defVal) {
     if (g_iniPath.empty()) return defVal;
@@ -966,9 +1043,12 @@ static void UpdateListScrollbar(ViewState* st, int total) {
 
 static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int hgt, RECT& outListRc) {
     EnsureListMetrics(h, st);
+    if (st->visibleIdx.empty() && !st->contacts.empty())
+        RebuildVisibleList(st);
 
     int sbw = DlgSBW();
     int wList = w - sbw; if (wList < S(h, 120)) wList = w;
+    int visN = VisibleCount(st);
 
     HBRUSH bg = CreateSolidBrush(g_clrListBg);
     RECT rbg{ x,y,x + wList,y + hgt }; FillRect(dc, &rbg, bg); DeleteObject(bg);
@@ -979,12 +1059,13 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
     st->perPage = std::max<int>(1, innerH / st->listItemH);
 
     if (st->listScroll < 0) st->listScroll = 0;
-    int maxScroll = std::max<int>(0, (int)st->contacts.size() - st->perPage);
+    int maxScroll = std::max<int>(0, visN - st->perPage);
     if (st->listScroll > maxScroll) st->listScroll = maxScroll;
 
     int ycur = innerTop;
-    for (int row = 0; row < st->perPage && st->listScroll + row < (int)st->contacts.size(); ++row) {
-        size_t idx = (size_t)(st->listScroll + row);
+    for (int row = 0; row < st->perPage && st->listScroll + row < visN; ++row) {
+        size_t idx = VisibleContact(st, st->listScroll + row);
+        if (idx == (size_t)-1 || idx >= st->contacts.size()) continue;
         const Contact& c = st->contacts[idx];
 
         std::wstring name = ContactDisplayName(c);
@@ -993,9 +1074,7 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
         }
 
         // Индикатор фото
-        bool hasPhoto = false;
-        if (c.photo.has_value() || !c.photo_url.empty()) hasPhoto = true;
-        else if (idx < st->rawBlocks.size()) hasPhoto = RawBlockHasPhoto(st->rawBlocks[idx]);
+        bool hasPhoto = ContactHasPhoto(st, idx);
         if (hasPhoto) name += L" 📷";
 
         std::wstring sub;
@@ -1059,7 +1138,7 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
     }
 
     outListRc = RECT{ x,y,x + wList,y + hgt };
-    UpdateListScrollbar(st, (int)st->contacts.size());
+    UpdateListScrollbar(st, visN);
 }
 
 // ===================== EDIT и ФОТО: наполнение и поведение =====================
@@ -1145,21 +1224,123 @@ static void UpdateRightPanel(ViewState* st) {
         else {
             text = L"";
         }
+        // Preserve focus: EM_SETSEL/EM_SCROLLCARET can steal it from filter or list
+        HWND keepFocus = GetFocus();
         SendMessageW(st->hEdit, WM_SETTEXT, 0, (LPARAM)text.c_str());
         SendMessageW(st->hEdit, EM_SETSEL, 0, 0);
         SendMessageW(st->hEdit, EM_SCROLLCARET, 0, 0);
+        if (keepFocus && IsWindow(keepFocus) && GetFocus() != keepFocus)
+            SetFocus(keepFocus);
     }
 }
 
-// Сабкласс EDIT — пробрасываем Esc в окно Lister, чтобы закрывалось
+// Forward ESC to Total Commander Lister parent so F3 viewer closes reliably
+static void ForwardEscToLister(HWND hwnd) {
+    HWND h = hwnd;
+    while (h) {
+        wchar_t cls[64]{};
+        GetClassNameW(h, cls, 64);
+        if (_wcsicmp(cls, L"VCF_VIEW_CLASS") == 0) {
+            HWND lister = GetParent(h);
+            if (lister) {
+                // TC Lister closes on ESC; also try WM_CLOSE as fallback
+                PostMessageW(lister, WM_KEYDOWN, VK_ESCAPE, 0);
+                PostMessageW(lister, WM_CLOSE, 0, 0);
+            }
+            return;
+        }
+        h = GetParent(h);
+    }
+}
+
+// Navigate visible contact list (shared by main window + filter box)
+static bool NavigateVisibleList(HWND h, ViewState* st, WPARAM key) {
+    if (!st || st->contacts.empty()) return false;
+    if (st->visibleIdx.empty()) RebuildVisibleList(st);
+    int visN = VisibleCount(st);
+    if (visN <= 0) return false;
+    int visRow = FindVisibleRow(st, st->sel);
+    if (visRow < 0) visRow = 0;
+    int newRow = visRow;
+    int page = std::max(1, st->perPage);
+    bool handled = false;
+    switch (key) {
+    case VK_UP:    if (newRow > 0) { newRow--; handled = true; } break;
+    case VK_DOWN:  if (newRow + 1 < visN) { newRow++; handled = true; } break;
+    case VK_PRIOR: newRow = std::max(0, newRow - page); handled = true; break;
+    case VK_NEXT:  newRow = std::min(visN - 1, newRow + page); handled = true; break;
+    case VK_HOME:
+        if (key == VK_HOME && (GetKeyState(VK_CONTROL) & 0x8000)) { /* allow Ctrl+Home in edit? */ }
+        newRow = 0; handled = true; break;
+    case VK_END:   newRow = visN - 1; handled = true; break;
+    default: return false;
+    }
+    if (!handled) return false;
+    size_t idx = VisibleContact(st, newRow);
+    if (idx == (size_t)-1) return false;
+    SetSelectionAndReveal(h, st, idx);
+    return true;
+}
+
+// Shared subclass for filter / checkbox
+static LRESULT CALLBACK EscChildSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR idSubClass, DWORD_PTR data) {
+    HWND viewer = (HWND)data;
+    auto* st = viewer ? (ViewState*)GetWindowLongPtrW(viewer, GWLP_USERDATA) : nullptr;
+
+    // TC Lister uses dialog-like keyboard routing; without WANTARROWS Up/Down never reach us
+    if (msg == WM_GETDLGCODE) {
+        LRESULT base = DefSubclassProc(hwnd, msg, wParam, lParam);
+        if (idSubClass == 1 || idSubClass == 2)
+            return base | DLGC_WANTARROWS | DLGC_WANTALLKEYS | DLGC_WANTTAB;
+        return base;
+    }
+
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wParam == VK_ESCAPE) {
+        ForwardEscToLister(hwnd);
+        return 0;
+    }
+
+    // Filter edit (id=1): arrows/page navigate list and hand focus to viewer so further keys work
+    if (idSubClass == 1 && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && st) {
+        if (wParam == VK_DOWN || wParam == VK_UP || wParam == VK_PRIOR || wParam == VK_NEXT
+            || wParam == VK_RETURN) {
+            if (wParam == VK_RETURN) {
+                if (viewer) SetFocus(viewer);
+                return 0;
+            }
+            NavigateVisibleList(viewer, st, wParam);
+            // Always move focus to list: otherwise keys stay trapped in the filter
+            if (viewer) SetFocus(viewer);
+            return 0;
+        }
+        if (wParam == VK_TAB) {
+            if (viewer) SetFocus(viewer);
+            return 0;
+        }
+    }
+
+    // Checkbox (id=2): arrows navigate and focus list
+    if (idSubClass == 2 && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && st) {
+        if (wParam == VK_DOWN || wParam == VK_UP || wParam == VK_PRIOR || wParam == VK_NEXT
+            || wParam == VK_HOME || wParam == VK_END) {
+            NavigateVisibleList(viewer, st, wParam);
+            if (viewer) SetFocus(viewer);
+            return 0;
+        }
+    }
+
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
+
+// Сабкласс EDIT — Esc → Lister, Ctrl+C, focus redirect
 static WNDPROC g_EditOldProc = nullptr;
 static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            HWND viewer = GetParent(hEdit);
-            HWND lister = viewer ? GetParent(viewer) : nullptr;
-            if (lister) { PostMessageW(lister, WM_KEYDOWN, VK_ESCAPE, 0); return 0; }
+            ForwardEscToLister(hEdit);
+            return 0;
         }
         // Ctrl+C without selection → copy current line value (after ':')
         if ((wParam == 'C' || wParam == 'c') && (GetKeyState(VK_CONTROL) & 0x8000)) {
@@ -1175,11 +1356,20 @@ static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LP
     case WM_SYSKEYDOWN:
     case WM_CHAR:
         if (wParam == VK_ESCAPE) {
-            HWND viewer = GetParent(hEdit);
-            HWND lister = viewer ? GetParent(viewer) : nullptr;
-            if (lister) { PostMessageW(lister, WM_KEYDOWN, VK_ESCAPE, 0); return 0; }
+            ForwardEscToLister(hEdit);
+            return 0;
         }
         break;
+    case WM_MOUSEWHEEL: {
+        // Forward wheel to parent so single card scrollbar moves (no inner V-scroll)
+        HWND viewer = GetParent(hEdit);
+        if (viewer) {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            // lParam is screen coords for WM_MOUSEWHEEL
+            return SendMessageW(viewer, WM_MOUSEWHEEL, wParam, lParam);
+        }
+        break;
+    }
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
     case WM_RBUTTONDOWN:
@@ -1256,19 +1446,25 @@ static LRESULT CALLBACK PhotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
 // ===================== Выбор/скролл =====================
 static void EnsureSelVisible(HWND h, ViewState* st) {
+    if (st->visibleIdx.empty() && !st->contacts.empty()) RebuildVisibleList(st);
     RECT rc; GetClientRect(h, &rc);
     int statusH = S(h, 18);
-    int innerH = (rc.bottom - statusH) - S(h, 16);
-    int rowH = st->listItemH ? st->listItemH : S(h, 52);
+    int filterH = S(h, 26);
+    int innerH = (rc.bottom - statusH - filterH) - S(h, 16);
+    int rowH = st->listItemH ? st->listItemH : S(h, 60);
     int per = std::max<int>(1, innerH / rowH);
     st->perPage = per;
 
-    int sel = (int)st->sel;
-    if (sel < st->listScroll) st->listScroll = sel;
-    else if (sel >= st->listScroll + per) st->listScroll = sel - (per - 1);
+    int visRow = FindVisibleRow(st, st->sel);
+    if (visRow < 0) {
+        st->listScroll = 0;
+    } else {
+        if (visRow < st->listScroll) st->listScroll = visRow;
+        else if (visRow >= st->listScroll + per) st->listScroll = visRow - (per - 1);
+    }
 
     if (st->listScroll < 0) st->listScroll = 0;
-    int maxScroll = std::max<int>(0, (int)st->contacts.size() - per);
+    int maxScroll = std::max<int>(0, VisibleCount(st) - per);
     if (st->listScroll > maxScroll) st->listScroll = maxScroll;
 }
 static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
@@ -1290,7 +1486,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
 
     switch (m) {
-    case WM_GETDLGCODE: return DLGC_WANTARROWS | DLGC_WANTCHARS;
+    case WM_GETDLGCODE: return DLGC_WANTARROWS | DLGC_WANTCHARS | DLGC_WANTALLKEYS;
+
+    // Click on owner-drawn list must activate viewer (filter otherwise keeps keyboard)
+    case WM_MOUSEACTIVATE:
+        if (st) {
+            SetFocus(h);
+            return MA_ACTIVATE;
+        }
+        break;
 
     case WM_CREATE: {
         st = new ViewState(); SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)st);
@@ -1328,11 +1532,28 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(st->hTip, TTM_SETDELAYTIME, TTDT_INITIAL, 400);
         }
 
+        // Quick filter above list + "with photo" checkbox
+        st->hFilter = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT,
+            0, 0, 0, 0, h, (HMENU)1010, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(st->hFilter, WM_SETFONT, (WPARAM)st->fonts.hSmall, TRUE);
+        // Cue banner (Vista+)
+        SendMessageW(st->hFilter, 0x1501 /*EM_SETCUEBANNER*/, TRUE,
+            (LPARAM)(g_tcRu ? L"Фильтр..." : L"Filter..."));
+        SetWindowSubclass(st->hFilter, EscChildSubclass, 1, (DWORD_PTR)h);
+
+        st->hPhotoOnly = CreateWindowExW(0, L"BUTTON",
+            g_tcRu ? L"📷 фото" : L"📷 photo",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_TEXT,
+            0, 0, 0, 0, h, (HMENU)1011, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(st->hPhotoOnly, WM_SETFONT, (WPARAM)st->fonts.hSmall, TRUE);
+        SetWindowSubclass(st->hPhotoOnly, EscChildSubclass, 2, (DWORD_PTR)h);
+
         // Скролл слева
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
             0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
 
-        // Правый скроллбар для карточки (большое фото или много текста)
+        // Единственный скроллбар карточки (фото + полный текст)
         st->hRightScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
             0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
 
@@ -1340,10 +1561,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hPhoto = CreateWindowExW(0, kPhotoClass, L"", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
 
-        // EDIT ниже фото
-        // Добавлен WS_VSCROLL для явного скроллбара в карточке при большом объёме данных
+        // EDIT below photo: wrap text (no HSCROLL). Height = full content; outer SBS_VERT
+        // hRightScroll moves photo+text together. ES_AUTOHSCROLL would disable wrap and leave
+        // only a horizontal bar at the bottom of the card — avoid that.
         st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY | ES_NOHIDESEL | WS_VSCROLL | WS_HSCROLL,
+            ES_MULTILINE | ES_READONLY | ES_NOHIDESEL | ES_AUTOVSCROLL,
             0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
         g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
@@ -1357,6 +1579,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (st->hPhoto && IsWindow(st->hPhoto)) DestroyWindow(st->hPhoto);
             if (st->hScroll && IsWindow(st->hScroll)) DestroyWindow(st->hScroll);
             if (st->hRightScroll && IsWindow(st->hRightScroll)) DestroyWindow(st->hRightScroll);
+            if (st->hFilter && IsWindow(st->hFilter)) {
+                RemoveWindowSubclass(st->hFilter, EscChildSubclass, 1);
+                DestroyWindow(st->hFilter);
+            }
+            if (st->hPhotoOnly && IsWindow(st->hPhotoOnly)) {
+                RemoveWindowSubclass(st->hPhotoOnly, EscChildSubclass, 2);
+                DestroyWindow(st->hPhotoOnly);
+            }
             if (st->hTip && IsWindow(st->hTip)) DestroyWindow(st->hTip);
             st->photo.reset();
             FreeFonts(st->fonts); delete st;
@@ -1372,25 +1602,36 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int listW = ListPaneWidth(h);
         int sbw = GetSystemMetrics(SM_CXVSCROLL);
         int statusH = S(h, 18);
-        int listContentH = std::max<int>(0, (int)rc.bottom - statusH);
+        int filterH = S(h, 26);
+        int filterPad = S(h, 4);
+        int photoChkW = S(h, 72);
 
-        MoveWindow(st->hScroll, listW - sbw, 0, sbw, listContentH, TRUE);
+        // --- Left: filter row + list + status ---
+        int filterTop = filterPad;
+        int listTop = filterTop + filterH + filterPad;
+        int listContentH = std::max<int>(0, (int)rc.bottom - statusH - listTop);
 
-        // Правая колонка (статусбар только слева — справа используем всю высоту)
+        if (st->hFilter) {
+            MoveWindow(st->hFilter, filterPad, filterTop,
+                std::max(40, listW - photoChkW - filterPad * 3), filterH, TRUE);
+        }
+        if (st->hPhotoOnly) {
+            MoveWindow(st->hPhotoOnly, listW - photoChkW - filterPad, filterTop,
+                photoChkW, filterH, TRUE);
+        }
+        MoveWindow(st->hScroll, listW - sbw, listTop, sbw, listContentH, TRUE);
+
+        // --- Right column: one vertical scrollbar for photo + full text (#7) ---
         int pad = S(h, 12);
         int ex = listW + 1 + pad;
         int rightScrollBarW = sbw;
-        int rightAreaTop = pad;
-        int rightAreaH = std::max<int>(50, (int)rc.bottom - pad - pad);
+        int rightAreaTop = 0;
+        int rightAreaH = std::max<int>(50, (int)rc.bottom);
 
-        // Ширина контента: резервируем место под правый скроллбар (прижат к правому краю окна)
         int ew = (int)rc.right - ex - pad - rightScrollBarW;
-        if (ew < S(h, 80)) {
-            // Узкое окно — скроллбар может перекрыть pad
+        if (ew < S(h, 80))
             ew = std::max<int>(0, (int)rc.right - ex - rightScrollBarW);
-        }
 
-        // Фото: ширина = min(ew, 1000), высота по содержимому (≤1000)
         int photoW = std::min<int>(ew, 1000);
         int photoH = 0;
         if (st->photo) {
@@ -1404,33 +1645,36 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             photoH = static_cast<int>(std::min<double>(1000.0, static_cast<double>(ih) * s));
         }
-        if (st->photo && photoH <= 0) photoH = 100; // min height to show the photo window
+        if (st->photo && photoH <= 0) photoH = 100;
 
         int ey = pad;
         int sep = S(h, 8);
         int editY = ey + (photoH > 0 ? photoH + sep : 0);
 
-        // Высота EDIT: заполняет остаток viewport; при большом фото — минимум, чтобы можно было доскроллить к тексту
-        int minEditH = S(h, 100);
-        int remaining = rightAreaH - (editY - pad);
-        int eh = remaining;
-        if (eh < minEditH && photoH > 0) eh = minEditH;
-        if (eh < 0) eh = 0;
+        // Full wrapped text height — no inner scrollbars on EDIT
+        int eh = MeasureEditContentHeight(st->hEdit, ew);
+        if (eh < S(h, 80)) eh = S(h, 80);
 
-        // Полная высота контента карточки (для диапазона скролла)
-        int contentH = (editY - pad) + eh + pad; // от верха области до низа EDIT + pad
+        int contentH = (editY - pad) + eh + pad;
         int maxScroll = std::max<int>(0, contentH - rightAreaH);
         if (st->rightScroll > maxScroll) st->rightScroll = maxScroll;
         if (st->rightScroll < 0) st->rightScroll = 0;
         int rightScroll = st->rightScroll;
 
-        MoveWindow(st->hRightScroll, (int)rc.right - rightScrollBarW, rightAreaTop, rightScrollBarW, rightAreaH, TRUE);
-
-        // Позиционируем фото и EDIT с учётом скролла
+        // Force vertical bar on the right edge (SBS_VERT; width=system thumb, height=panel)
+        if (st->hRightScroll) {
+            // If a previous layout made width>height, re-apply SBS_VERT explicitly
+            LONG_PTR style = GetWindowLongPtrW(st->hRightScroll, GWL_STYLE);
+            if (!(style & SBS_VERT) || (style & SBS_HORZ)) {
+                SetWindowLongPtrW(st->hRightScroll, GWL_STYLE, (style & ~SBS_HORZ) | SBS_VERT | WS_CHILD);
+            }
+            MoveWindow(st->hRightScroll,
+                (int)rc.right - rightScrollBarW, rightAreaTop,
+                rightScrollBarW, rightAreaH, TRUE);
+        }
         MoveWindow(st->hPhoto, ex, ey - rightScroll, photoW, (photoH > 0 ? photoH : 0), TRUE);
         MoveWindow(st->hEdit, ex, editY - rightScroll, ew, eh, TRUE);
 
-        // SCROLLINFO: nMax = contentH, nPage = viewport → max pos ≈ contentH - nPage
         SCROLLINFO rsi{};
         rsi.cbSize = sizeof(rsi);
         rsi.fMask = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL;
@@ -1438,17 +1682,45 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         rsi.nMax = std::max<int>(0, contentH - 1);
         rsi.nPage = (UINT)std::max<int>(1, rightAreaH);
         rsi.nPos = rightScroll;
-        SetScrollInfo(st->hRightScroll, SB_CTL, &rsi, TRUE);
-        ShowWindow(st->hRightScroll, (maxScroll > 0) ? SW_SHOW : SW_HIDE);
+        if (st->hRightScroll) {
+            SetScrollInfo(st->hRightScroll, SB_CTL, &rsi, TRUE);
+            ShowWindow(st->hRightScroll, (maxScroll > 0) ? SW_SHOW : SW_HIDE);
+        }
 
         InvalidateRect(h, nullptr, FALSE);
         if (st->hPhoto) InvalidateRect(st->hPhoto, nullptr, FALSE);
         return 0;
     }
+    case WM_COMMAND: {
+        if (!st) break;
+        if (LOWORD(w) == 1010 && HIWORD(w) == EN_CHANGE && (HWND)l == st->hFilter) {
+            int len = GetWindowTextLengthW(st->hFilter);
+            st->filterText.assign((size_t)std::max(0, len), L'\0');
+            if (len > 0) GetWindowTextW(st->hFilter, &st->filterText[0], len + 1);
+            RebuildVisibleList(st);
+            UpdateRightPanel(st);
+            InvalidateRect(h, nullptr, FALSE);
+            RECT rc; GetClientRect(h, &rc);
+            SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+            return 0;
+        }
+        if (LOWORD(w) == 1011 && HIWORD(w) == BN_CLICKED && (HWND)l == st->hPhotoOnly) {
+            st->filterPhotoOnly = (SendMessageW(st->hPhotoOnly, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            RebuildVisibleList(st);
+            UpdateRightPanel(st);
+            InvalidateRect(h, nullptr, FALSE);
+            RECT rc; GetClientRect(h, &rc);
+            SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+            // Вернуть фокус на viewer, чтобы ESC и стрелки снова работали
+            SetFocus(h);
+            return 0;
+        }
+        break;
+    }
     case WM_VSCROLL: {
         if (!st) break;
         if ((HWND)l == st->hScroll) {
-            int total = (int)st->contacts.size(); if (total <= 0) return 0;
+            int total = VisibleCount(st); if (total <= 0) return 0;
             int maxScroll = std::max<int>(0, total - st->perPage);
             int pos = st->listScroll;
             switch (LOWORD(w)) {
@@ -1508,7 +1780,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (PtInRect(&st->listRc, pt)) {
             int delta = GET_WHEEL_DELTA_WPARAM(w);
             int step = (delta > 0) ? -1 : +1;
-            int maxScroll = std::max<int>(0, (int)st->contacts.size() - st->perPage);
+            int maxScroll = std::max<int>(0, VisibleCount(st) - st->perPage);
             st->listScroll = std::max<int>(0, std::min<int>(maxScroll, st->listScroll + step));
             SCROLLINFO si{}; si.cbSize = sizeof(si); si.fMask = SIF_POS; si.nPos = st->listScroll;
             SetScrollInfo(st->hScroll, SB_CTL, &si, TRUE);
@@ -1534,6 +1806,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_KEYDOWN: {
+        // ESC — закрыть Lister (когда фокус на главном окне плагина)
+        if (w == VK_ESCAPE) {
+            ForwardEscToLister(h);
+            return 0;
+        }
         // Ctrl+C: copy selection / line value / contact name
         if (st && (GetKeyState(VK_CONTROL) & 0x8000) && (w == 'C' || w == 'c')) {
             HWND focus = GetFocus();
@@ -1550,16 +1827,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
         }
         if (!st || st->contacts.empty()) return 0;
-        size_t sel = st->sel, count = st->contacts.size(); bool handled = false;
-        switch (w) {
-        case VK_UP:    if (sel > 0) sel--, handled = true; break;
-        case VK_DOWN:  if (sel + 1 < count) sel++, handled = true; break;
-        case VK_PRIOR: if (st->perPage > 0) sel = (sel > (size_t)st->perPage) ? (sel - (size_t)st->perPage) : 0, handled = true; break;
-        case VK_NEXT:  if (st->perPage > 0) sel = std::min<size_t>(count - 1, sel + (size_t)st->perPage), handled = true; break;
-        case VK_HOME:  sel = 0; handled = true; break;
-        case VK_END:   sel = count ? count - 1 : 0; handled = true; break;
-        }
-        if (handled) { SetSelectionAndReveal(h, st, sel); return 0; }
+        // Навигация только по видимому (отфильтрованному) списку
+        if (NavigateVisibleList(h, st, w)) return 0;
         break;
     }
     case WM_SETCURSOR: {
@@ -1582,18 +1851,38 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             st->draggingSplit = true;
             SetCapture(h);
             SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+            SetFocus(h);
             return 0;
         }
-        // Клики по статусбару не выбирают контакты
-        if (y >= rcClient.bottom - statusH) return 0;
-        int pad = S(h, 8), listW = ListPaneWidth(h) - GetSystemMetrics(SM_CXVSCROLL);
-        if (x >= pad && x < listW - pad) {
+        // Клики по статусбару / фильтру не выбирают контакты
+        int filterH = S(h, 26);
+        int filterPad = S(h, 4);
+        int listTop = filterPad + filterH + filterPad;
+        if (y >= rcClient.bottom - statusH || y < listTop) return 0;
+
+        // Always take keyboard from filter/checkbox when user clicks the list area
+        SetFocus(h);
+
+        int pad = S(h, 8);
+        int listPane = ListPaneWidth(h);
+        int listW = listPane - GetSystemMetrics(SM_CXVSCROLL);
+        if (x >= 0 && x < listPane) {
+            // Hit-test rows against painted list (pad matches RenderList)
             int rowH = st->listItemH ? st->listItemH : S(h, 60);
-            int row = (y - pad) / rowH;
-            if (row >= 0 && row < st->perPage) {
-                size_t idx = (size_t)(st->listScroll + row);
-                if (idx < st->contacts.size()) { st->sel = idx; st->rightScroll = 0; UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); return 0; }
+            if (rowH <= 0) rowH = S(h, 60);
+            int row = (y - listTop - pad) / rowH;
+            if (row < 0) row = 0;
+            if (row >= 0 && (x < listW || x < listPane)) {
+                size_t idx = VisibleContact(st, st->listScroll + row);
+                if (idx != (size_t)-1 && idx < st->contacts.size()) {
+                    st->sel = idx; st->rightScroll = 0;
+                    UpdateRightPanel(st);
+                    SetFocus(h); // again: UpdateRightPanel must not leave focus on hEdit
+                    InvalidateRect(h, nullptr, FALSE);
+                    return 0;
+                }
             }
+            SetFocus(h);
         }
         return 0;
     }
@@ -1768,8 +2057,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         int listW = ListPaneWidth(h);
         int statusH = S(h, 18);
-        int listH = rc.bottom - statusH;
-        RenderList(mem, h, st, rc.left, rc.top, listW, listH, st->listRc);
+        int filterH = S(h, 26);
+        int filterPad = S(h, 4);
+        int listTop = filterPad + filterH + filterPad;
+        int listH = std::max(0, (int)rc.bottom - statusH - listTop);
+        // list background under filter area (filter is a child control)
+        {
+            HBRUSH fbg = CreateSolidBrush(g_clrListBg);
+            RECT fr{ rc.left, rc.top, listW, listTop };
+            FillRect(mem, &fr, fbg); DeleteObject(fbg);
+        }
+        RenderList(mem, h, st, rc.left, listTop, listW, listH, st->listRc);
 
         // Splitter (slightly wider visual so it's obvious and draggable)
         int splitW = std::max(2, S(h, 3));
@@ -1777,7 +2075,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         RECT sep{ listW - splitW / 2, rc.top, listW + splitW / 2 + 1, rc.bottom };
         FillRect(mem, &sep, sepBr); DeleteObject(sepBr);
 
-        // Status bar under the list (total contacts + search matches)
+        // Status bar under the list
         if (statusH > 0) {
             RECT srect{ rc.left, rc.bottom - statusH, listW, rc.bottom };
             HBRUSH sbr = CreateSolidBrush(g_clrListBg);
@@ -1786,14 +2084,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             HFONT oldf = (HFONT)SelectObject(mem, st->fonts.hSmall);
             SetBkMode(mem, TRANSPARENT);
             SetTextColor(mem, g_clrSub);
+            int visN = VisibleCount(st);
+            int totalN = (int)st->contacts.size();
             std::wstring stxt = g_tcRu ? L"Контактов: " : L"Contacts: ";
-            stxt += std::to_wstring((int)st->contacts.size());
+            if (visN != totalN) {
+                stxt += std::to_wstring(visN);
+                stxt += L"/";
+                stxt += std::to_wstring(totalN);
+            } else {
+                stxt += std::to_wstring(totalN);
+            }
             if (!st->contacts.empty()) {
                 stxt += L"  (";
                 stxt += std::to_wstring(st->sel + 1);
                 stxt += L"/";
-                stxt += std::to_wstring((int)st->contacts.size());
+                stxt += std::to_wstring(totalN);
                 stxt += L")";
+            }
+            if (st->filterPhotoOnly) {
+                stxt += g_tcRu ? L"  📷" : L"  📷";
             }
             if (!st->searchNeedle.empty()) {
                 stxt += g_tcRu ? L"  |  Найдено: " : L"  |  Found: ";
@@ -1843,6 +2152,7 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     st->matchCount = 0;
     st->matchPos = 0;
     LoadViewSettings(st);
+    RebuildVisibleList(st);
     UpdateRightPanel(st);
     InvalidateRect(h, nullptr, FALSE);
     RECT rc; GetClientRect(h, &rc);
@@ -1853,6 +2163,8 @@ extern "C" void VCFView_SetRawBlocks(HWND h, const std::vector<std::wstring>& ra
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
     st->rawBlocks = rawBlocks;
     st->rightScroll = 0;
+    // raw blocks affect photo detection for filter
+    RebuildVisibleList(st);
     UpdateRightPanel(st);
     InvalidateRect(h, nullptr, FALSE);
     RECT rc; GetClientRect(h, &rc);
