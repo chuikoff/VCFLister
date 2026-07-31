@@ -12,6 +12,7 @@
 #include <windowsx.h>
 #include <gdiplus.h>
 #include <commctrl.h>
+#include <richedit.h>
 #include <wininet.h>
 #pragma comment(lib, "Gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -1463,6 +1464,96 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
     UpdateListScrollbar(st, visN);
 }
 
+// ===================== Card text (RichEdit) — bold values (#18) =====================
+static void EnsureRichEditLoaded() {
+    static bool once = false;
+    if (!once) {
+        // RICHEDIT50W
+        if (!LoadLibraryW(L"Msftedit.dll"))
+            LoadLibraryW(L"Riched20.dll");
+        once = true;
+    }
+}
+
+// Set plain card text and bold the values (after ':') + note headers (── … ──)
+static void SetCardEditText(HWND hEdit, const std::wstring& text, HFONT hFont) {
+    if (!hEdit || !IsWindow(hEdit)) return;
+
+    LOGFONTW lf{};
+    if (hFont) GetObjectW(hFont, sizeof(lf), &lf);
+    int yHeight = 180; // ~9pt in twips
+    if (lf.lfHeight != 0) {
+        HDC dc = GetDC(hEdit);
+        int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
+        if (dc) ReleaseDC(hEdit, dc);
+        int px = (lf.lfHeight < 0) ? -lf.lfHeight : lf.lfHeight;
+        if (px > 0 && dpi > 0)
+            yHeight = MulDiv(px, 72 * 20, dpi);
+        if (yHeight < 140) yHeight = 140;
+        if (yHeight > 360) yHeight = 360;
+    }
+    const wchar_t* face = (lf.lfFaceName[0]) ? lf.lfFaceName : L"Segoe UI";
+
+    SendMessageW(hEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)g_clrBk);
+
+    // Plain text (Unicode)
+    SETTEXTEX stx{};
+    stx.flags = ST_DEFAULT;
+    stx.codepage = 1200; // UTF-16
+    SendMessageW(hEdit, EM_SETTEXTEX, (WPARAM)&stx, (LPARAM)text.c_str());
+
+    CHARFORMAT2W cfNorm{};
+    cfNorm.cbSize = sizeof(cfNorm);
+    cfNorm.dwMask = CFM_BOLD | CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_CHARSET;
+    cfNorm.dwEffects = 0;
+    cfNorm.crTextColor = g_clrTxt;
+    cfNorm.yHeight = yHeight;
+    cfNorm.bCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(cfNorm.szFaceName, face, _TRUNCATE);
+    SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cfNorm);
+
+    CHARFORMAT2W cfBold = cfNorm;
+    cfBold.dwEffects = CFE_BOLD;
+
+    // Bold values after first ':' on each line; bold whole "── header ──" lines
+    const size_t n = text.size();
+    size_t i = 0;
+    while (i < n) {
+        size_t lineStart = i;
+        size_t lineEnd = i;
+        while (lineEnd < n && text[lineEnd] != L'\r' && text[lineEnd] != L'\n')
+            ++lineEnd;
+
+        if (lineEnd > lineStart) {
+            // Note separator line (box-drawing ─ U+2500)
+            if (text[lineStart] == L'\x2500' ||
+                (lineEnd > lineStart + 1 && text[lineStart] == L'-' && text[lineStart + 1] == L'-')) {
+                SendMessageW(hEdit, EM_SETSEL, (WPARAM)lineStart, (LPARAM)lineEnd);
+                SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfBold);
+            } else {
+                size_t colon = text.find(L':', lineStart);
+                if (colon != std::wstring::npos && colon < lineEnd) {
+                    size_t valStart = colon + 1;
+                    while (valStart < lineEnd && text[valStart] == L' ')
+                        ++valStart;
+                    if (valStart < lineEnd) {
+                        // Issue #18: bold values (Full name: **Leonard**)
+                        SendMessageW(hEdit, EM_SETSEL, (WPARAM)valStart, (LPARAM)lineEnd);
+                        SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfBold);
+                    }
+                }
+            }
+        }
+
+        i = lineEnd;
+        if (i < n && text[i] == L'\r') ++i;
+        if (i < n && text[i] == L'\n') ++i;
+    }
+
+    SendMessageW(hEdit, EM_SETSEL, 0, 0);
+    SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
+}
+
 // ===================== EDIT и ФОТО: наполнение и поведение =====================
 static void UpdateRightPanel(ViewState* st) {
     if (!st) return;
@@ -1546,11 +1637,9 @@ static void UpdateRightPanel(ViewState* st) {
         else {
             text = L"";
         }
-        // Preserve focus: EM_SETSEL/EM_SCROLLCARET can steal it from filter or list
+        // Preserve focus: EM_SETSEL can steal it from filter or list
         HWND keepFocus = GetFocus();
-        SendMessageW(st->hEdit, WM_SETTEXT, 0, (LPARAM)text.c_str());
-        SendMessageW(st->hEdit, EM_SETSEL, 0, 0);
-        SendMessageW(st->hEdit, EM_SCROLLCARET, 0, 0);
+        SetCardEditText(st->hEdit, text, st->fonts.hNorm);
         if (keepFocus && IsWindow(keepFocus) && GetFocus() != keepFocus)
             SetFocus(keepFocus);
     }
@@ -1655,7 +1744,7 @@ static LRESULT CALLBACK EscChildSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-// Сабкласс EDIT — Esc → Lister, Ctrl+C, focus redirect
+// Сабкласс EDIT — Esc → Lister, Ctrl+C, focus redirect, custom RMB menu
 static WNDPROC g_EditOldProc = nullptr;
 static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -1686,24 +1775,50 @@ static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LP
         // Forward wheel to parent so single card scrollbar moves (no inner V-scroll)
         HWND viewer = GetParent(hEdit);
         if (viewer) {
-            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            // lParam is screen coords for WM_MOUSEWHEEL
             return SendMessageW(viewer, WM_MOUSEWHEEL, wParam, lParam);
         }
         break;
     }
+    // Custom copy menu lives on the viewer — do not let EDIT show its own (or swallow) context menu
+    case WM_CONTEXTMENU: {
+        HWND viewer = GetParent(hEdit);
+        if (viewer && IsWindow(viewer))
+            return SendMessageW(viewer, WM_CONTEXTMENU, (WPARAM)hEdit, lParam);
+        return 0;
+    }
+    case WM_RBUTTONDOWN: {
+        // Place caret under cursor so "copy line value" uses the clicked line
+        CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+        LRESULT ch = SendMessageW(hEdit, EM_CHARFROMPOS, 0, MAKELPARAM(x, y));
+        if (ch != -1) {
+            int idx = (int)(short)LOWORD(ch);
+            SendMessageW(hEdit, EM_SETSEL, (WPARAM)idx, (LPARAM)idx);
+        }
+        // Keep focus on edit until menu finishes (parent will SetFocus if needed)
+        SetFocus(hEdit);
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        // Generate WM_CONTEXTMENU ourselves (screen coords) → parent custom menu
+        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ClientToScreen(hEdit, &pt);
+        HWND viewer = GetParent(hEdit);
+        if (viewer)
+            SendMessageW(viewer, WM_CONTEXTMENU, (WPARAM)hEdit, MAKELPARAM(pt.x, pt.y));
+        return 0; // don't run default EDIT menu
+    }
     case WM_LBUTTONDOWN:
     case WM_LBUTTONUP:
-    case WM_RBUTTONDOWN:
-    case WM_RBUTTONUP:
     case WM_MOUSEMOVE:  // for selection drag
         {
             LRESULT res = CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
-            // Redirect focus to main view window so TC lister can switch plugins/views (HEX, other plugins etc.)
-            // Selection remains visible thanks to ES_NOHIDESEL
-            HWND viewer = GetParent(hEdit);
-            if (viewer && IsWindow(viewer)) {
-                SetFocus(viewer);
+            // LMB: redirect focus to viewer so TC can switch Lister plugins/modes
+            // Selection stays visible thanks to ES_NOHIDESEL
+            if (msg == WM_LBUTTONUP || msg == WM_LBUTTONDOWN) {
+                HWND viewer = GetParent(hEdit);
+                if (viewer && IsWindow(viewer))
+                    SetFocus(viewer);
             }
             return res;
         }
@@ -1883,11 +1998,26 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hPhoto = CreateWindowExW(0, kPhotoClass, L"", WS_CHILD | WS_VISIBLE,
             0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
 
-        // EDIT below photo: wrap text, no own scrollbars (outer hRightScroll scrolls card)
-        st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
-            ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
+        // RichEdit below photo: wrap, readonly, bold values (#18); outer hRightScroll scrolls card
+        EnsureRichEditLoaded();
+        st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_NOHIDESEL | ES_SAVESEL,
             0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+        if (!st->hEdit) {
+            // Fallback if Msftedit unavailable
+            st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, RICHEDIT_CLASSW, L"",
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
+                0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+        }
+        if (!st->hEdit) {
+            st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
+                0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+        }
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
+        SendMessageW(st->hEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)g_clrBk);
+        // No auto-URL detect chrome
+        SendMessageW(st->hEdit, EM_AUTOURLDETECT, FALSE, 0);
         g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
 
         SetFocus(h);
@@ -2344,16 +2474,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
 
-        if (hSrc == st->hEdit || (hSrc == h)) {
-            if (hSrc == h) {
-                RECT rcE{}; GetWindowRect(st->hEdit, &rcE);
-                if (!(pt.x >= rcE.left && pt.x < rcE.right && pt.y >= rcE.top && pt.y < rcE.bottom)) break;
-            }
+        // Card text (EDIT): copy selection / line value / all
+        bool onEdit = (hSrc == st->hEdit);
+        if (!onEdit && hSrc == h && st->hEdit) {
+            RECT rcE{}; GetWindowRect(st->hEdit, &rcE);
+            onEdit = (pt.x >= rcE.left && pt.x < rcE.right && pt.y >= rcE.top && pt.y < rcE.bottom);
+        }
+        if (onEdit && st->hEdit) {
             HMENU m = CreatePopupMenu();
             AppendMenuW(m, MF_STRING, 1, g_tcRu ? L"Копировать" : L"Copy");
             AppendMenuW(m, MF_STRING, 2, g_tcRu ? L"Копировать строку (значение)" : L"Copy line value");
             AppendMenuW(m, MF_STRING, 3, g_tcRu ? L"Копировать всё" : L"Copy all");
-            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, nullptr);
+            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+                pt.x, pt.y, 0, h, nullptr);
             DestroyMenu(m);
             if (cmd == 1) {
                 DWORD a = 0, b = 0; SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
@@ -2371,6 +2504,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 if (len > 0) GetWindowTextW(st->hEdit, &all[0], len + 1);
                 SetClipboardTextW(h, all);
             }
+            // Return focus to viewer so TC plugin keys keep working
+            SetFocus(h);
             return 0;
         }
         break;
