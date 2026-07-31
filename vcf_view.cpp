@@ -865,15 +865,23 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             }
             if (!cleaned.empty()) val = cleaned;
         }
-        // Unescape common vCard text escapes in free-form values
+        // Unescape vCard text (RFC 2426 / 6350): \n \N = newline, \t (common), \, \; \\
+        // Win32 multiline EDIT needs CRLF to show line breaks.
         {
             std::wstring u;
-            u.reserve(val.size());
+            u.reserve(val.size() + 8);
             for (size_t k = 0; k < val.size(); ++k) {
                 if (val[k] == L'\\' && k + 1 < val.size()) {
                     wchar_t n = val[k + 1];
-                    if (n == L'n' || n == L'N') { u += L'\n'; ++k; continue; }
+                    if (n == L'n' || n == L'N') { u += L"\r\n"; ++k; continue; }
+                    if (n == L't' || n == L'T') { u += L'\t'; ++k; continue; }
                     if (n == L',' || n == L';' || n == L'\\') { u += n; ++k; continue; }
+                }
+                // Normalize bare LF → CRLF (some exporters)
+                if (val[k] == L'\n') {
+                    if (u.empty() || u.back() != L'\r') u += L'\r';
+                    u += L'\n';
+                    continue;
                 }
                 u += val[k];
             }
@@ -978,6 +986,26 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         // Special handling for the encoded custom fields in this vCard (from ez-vcard sample)
         if (headUp.find(L"X-FCENCODED-") == 0) {
             label = ru ? L"Связанное / Пользовательское" : L"Related / Custom";
+        }
+
+        // NOTE — separate block: blank line, header on its own line, body below, blank after
+        const bool isNote = (headUp == L"NOTE" || headUp.rfind(L"NOTE;", 0) == 0);
+        if (isNote) {
+            if (!out.empty() && out.size() >= 2 && !(out[out.size() - 2] == L'\r' && out[out.size() - 1] == L'\n'
+                    && out.size() >= 4 && out[out.size() - 4] == L'\r')) {
+                // ensure one blank line before note block
+                if (!(out.size() >= 4 && out[out.size() - 4] == L'\r' && out[out.size() - 3] == L'\n'
+                        && out[out.size() - 2] == L'\r' && out[out.size() - 1] == L'\n'))
+                    out += L"\r\n";
+            }
+            out += L"── ";
+            out += label;
+            out += L" ──\r\n";
+            out += val;
+            if (val.empty() || val.back() != L'\n')
+                out += L"\r\n";
+            out += L"\r\n";
+            continue;
         }
 
         out += label; out += L": "; out += val; out += L"\r\n";
