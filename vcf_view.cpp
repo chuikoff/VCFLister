@@ -1009,7 +1009,11 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             continue;
         }
 
-        out += label; out += L": "; out += val; out += L"\r\n";
+        // Two-column table row: label <TAB> value  (tab stop set on RichEdit)
+        out += label;
+        out += L'\t';
+        out += val;
+        out += L"\r\n";
     }
     return out;
 }
@@ -1284,9 +1288,11 @@ static void RebuildSearchFlags(ViewState* st, bool wholeWord = false) {
     }
 }
 
-// Extract "value" part after first ':' from a detail line (for copy)
+// Extract value part from a card line (table: label\\tvalue, or legacy "label: value")
 static std::wstring ValueAfterColon(const std::wstring& line) {
-    size_t p = line.find(L':');
+    size_t p = line.find(L'\t');
+    if (p != std::wstring::npos) return Trim(line.substr(p + 1));
+    p = line.find(L':');
     if (p == std::wstring::npos) return Trim(line);
     return Trim(line.substr(p + 1));
 }
@@ -1464,24 +1470,54 @@ static void RenderList(HDC dc, HWND h, ViewState* st, int x, int y, int w, int h
     UpdateListScrollbar(st, visN);
 }
 
-// ===================== Card text (RichEdit) — bold values (#18) =====================
+// ===================== Card text (RichEdit) — two-column table (#18) =====================
 static void EnsureRichEditLoaded() {
     static bool once = false;
     if (!once) {
-        // RICHEDIT50W
         if (!LoadLibraryW(L"Msftedit.dll"))
             LoadLibraryW(L"Riched20.dll");
         once = true;
     }
 }
 
-// Set plain card text and bold the values (after ':') + note headers (── … ──)
+// Label column width in twips (~38% of client, clamped)
+static void ApplyCardEditTabStop(HWND hEdit) {
+    if (!hEdit || !IsWindow(hEdit)) return;
+    RECT rc{}; GetClientRect(hEdit, &rc);
+    int w = rc.right - rc.left;
+    if (w < 40) return;
+    HDC dc = GetDC(hEdit);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(hEdit, dc);
+    if (dpi <= 0) dpi = 96;
+
+    int labelPx = w * 38 / 100;
+    if (labelPx < 100) labelPx = std::min(100, w / 2);
+    if (labelPx > 240) labelPx = 240;
+    if (labelPx >= w - 40) labelPx = w / 2;
+
+    LONG tabTwips = MulDiv(labelPx, 1440, dpi);
+    if (tabTwips < 400) tabTwips = 400;
+
+    PARAFORMAT2 pf{};
+    pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_TABSTOPS;
+    pf.cTabCount = 1;
+    pf.rgxTabs[0] = tabTwips;
+    // Apply to all text
+    SendMessageW(hEdit, EM_SETSEL, 0, -1);
+    SendMessageW(hEdit, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+    SendMessageW(hEdit, EM_SETSEL, 0, 0);
+}
+
+// Two-column card: "Label\\tValue". Colors only (no bold).
+// Positions from EM_LINEINDEX — RichEdit's real indices (not source \\r\\n offsets).
 static void SetCardEditText(HWND hEdit, const std::wstring& text, HFONT hFont) {
     if (!hEdit || !IsWindow(hEdit)) return;
 
     LOGFONTW lf{};
     if (hFont) GetObjectW(hFont, sizeof(lf), &lf);
-    int yHeight = 180; // ~9pt in twips
+    int yHeight = 180;
     if (lf.lfHeight != 0) {
         HDC dc = GetDC(hEdit);
         int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
@@ -1495,63 +1531,94 @@ static void SetCardEditText(HWND hEdit, const std::wstring& text, HFONT hFont) {
     const wchar_t* face = (lf.lfFaceName[0]) ? lf.lfFaceName : L"Segoe UI";
 
     SendMessageW(hEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)g_clrBk);
+    SendMessageW(hEdit, EM_SETUNDOLIMIT, 0, 0);
+    SendMessageW(hEdit, WM_SETREDRAW, FALSE, 0);
 
-    // Plain text (Unicode)
     SETTEXTEX stx{};
     stx.flags = ST_DEFAULT;
-    stx.codepage = 1200; // UTF-16
+    stx.codepage = 1200;
     SendMessageW(hEdit, EM_SETTEXTEX, (WPARAM)&stx, (LPARAM)text.c_str());
 
-    CHARFORMAT2W cfNorm{};
-    cfNorm.cbSize = sizeof(cfNorm);
-    cfNorm.dwMask = CFM_BOLD | CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_CHARSET;
-    cfNorm.dwEffects = 0;
-    cfNorm.crTextColor = g_clrTxt;
-    cfNorm.yHeight = yHeight;
-    cfNorm.bCharSet = DEFAULT_CHARSET;
-    wcsncpy_s(cfNorm.szFaceName, face, _TRUNCATE);
-    SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cfNorm);
+    ApplyCardEditTabStop(hEdit);
 
-    CHARFORMAT2W cfBold = cfNorm;
-    cfBold.dwEffects = CFE_BOLD;
+    CHARFORMAT2W cfBase{};
+    cfBase.cbSize = sizeof(cfBase);
+    cfBase.dwMask = CFM_BOLD | CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_CHARSET;
+    cfBase.dwEffects = 0; // never bold
+    cfBase.crTextColor = g_clrTxt;
+    cfBase.yHeight = yHeight;
+    cfBase.bCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(cfBase.szFaceName, face, _TRUNCATE);
+    SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cfBase);
 
-    // Bold values after first ':' on each line; bold whole "── header ──" lines
-    const size_t n = text.size();
-    size_t i = 0;
-    while (i < n) {
-        size_t lineStart = i;
-        size_t lineEnd = i;
-        while (lineEnd < n && text[lineEnd] != L'\r' && text[lineEnd] != L'\n')
-            ++lineEnd;
+    CHARFORMAT2W cfLabel = cfBase;
+    cfLabel.crTextColor = g_clrSub; // muted labels
 
-        if (lineEnd > lineStart) {
-            // Note separator line (box-drawing ─ U+2500)
-            if (text[lineStart] == L'\x2500' ||
-                (lineEnd > lineStart + 1 && text[lineStart] == L'-' && text[lineStart + 1] == L'-')) {
-                SendMessageW(hEdit, EM_SETSEL, (WPARAM)lineStart, (LPARAM)lineEnd);
-                SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfBold);
-            } else {
-                size_t colon = text.find(L':', lineStart);
-                if (colon != std::wstring::npos && colon < lineEnd) {
-                    size_t valStart = colon + 1;
-                    while (valStart < lineEnd && text[valStart] == L' ')
-                        ++valStart;
-                    if (valStart < lineEnd) {
-                        // Issue #18: bold values (Full name: **Leonard**)
-                        SendMessageW(hEdit, EM_SETSEL, (WPARAM)valStart, (LPARAM)lineEnd);
-                        SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfBold);
-                    }
-                }
-            }
+    CHARFORMAT2W cfValue = cfBase;
+    cfValue.crTextColor = g_clrTxt; // primary values
+
+    CHARFORMAT2W cfHead = cfBase;
+    cfHead.crTextColor = g_clrTxt;
+
+    const int lineCount = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
+    for (int li = 0; li < lineCount; ++li) {
+        const int lineIdx = (int)SendMessageW(hEdit, EM_LINEINDEX, li, 0);
+        if (lineIdx < 0) continue;
+        int lineLen = (int)SendMessageW(hEdit, EM_LINELENGTH, lineIdx, 0);
+        if (lineLen <= 0) continue;
+        if (lineLen > 8000) lineLen = 8000;
+
+        std::vector<wchar_t> buf((size_t)lineLen + 2, 0);
+        *(WORD*)buf.data() = (WORD)(lineLen + 1);
+        int got = (int)SendMessageW(hEdit, EM_GETLINE, li, (LPARAM)buf.data());
+        if (got < 0) got = 0;
+        if (got > lineLen) got = lineLen;
+        std::wstring line(buf.data(), buf.data() + got);
+        while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n'))
+            line.pop_back();
+        if (line.empty()) continue;
+
+        const int absEnd = lineIdx + (int)line.size();
+
+        // Note header ── … ──
+        if (line[0] == L'\x2500' || (line.size() >= 2 && line[0] == L'-' && line[1] == L'-')) {
+            SendMessageW(hEdit, EM_SETSEL, (WPARAM)lineIdx, (LPARAM)absEnd);
+            SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfHead);
+            continue;
         }
 
-        i = lineEnd;
-        if (i < n && text[i] == L'\r') ++i;
-        if (i < n && text[i] == L'\n') ++i;
+        // Table row: label \\t value
+        size_t tab = line.find(L'\t');
+        if (tab != std::wstring::npos) {
+            SendMessageW(hEdit, EM_SETSEL, (WPARAM)lineIdx, (LPARAM)(lineIdx + (int)tab));
+            SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfLabel);
+            if (tab + 1 < line.size()) {
+                SendMessageW(hEdit, EM_SETSEL, (WPARAM)(lineIdx + (int)tab + 1), (LPARAM)absEnd);
+                SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfValue);
+            }
+            continue;
+        }
+
+        // Legacy "label: value" or NOTE body
+        size_t colon = line.find(L':');
+        if (colon != std::wstring::npos) {
+            size_t valOff = colon + 1;
+            if (valOff < line.size() && line[valOff] == L' ') ++valOff;
+            SendMessageW(hEdit, EM_SETSEL, (WPARAM)lineIdx, (LPARAM)(lineIdx + (int)valOff));
+            SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfLabel);
+            if (valOff < line.size()) {
+                SendMessageW(hEdit, EM_SETSEL, (WPARAM)(lineIdx + (int)valOff), (LPARAM)absEnd);
+                SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfValue);
+            }
+        } else {
+            SendMessageW(hEdit, EM_SETSEL, (WPARAM)lineIdx, (LPARAM)absEnd);
+            SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cfValue);
+        }
     }
 
     SendMessageW(hEdit, EM_SETSEL, 0, 0);
-    SendMessageW(hEdit, EM_SCROLLCARET, 0, 0);
+    SendMessageW(hEdit, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hEdit, nullptr, TRUE);
 }
 
 // ===================== EDIT и ФОТО: наполнение и поведение =====================
@@ -1613,26 +1680,36 @@ static void UpdateRightPanel(ViewState* st) {
         }
         else if (st->sel < st->contacts.size()) {
             const Contact& c = st->contacts[st->sel];
-            auto add = [&](const std::wstring& k, const std::wstring& v) { if (!v.empty()) { text += k; text += v; text += L"\r\n"; } };
+            auto add = [&](const std::wstring& k, const std::wstring& v) {
+                if (v.empty()) return;
+                text += k; text += L'\t'; text += v; text += L"\r\n";
+            };
             std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
             if (name.empty()) name = L"(no name)";
-            add(g_tcRu ? L"Имя: " : L"Name: ", name);
-            add(g_tcRu ? L"Тип контакта: " : L"Kind: ", c.kind);
-            add(g_tcRu ? L"Пол: " : L"Gender: ", c.gender);
-            add(g_tcRu ? L"Язык: " : L"Language: ", c.lang);
-            for (auto& lg : c.langs) if (lg != c.lang) add(g_tcRu ? L"Язык: " : L"Language: ", lg);
-            add(g_tcRu ? L"Компания: " : L"Organization: ", c.org);
-            add(g_tcRu ? L"Должность: " : L"Role: ", c.title);
-            if (!c.urls.empty()) { for (auto& u : c.urls) add(L"URL: ", u); }
-            else add(L"URL: ", c.url);
-            add(g_tcRu ? L"День рождения: " : L"Birthday: ", c.bday);
-            for (auto& m : c.members) add(g_tcRu ? L"Участник: " : L"Member: ", m);
-            for (auto& p : c.phones) if (!p.number.empty()) add(g_tcRu ? L"Телефон: " : L"Phone: ", p.number);
-            bool any = false; for (auto& e : c.emails) { if (!e.addr.empty()) { add(L"Email: ", e.addr); any = true; } }
-            if (!any) { std::wstring fb = FallbackEmail_NotesAware(c); if (!fb.empty()) add(L"Email: ", fb); }
-            for (auto& a : c.addrs) if (!a.text.empty()) add(g_tcRu ? L"Адрес: " : L"Address: ", a.text);
-            if constexpr (detail_detect::has_notes<Contact>::value) { for (auto& n : c.notes) add(g_tcRu ? L"Заметка: " : L"Note: ", n); }
-            else if (!c.note.empty()) { add(g_tcRu ? L"Заметка: " : L"Note: ", c.note); }
+            add(g_tcRu ? L"Имя" : L"Name", name);
+            add(g_tcRu ? L"Тип контакта" : L"Kind", c.kind);
+            add(g_tcRu ? L"Пол" : L"Gender", c.gender);
+            add(g_tcRu ? L"Язык" : L"Language", c.lang);
+            for (auto& lg : c.langs) if (lg != c.lang) add(g_tcRu ? L"Язык" : L"Language", lg);
+            add(g_tcRu ? L"Компания" : L"Organization", c.org);
+            add(g_tcRu ? L"Должность" : L"Role", c.title);
+            if (!c.urls.empty()) { for (auto& u : c.urls) add(L"URL", u); }
+            else add(L"URL", c.url);
+            add(g_tcRu ? L"День рождения" : L"Birthday", c.bday);
+            for (auto& m : c.members) add(g_tcRu ? L"Участник" : L"Member", m);
+            for (auto& p : c.phones) if (!p.number.empty()) add(g_tcRu ? L"Телефон" : L"Phone", p.number);
+            bool any = false; for (auto& e : c.emails) { if (!e.addr.empty()) { add(L"Email", e.addr); any = true; } }
+            if (!any) { std::wstring fb = FallbackEmail_NotesAware(c); if (!fb.empty()) add(L"Email", fb); }
+            for (auto& a : c.addrs) if (!a.text.empty()) add(g_tcRu ? L"Адрес" : L"Address", a.text);
+            if constexpr (detail_detect::has_notes<Contact>::value) {
+                for (auto& n : c.notes) if (!n.empty()) {
+                    text += L"── "; text += (g_tcRu ? L"Заметка" : L"Note"); text += L" ──\r\n";
+                    text += n; text += L"\r\n\r\n";
+                }
+            } else if (!c.note.empty()) {
+                text += L"── "; text += (g_tcRu ? L"Заметка" : L"Note"); text += L" ──\r\n";
+                text += c.note; text += L"\r\n\r\n";
+            }
         }
         else {
             text = L"";
@@ -1744,16 +1821,29 @@ static LRESULT CALLBACK EscChildSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
-// Сабкласс EDIT — Esc → Lister, Ctrl+C, focus redirect, custom RMB menu
-static WNDPROC g_EditOldProc = nullptr;
-static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
+// Custom messages for copy menus (avoid WM_CONTEXTMENU / TPM reentrancy inside TC Lister)
+static const UINT WM_VCF_MENU_LIST = WM_APP + 40;
+static const UINT WM_VCF_MENU_CARD = WM_APP + 41;
+static bool g_inPopupMenu = false;
+
+// Safe popup for WLX under TC Lister (no SetForegroundWindow — can hang/crash TC)
+static int TrackCopyMenu(HWND hwndPlugin, HMENU menu, POINT ptScreen) {
+    if (!menu || !hwndPlugin) return 0;
+    HWND owner = hwndPlugin;
+    int cmd = (int)TrackPopupMenu(menu,
+        TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_NONOTIFY,
+        ptScreen.x, ptScreen.y, 0, owner, nullptr);
+    return cmd;
+}
+
+static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam,
+    UINT_PTR /*id*/, DWORD_PTR /*data*/) {
     switch (msg) {
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             ForwardEscToLister(hEdit);
             return 0;
         }
-        // Ctrl+C without selection → copy current line value (after ':')
         if ((wParam == 'C' || wParam == 'c') && (GetKeyState(VK_CONTROL) & 0x8000)) {
             DWORD a = 0, b = 0;
             SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
@@ -1772,58 +1862,65 @@ static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LP
         }
         break;
     case WM_MOUSEWHEEL: {
-        // Forward wheel to parent so single card scrollbar moves (no inner V-scroll)
         HWND viewer = GetParent(hEdit);
-        if (viewer) {
+        if (viewer)
             return SendMessageW(viewer, WM_MOUSEWHEEL, wParam, lParam);
-        }
         break;
     }
-    // Custom copy menu lives on the viewer — do not let EDIT show its own (or swallow) context menu
-    case WM_CONTEXTMENU: {
-        HWND viewer = GetParent(hEdit);
-        if (viewer && IsWindow(viewer))
-            return SendMessageW(viewer, WM_CONTEXTMENU, (WPARAM)hEdit, lParam);
-        return 0;
-    }
     case WM_RBUTTONDOWN: {
-        // Place caret under cursor so "copy line value" uses the clicked line
-        CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
-        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
-        LRESULT ch = SendMessageW(hEdit, EM_CHARFROMPOS, 0, MAKELPARAM(x, y));
-        if (ch != -1) {
-            int idx = (int)(short)LOWORD(ch);
-            SendMessageW(hEdit, EM_SETSEL, (WPARAM)idx, (LPARAM)idx);
+        // Keep existing mouse selection (user may RMB → Copy).
+        // Only place caret when nothing is selected.
+        DWORD a = 0, b = 0;
+        SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+        if (a == b) {
+            // RichEdit: lParam is POINTL*, NOT MAKELPARAM (that crashes / AVs!)
+            POINTL ptl{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            LRESULT idx = SendMessageW(hEdit, EM_CHARFROMPOS, 0, (LPARAM)&ptl);
+            if (idx >= 0)
+                SendMessageW(hEdit, EM_SETSEL, (WPARAM)idx, (LPARAM)idx);
         }
-        // Keep focus on edit until menu finishes (parent will SetFocus if needed)
-        SetFocus(hEdit);
         return 0;
     }
     case WM_RBUTTONUP: {
-        // Generate WM_CONTEXTMENU ourselves (screen coords) → parent custom menu
-        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        ClientToScreen(hEdit, &pt);
-        HWND viewer = GetParent(hEdit);
-        if (viewer)
-            SendMessageW(viewer, WM_CONTEXTMENU, (WPARAM)hEdit, MAKELPARAM(pt.x, pt.y));
-        return 0; // don't run default EDIT menu
-    }
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONUP:
-    case WM_MOUSEMOVE:  // for selection drag
-        {
-            LRESULT res = CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
-            // LMB: redirect focus to viewer so TC can switch Lister plugins/modes
-            // Selection stays visible thanks to ES_NOHIDESEL
-            if (msg == WM_LBUTTONUP || msg == WM_LBUTTONDOWN) {
-                HWND viewer = GetParent(hEdit);
-                if (viewer && IsWindow(viewer))
-                    SetFocus(viewer);
-            }
-            return res;
+        if (!g_inPopupMenu) {
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ClientToScreen(hEdit, &pt);
+            HWND viewer = GetParent(hEdit);
+            if (viewer && IsWindow(viewer))
+                PostMessageW(viewer, WM_VCF_MENU_CARD, 0, POINTTOPOINTS(pt));
         }
+        return 0;
     }
-    return CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
+    case WM_CONTEXTMENU:
+        // Keyboard Shift+F10 / Apps key only — mouse path uses WM_VCF_MENU_CARD
+        if (!g_inPopupMenu && (GET_X_LPARAM(lParam) == -1 && GET_Y_LPARAM(lParam) == -1)) {
+            HWND viewer = GetParent(hEdit);
+            POINT pt{}; GetCursorPos(&pt);
+            if (viewer)
+                PostMessageW(viewer, WM_VCF_MENU_CARD, 0, POINTTOPOINTS(pt));
+        }
+        return 0; // never show built-in RichEdit menu
+    case WM_LBUTTONDOWN:
+        // Keep focus on the card text while the user selects — do NOT SetFocus(viewer) here
+        // (that broke selection and could freeze RMB menu after drag-select).
+        return DefSubclassProc(hEdit, msg, wParam, lParam);
+    case WM_LBUTTONUP: {
+        LRESULT res = DefSubclassProc(hEdit, msg, wParam, lParam);
+        // If nothing selected (simple click), return focus to viewer for TC Lister keys.
+        // If there is a selection, keep focus on the edit so copy / RMB work.
+        DWORD a = 0, b = 0;
+        SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+        if (a == b) {
+            HWND viewer = GetParent(hEdit);
+            if (viewer && IsWindow(viewer))
+                SetFocus(viewer);
+        }
+        return res;
+    }
+    case WM_MOUSEMOVE:
+        return DefSubclassProc(hEdit, msg, wParam, lParam);
+    }
+    return DefSubclassProc(hEdit, msg, wParam, lParam);
 }
 
 // Окно превью фото
@@ -2016,16 +2113,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
         SendMessageW(st->hEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)g_clrBk);
-        // No auto-URL detect chrome
         SendMessageW(st->hEdit, EM_AUTOURLDETECT, FALSE, 0);
-        g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+        SetWindowSubclass(st->hEdit, EditSubclassProc, 3, 0);
 
         SetFocus(h);
         return 0;
     }
     case WM_DESTROY: {
         if (st) {
-            if (st->hEdit && IsWindow(st->hEdit)) DestroyWindow(st->hEdit);
+            if (st->hEdit && IsWindow(st->hEdit)) {
+                RemoveWindowSubclass(st->hEdit, EditSubclassProc, 3);
+                DestroyWindow(st->hEdit);
+            }
             if (st->hPhoto && IsWindow(st->hPhoto)) DestroyWindow(st->hPhoto);
             if (st->hScroll && IsWindow(st->hScroll)) DestroyWindow(st->hScroll);
             if (st->hRightScroll && IsWindow(st->hRightScroll)) DestroyWindow(st->hRightScroll);
@@ -2148,6 +2247,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
         }
         MoveWindow(st->hEdit, ex, editY - rightScroll, ew, eh, TRUE);
+        // Keep label/value columns aligned when width changes
+        if (st->hEdit) ApplyCardEditTabStop(st->hEdit);
 
         SCROLLINFO rsi{};
         rsi.cbSize = sizeof(rsi);
@@ -2434,81 +2535,93 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
 
-    // ПКМ → копирование (список / EDIT)
-    case WM_CONTEXTMENU: {
-        if (!st) break;
-        HWND hSrc = (HWND)w;
-        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
-        if (pt.x == -1 && pt.y == -1) { // keyboard
-            GetCursorPos(&pt);
-        }
-        POINT ptClient = pt; ScreenToClient(h, &ptClient);
-
-        // Right-click on list: copy name / phone / email
+    // List RMB — post custom menu (do not use WM_CONTEXTMENU under TC Lister)
+    case WM_RBUTTONUP: {
+        if (!st || g_inPopupMenu) return 0;
+        int x = GET_X_LPARAM(l), y = GET_Y_LPARAM(l);
         int listW = ListPaneWidth(h);
-        if (hSrc == h && ptClient.x < listW && st->sel < st->contacts.size()) {
-            const Contact& c = st->contacts[st->sel];
-            HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, 10, g_tcRu ? L"Копировать имя" : L"Copy name");
-            AppendMenuW(m, MF_STRING, 11, g_tcRu ? L"Копировать телефон" : L"Copy phone");
-            AppendMenuW(m, MF_STRING, 12, g_tcRu ? L"Копировать email" : L"Copy email");
-            AppendMenuW(m, MF_STRING, 13, g_tcRu ? L"Копировать карточку" : L"Copy card text");
-            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, h, nullptr);
-            DestroyMenu(m);
-            if (cmd == 10) {
-                std::wstring n = ContactDisplayName(c);
-                if (!n.empty()) SetClipboardTextW(h, n);
-            } else if (cmd == 11) {
-                std::wstring p = PrimaryPhone(c);
-                if (!p.empty()) SetClipboardTextW(h, p);
-            } else if (cmd == 12) {
-                std::wstring e = PrimaryEmail(c);
-                if (e.empty()) e = FallbackEmail_NotesAware(c);
-                if (!e.empty()) SetClipboardTextW(h, e);
-            } else if (cmd == 13 && IsWindow(st->hEdit)) {
-                int len = GetWindowTextLengthW(st->hEdit);
-                std::wstring all((size_t)std::max(0, len), L'\0');
-                if (len > 0) GetWindowTextW(st->hEdit, &all[0], len + 1);
-                SetClipboardTextW(h, all);
-            }
+        int filterH = S(h, 26), filterPad = S(h, 4), statusH = S(h, 18);
+        int listTop = filterPad + filterH + filterPad;
+        RECT rc{}; GetClientRect(h, &rc);
+        if (x >= 0 && x < listW && y >= listTop && y < rc.bottom - statusH) {
+            POINT pt{ x, y };
+            ClientToScreen(h, &pt);
+            PostMessageW(h, WM_VCF_MENU_LIST, 0, POINTTOPOINTS(pt));
             return 0;
         }
-
-        // Card text (EDIT): copy selection / line value / all
-        bool onEdit = (hSrc == st->hEdit);
-        if (!onEdit && hSrc == h && st->hEdit) {
-            RECT rcE{}; GetWindowRect(st->hEdit, &rcE);
-            onEdit = (pt.x >= rcE.left && pt.x < rcE.right && pt.y >= rcE.top && pt.y < rcE.bottom);
+        return 0;
+    }
+    case WM_CONTEXTMENU: {
+        // Only keyboard invocation on the plugin root; mouse uses WM_VCF_MENU_*
+        if (!st || g_inPopupMenu) return 0;
+        if (GET_X_LPARAM(l) != -1 || GET_Y_LPARAM(l) != -1) return 0;
+        POINT pt{}; GetCursorPos(&pt);
+        POINT pc = pt; ScreenToClient(h, &pc);
+        int listW = ListPaneWidth(h);
+        if (pc.x < listW)
+            PostMessageW(h, WM_VCF_MENU_LIST, 0, POINTTOPOINTS(pt));
+        else if (st->hEdit)
+            PostMessageW(h, WM_VCF_MENU_CARD, 0, POINTTOPOINTS(pt));
+        return 0;
+    }
+    case WM_VCF_MENU_LIST: {
+        if (!st || g_inPopupMenu) return 0;
+        if (st->contacts.empty() || st->sel >= st->contacts.size()) return 0;
+        g_inPopupMenu = true;
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        const Contact& c = st->contacts[st->sel];
+        HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, 10, g_tcRu ? L"Копировать имя" : L"Copy name");
+        AppendMenuW(m, MF_STRING, 11, g_tcRu ? L"Копировать телефон" : L"Copy phone");
+        AppendMenuW(m, MF_STRING, 12, g_tcRu ? L"Копировать email" : L"Copy email");
+        AppendMenuW(m, MF_STRING, 13, g_tcRu ? L"Копировать карточку" : L"Copy card text");
+        int cmd = TrackCopyMenu(h, m, pt);
+        DestroyMenu(m);
+        if (cmd == 10) {
+            std::wstring n = ContactDisplayName(c);
+            if (!n.empty()) SetClipboardTextW(h, n);
+        } else if (cmd == 11) {
+            std::wstring p = PrimaryPhone(c);
+            if (!p.empty()) SetClipboardTextW(h, p);
+        } else if (cmd == 12) {
+            std::wstring e = PrimaryEmail(c);
+            if (e.empty()) e = FallbackEmail_NotesAware(c);
+            if (!e.empty()) SetClipboardTextW(h, e);
+        } else if (cmd == 13 && IsWindow(st->hEdit)) {
+            int len = GetWindowTextLengthW(st->hEdit);
+            std::wstring all((size_t)std::max(0, len), L'\0');
+            if (len > 0) GetWindowTextW(st->hEdit, &all[0], len + 1);
+            SetClipboardTextW(h, all);
         }
-        if (onEdit && st->hEdit) {
-            HMENU m = CreatePopupMenu();
-            AppendMenuW(m, MF_STRING, 1, g_tcRu ? L"Копировать" : L"Copy");
-            AppendMenuW(m, MF_STRING, 2, g_tcRu ? L"Копировать строку (значение)" : L"Copy line value");
-            AppendMenuW(m, MF_STRING, 3, g_tcRu ? L"Копировать всё" : L"Copy all");
-            int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
-                pt.x, pt.y, 0, h, nullptr);
-            DestroyMenu(m);
-            if (cmd == 1) {
-                DWORD a = 0, b = 0; SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
-                if (a != b) SendMessageW(st->hEdit, WM_COPY, 0, 0);
-                else {
-                    std::wstring line = GetEditCurrentLine(st->hEdit);
-                    SetClipboardTextW(h, ValueAfterColon(line));
-                }
-            } else if (cmd == 2) {
-                std::wstring line = GetEditSelectionOrLine(st->hEdit);
-                SetClipboardTextW(h, ValueAfterColon(line));
-            } else if (cmd == 3) {
-                int len = GetWindowTextLengthW(st->hEdit);
-                std::wstring all((size_t)std::max(0, len), L'\0');
-                if (len > 0) GetWindowTextW(st->hEdit, &all[0], len + 1);
-                SetClipboardTextW(h, all);
-            }
-            // Return focus to viewer so TC plugin keys keep working
-            SetFocus(h);
-            return 0;
+        g_inPopupMenu = false;
+        SetFocus(h);
+        return 0;
+    }
+    case WM_VCF_MENU_CARD: {
+        if (!st || g_inPopupMenu || !st->hEdit) return 0;
+        g_inPopupMenu = true;
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, 1, g_tcRu ? L"Копировать" : L"Copy");
+        AppendMenuW(m, MF_STRING, 2, g_tcRu ? L"Копировать строку (значение)" : L"Copy line value");
+        AppendMenuW(m, MF_STRING, 3, g_tcRu ? L"Копировать всё" : L"Copy all");
+        int cmd = TrackCopyMenu(h, m, pt);
+        DestroyMenu(m);
+        if (cmd == 1) {
+            DWORD a = 0, b = 0; SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+            if (a != b) SendMessageW(st->hEdit, WM_COPY, 0, 0);
+            else SetClipboardTextW(h, ValueAfterColon(GetEditCurrentLine(st->hEdit)));
+        } else if (cmd == 2) {
+            SetClipboardTextW(h, ValueAfterColon(GetEditSelectionOrLine(st->hEdit)));
+        } else if (cmd == 3) {
+            int len = GetWindowTextLengthW(st->hEdit);
+            std::wstring all((size_t)std::max(0, len), L'\0');
+            if (len > 0) GetWindowTextW(st->hEdit, &all[0], len + 1);
+            SetClipboardTextW(h, all);
         }
-        break;
+        g_inPopupMenu = false;
+        SetFocus(h);
+        return 0;
     }
     case WM_CTLCOLORDLG:
     case WM_CTLCOLORSTATIC:
