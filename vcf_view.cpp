@@ -13,10 +13,12 @@
 #include <gdiplus.h>
 #include <commctrl.h>
 #include <richedit.h>
+#include <uxtheme.h>
 #include <wininet.h>
 #pragma comment(lib, "Gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 #include <vector>
 #include <string>
@@ -1300,27 +1302,57 @@ static std::wstring ValueAfterColon(const std::wstring& line) {
 static std::wstring GetEditCurrentLine(HWND hEdit) {
     DWORD a = 0, b = 0;
     SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+    // Use selection start; for multi-line sel still the line under the caret start
     int line = (int)SendMessageW(hEdit, EM_LINEFROMCHAR, a, 0);
     int idx = (int)SendMessageW(hEdit, EM_LINEINDEX, line, 0);
     if (idx < 0) return L"";
-    wchar_t buf[2048];
-    *(WORD*)buf = 2047;
-    int n = (int)SendMessageW(hEdit, EM_GETLINE, line, (LPARAM)buf);
-    if (n < 0) n = 0;
-    if (n > 2047) n = 2047;
-    buf[n] = 0;
-    return std::wstring(buf, n);
+    // Prefer EM_GETTEXTRANGE — reliable on RichEdit (EM_GETLINE length quirks)
+    int lineLen = (int)SendMessageW(hEdit, EM_LINELENGTH, idx, 0);
+    if (lineLen < 0) lineLen = 0;
+    if (lineLen > 16000) lineLen = 16000;
+    if (lineLen == 0) {
+        // EM_LINELENGTH can be 0 for empty line; try GETLINE capacity probe
+        wchar_t probe[8]; *(WORD*)probe = 7;
+        lineLen = (int)SendMessageW(hEdit, EM_GETLINE, line, (LPARAM)probe);
+        if (lineLen < 0) lineLen = 0;
+    }
+    if (lineLen <= 0) return L"";
+    std::wstring out((size_t)lineLen, L'\0');
+    TEXTRANGEW tr{};
+    tr.chrg.cpMin = idx;
+    tr.chrg.cpMax = idx + lineLen;
+    tr.lpstrText = &out[0];
+    int got = (int)SendMessageW(hEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    if (got < 0) got = 0;
+    if (got > lineLen) got = lineLen;
+    out.resize((size_t)got);
+    while (!out.empty() && (out.back() == L'\r' || out.back() == L'\n'))
+        out.pop_back();
+    return out;
 }
 
-static std::wstring GetEditSelectionOrLine(HWND hEdit) {
-    DWORD a = 0, b = 0;
-    SendMessageW(hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
-    int len = GetWindowTextLengthW(hEdit);
-    if (len <= 0) return L"";
-    std::wstring all((size_t)len, L'\0');
-    GetWindowTextW(hEdit, &all[0], len + 1);
-    if (a != b && (int)b <= len) return all.substr(a, b - a);
-    return GetEditCurrentLine(hEdit);
+// Full field value on the current line (ignores selection) — for "Copy line value"
+static std::wstring GetEditLineValue(HWND hEdit) {
+    return ValueAfterColon(GetEditCurrentLine(hEdit));
+}
+
+// Selection text via RichEdit char range (not GetWindowText substr — indices differ / off-by-one)
+static std::wstring GetEditSelectionText(HWND hEdit) {
+    CHARRANGE cr{};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    if (cr.cpMin == cr.cpMax) return L"";
+    LONG n = cr.cpMax - cr.cpMin;
+    if (n < 0) n = -n;
+    if (n > 1'000'000) n = 1'000'000;
+    std::wstring out((size_t)n, L'\0');
+    TEXTRANGEW tr{};
+    tr.chrg.cpMin = (std::min)(cr.cpMin, cr.cpMax);
+    tr.chrg.cpMax = (std::max)(cr.cpMin, cr.cpMax);
+    tr.lpstrText = &out[0];
+    int got = (int)SendMessageW(hEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
+    if (got < 0) got = 0;
+    out.resize((size_t)got);
+    return out;
 }
 
 // ===================== Копирование =====================
@@ -2081,6 +2113,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_TEXT,
             0, 0, 0, 0, h, (HMENU)1011, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(st->hPhotoOnly, WM_SETFONT, (WPARAM)st->fonts.hSmall, TRUE);
+        // Disable visual styles so WM_CTLCOLORBTN can set light text in dark theme (#20)
+        SetWindowTheme(st->hPhotoOnly, L"", L"");
         SetWindowSubclass(st->hPhotoOnly, EscChildSubclass, 2, (DWORD_PTR)h);
 
         // Скролл слева
@@ -2608,11 +2642,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int cmd = TrackCopyMenu(h, m, pt);
         DestroyMenu(m);
         if (cmd == 1) {
-            DWORD a = 0, b = 0; SendMessageW(st->hEdit, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
-            if (a != b) SendMessageW(st->hEdit, WM_COPY, 0, 0);
-            else SetClipboardTextW(h, ValueAfterColon(GetEditCurrentLine(st->hEdit)));
+            // Copy selection if any; else full field value of current line
+            std::wstring sel = GetEditSelectionText(st->hEdit);
+            if (!sel.empty()) SetClipboardTextW(h, sel);
+            else SetClipboardTextW(h, GetEditLineValue(st->hEdit));
         } else if (cmd == 2) {
-            SetClipboardTextW(h, ValueAfterColon(GetEditSelectionOrLine(st->hEdit)));
+            // Always full line value, ignore selection (#19)
+            SetClipboardTextW(h, GetEditLineValue(st->hEdit));
         } else if (cmd == 3) {
             int len = GetWindowTextLengthW(st->hEdit);
             std::wstring all((size_t)std::max(0, len), L'\0');
@@ -2625,9 +2661,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CTLCOLORDLG:
     case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN:   // checkbox "📷 photo" label (#20)
     case WM_CTLCOLORLISTBOX:
     case WM_CTLCOLOREDIT: {
-        HDC dc = (HDC)w; SetTextColor(dc, g_clrTxt); SetBkColor(dc, g_clrBk);
+        HDC dc = (HDC)w;
+        HWND hCtl = (HWND)l;
+        // Photo filter checkbox sits on list background — light text in dark theme
+        if (st && st->hPhotoOnly && hCtl == st->hPhotoOnly) {
+            SetTextColor(dc, g_clrTxt);
+            SetBkMode(dc, TRANSPARENT);
+            // Transparent so list-area paint shows through
+            return (INT_PTR)GetStockObject(HOLLOW_BRUSH);
+        }
+        SetTextColor(dc, g_clrTxt);
+        SetBkColor(dc, g_clrBk);
+        SetBkMode(dc, OPAQUE);
         return (INT_PTR)(g_hbrBk ? g_hbrBk : GetSysColorBrush(COLOR_WINDOW));
     }
 
