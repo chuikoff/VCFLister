@@ -1,3 +1,22 @@
+## [2.5.0] – 2026-08-18
+
+### Changed
+- Карточка строится из **одного разбора** (`Contact.fields` / `BuildFromContact`), без повторного parse raw-блока.
+- Поиск: по полям по отдельности (без склейки огромной `hay`), плюс `fields` / `androidCustoms` (NICKNAME, IMPP, X-*, …).
+- Уважается **Match case** (`lcs_matchcase`); `wrap=false` сканирует до края списка.
+- `A2W` на `std::wstring` (без `malloc`/`free`).
+
+### Fixed
+- Статусбар **«Найдено: p/N»**: `matchPos` обновляется при клике/стрелках (`SetSelectionAndReveal`), не только в F3.
+- Tooltip списка: тот же hit-test, что у клика (фильтр + `visibleIdx`).
+- `PhotoWndProc`: безопасный `ViewStateFromHwnd` (`IsWindow` + null).
+- Поиск: корректная длина после `LowerInvariant` (напр. `ß` → `ss`).
+- Win32: `TargetExt=.wlx` (без MSB8012 TargetPath/`.dll`).
+
+### Cleanup
+- Удалён мёртвый SFINAE (`addNoteImpl` / `has_notes`), пустой `vcf_view_theme.hpp`, `*.orig`, `original_*.txt`, `fix*.ps1`, `RCa14392`.
+- `.gitignore`: `*.orig`, `original_*.txt`, `RCa*`.
+
 ## [2.4.7] – 2026-08-01
 
 ### Fixed

@@ -5,6 +5,6 @@ file=VCFLister.wlx
 file64=VCFLister.wlx64
 defaultdir=VCFLister
 defaultextension=vcf
-version=2.4
+version=2.5
 author=chuikoff
 homepage=https://github.com/chuikoff/VCFLister

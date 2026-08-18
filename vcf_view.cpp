@@ -1,8 +1,7 @@
 ﻿// vcf_view.cpp — левый список + правый блок: фото (сверху) + EDIT (ниже)
 // Вывод ВСЕХ полей vCard (v2.1/v3/v4) c локализацией ключей/TYPE (RU/EN по языку TC)
 // 2.1: поддержка QUOTED-PRINTABLE + CHARSET, склейка мягких переносов, PHOTO;ENCODING=BASE64 многострочный
-#define UNICODE
-#define _UNICODE
+// UNICODE/_UNICODE come from the project (avoid C4005 redefinition)
 #define NOMINMAX
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
@@ -31,21 +30,6 @@
 #include "vcf_view.hpp"
 #include "vcf_theme.hpp"
 #include "vcf_utils.hpp"
-
-// Заглушки на расширения
-struct AndroidCustom { std::wstring rawType; std::vector<std::wstring> slots; };
-namespace detail_detect {
-    template<typename T> struct has_notes {
-        template<typename U> static auto test(int) -> decltype(std::declval<U>().notes, std::true_type{});
-        template<typename>  static auto test(...) -> std::false_type;
-        static constexpr bool value = std::is_same<decltype(test<T>(0)), std::true_type>::value;
-    };
-    template<typename T> struct has_android {
-        template<typename U> static auto test(int) -> decltype(std::declval<U>().androidCustoms, std::true_type{});
-        template<typename>  static auto test(...) -> std::false_type;
-        static constexpr bool value = std::is_same<decltype(test<T>(0)), std::true_type>::value;
-    };
-}
 
 // ===================== Helpers =====================
 using namespace Gdiplus;
@@ -78,71 +62,11 @@ static std::wstring FallbackEmail_NotesAware(const Contact& c) {
         std::wstring f = ExtractEmailFromText(c.url); if (!f.empty()) return f;
     }
     if (!c.note.empty()) { std::wstring f = ExtractEmailFromText(c.note); if (!f.empty()) return f; }
-    if constexpr (detail_detect::has_notes<Contact>::value) {
-        for (const auto& n : c.notes) { std::wstring f = ExtractEmailFromText(n); if (!f.empty()) return f; }
+    for (const auto& n : c.notes) {
+        std::wstring f = ExtractEmailFromText(n);
+        if (!f.empty()) return f;
     }
     return L"";
-}
-
-// === Кодеки для vCard 2.1: quoted-printable и конверсия к Unicode ===
-static std::vector<BYTE> DecodeQuotedPrintableToBytes(const std::wstring& wsrc) {
-    // Берём только младший байт wchar_t (файл ASCII/latin), игнорируя >255
-    std::string src; src.reserve(wsrc.size());
-    for (wchar_t wc : wsrc) { src.push_back((char)((unsigned)wc & 0xFF)); }
-
-    std::vector<BYTE> out; out.reserve(src.size());
-    for (size_t i = 0; i < src.size();) {
-        char c = src[i];
-        if (c == '=') {
-            // soft-break: "=\r\n", "=\n", or trailing '=' at end of value (vCard 2.1)
-            if (i + 1 >= src.size()) break;
-            if (i + 1 < src.size()) {
-                if (src[i + 1] == '\r' && i + 2 < src.size() && src[i + 2] == '\n') { i += 3; continue; }
-                if (src[i + 1] == '\n' || src[i + 1] == '\r') { i += 2; continue; }
-                if (src[i + 1] == ' ' || src[i + 1] == '\t') { i += 2; continue; }
-            }
-            // =HH
-            if (i + 2 < src.size()) {
-                auto hex = [](char h)->int {
-                    if (h >= '0' && h <= '9') return h - '0';
-                    if (h >= 'A' && h <= 'F') return h - 'A' + 10;
-                    if (h >= 'a' && h <= 'f') return h - 'a' + 10;
-                    return -1;
-                    };
-                int hi = hex(src[i + 1]), lo = hex(src[i + 2]);
-                if (hi >= 0 && lo >= 0) { out.push_back((BYTE)((hi << 4) | lo)); i += 3; continue; }
-            }
-            // иначе буквально '='
-            out.push_back((BYTE)'='); ++i; continue;
-        }
-        else if (c == '\r' || c == '\n') {
-            // реальный перевод строки превращаем в \n
-            if (!out.empty() && out.back() != '\n') out.push_back('\n');
-            ++i; if (c == '\r' && i < src.size() && src[i] == '\n') ++i;
-            continue;
-        }
-        else {
-            out.push_back((BYTE)c); ++i; continue;
-        }
-    }
-    return out;
-}
-
-static std::wstring BytesToWide(const std::vector<BYTE>& bytes, UINT codepage) {
-    if (bytes.empty()) return L"";
-    int need = MultiByteToWideChar(codepage, 0, (LPCCH)bytes.data(), (int)bytes.size(), nullptr, 0);
-    if (need <= 0) {
-        // как fallback попробуем CP_UTF8, затем 1251
-        UINT cps[2] = { CP_UTF8, 1251 };
-        for (UINT cp : cps) {
-            need = MultiByteToWideChar(cp, 0, (LPCCH)bytes.data(), (int)bytes.size(), nullptr, 0);
-            if (need > 0) { codepage = cp; break; }
-        }
-        if (need <= 0) return L"";
-    }
-    std::wstring w; w.resize(need);
-    MultiByteToWideChar(codepage, 0, (LPCCH)bytes.data(), (int)bytes.size(), &w[0], need);
-    return w;
 }
 
 // ===================== Локализация ключей и TYPE =====================
@@ -272,85 +196,6 @@ static bool HeaderHasParam(const std::wstring& headUp, const std::wstring& pname
     return false;
 }
 
-// Склейка значений для:
-// - 2.1 QUOTED-PRINTABLE с мягкими переносами (= в конце строки)
-// - PHOTO;ENCODING=BASE64 / B — собираем всё до следующей строки со знаком ':'
-static std::wstring CollectValuePossiblyMultiline(const std::vector<std::wstring>& lines, size_t& i, const std::wstring& headUp) {
-    std::wstring val = (lines[i].find(L':') != std::wstring::npos) ? Trim(lines[i].substr(lines[i].find(L':') + 1)) : L"";
-    bool isQP = false;
-    std::wstring encVal;
-    if (HeaderHasParam(headUp, L"ENCODING", &encVal)) {
-        std::wstring e = ToUpperASCII(encVal);
-        if (e == L"QUOTED-PRINTABLE") isQP = true;
-    }
-    bool isB64 = false;
-    if (!isQP) {
-        std::wstring e;
-        if (HeaderHasParam(headUp, L"ENCODING", &e)) {
-            std::wstring up = ToUpperASCII(e);
-            if (up == L"BASE64" || up == L"B") isB64 = true;
-        }
-        // PHOTO;TYPE=JPEG without ENCODING, or bare ;JPEG / ;PNG (Android v2.1)
-        if (!isB64) {
-            std::wstring prop = headUp;
-            size_t sc = prop.find(L';');
-            std::wstring name = sc == std::wstring::npos ? prop : prop.substr(0, sc);
-            size_t dot = name.find(L'.');
-            if (dot != std::wstring::npos) name = name.substr(dot + 1);
-            if (name.rfind(L"PHOTO", 0) == 0) {
-                // first chars of value look like base64 JPEG/PNG
-                std::wstring v0 = val;
-                while (!v0.empty() && iswspace(v0[0])) v0.erase(v0.begin());
-                if (v0.rfind(L"/9j/", 0) == 0 || v0.rfind(L"iVBOR", 0) == 0 || v0.size() > 40)
-                    isB64 = true;
-                if (headUp.find(L"JPEG") != std::wstring::npos || headUp.find(L"PNG") != std::wstring::npos
-                    || headUp.find(L"GIF") != std::wstring::npos || headUp.find(L"BMP") != std::wstring::npos)
-                    isB64 = true;
-            }
-        }
-    }
-
-    if (isQP) {
-        // Для QP: склеиваем строки, если текущая часть оканчивается '='
-        while (true) {
-            if (!val.empty() && val.back() == L'=') {
-                val.pop_back(); // удалить '='
-                if (i + 1 < lines.size()) {
-                    ++i;
-                    // если следующая строка начинается с пробела/таб — это обычное folding (уже разрулено выше),
-                    // но в 2.1 часто просто следующая строка — продолжение.
-                    val += Trim(lines[i]);
-                    continue;
-                }
-            }
-            break;
-        }
-    }
-    else if (isB64) {
-        // Для Base64 (особенно PHOTO): собираем продолжения.
-        // Останавливаемся только на строках, которые выглядят как начало нового свойства vCard (WORD:),
-        // чтобы не обрываться на случайных ':' внутри загрязнённых/плохих данных.
-        while (i + 1 < lines.size()) {
-            const std::wstring& nxt = lines[i + 1];
-            if (nxt.find(L':') != std::wstring::npos) {
-                std::wstring nt = Trim(nxt);
-                size_t cp = nt.find(L':');
-                if (cp != std::wstring::npos) {
-                    std::wstring prop = Trim(nt.substr(0, cp));
-                    // Простая эвристика: property name состоит из допустимых символов и выглядит как ключ
-                    bool looksLikeProp = !prop.empty() &&
-                        prop.find_first_not_of(L"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") == std::wstring::npos &&
-                        prop.size() >= 2;
-                    if (looksLikeProp) break;
-                }
-            }
-            ++i;
-            val += Trim(nxt);
-        }
-    }
-    return val;
-}
-
 // Разбор заголовка "KEY;PARAM=...;TYPE=...;PREF;WORK:VALUE" и сбор локализованной подписи
 static std::wstring BuildLocalizedHead(const std::wstring& headRaw, bool ru) {
     std::vector<std::wstring> parts;
@@ -402,52 +247,6 @@ static std::wstring BuildLocalizedHead(const std::wstring& headRaw, bool ru) {
         label += L" ("; label += typed; label += L")";
     }
     return label;
-}
-
-// ===================== Фото: декодер Base64 =====================
-static const int* GetB64Table() {
-    static int T[256];
-    static bool inited = false;
-    if (!inited) {
-        for (int i = 0; i < 256; ++i) T[i] = -1;
-        for (int i = 'A'; i <= 'Z'; ++i) T[i] = i - 'A';
-        for (int i = 'a'; i <= 'z'; ++i) T[i] = i - 'a' + 26;
-        for (int i = '0'; i <= '9'; ++i) T[i] = i - '0' + 52;
-        T[(unsigned)'+'] = 62;
-        T[(unsigned)'/'] = 63;
-        inited = true;
-    }
-    return T;
-}
-
-static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
-    const int* T = GetB64Table();
-    // Collect alphabet only
-    std::string alph;
-    alph.reserve(wsrc.size());
-    for (wchar_t wc : wsrc) {
-        if (wc == L'=') break;
-        if (wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') continue;
-        if (wc > 255) continue;
-        if (T[(unsigned char)wc] < 0) continue;
-        alph.push_back((char)wc);
-    }
-    // Invalid length % 4 == 1 → drop trailing junk char (common in phone exports)
-    while (alph.size() % 4 == 1 && !alph.empty()) alph.pop_back();
-
-    std::vector<BYTE> out; out.reserve(alph.size() * 3 / 4);
-    int val = 0, valb = -8;
-    for (char c : alph) {
-        int d = T[(unsigned char)c];
-        if (d < 0) continue;
-        val = (val << 6) + d;
-        valb += 6;
-        if (valb >= 0) {
-            out.push_back((BYTE)((val >> valb) & 0xFF));
-            valb -= 8;
-        }
-    }
-    return out;
 }
 
 // BlackBerry and some phone exports produce JPEGs where APP0/APP1 length
@@ -562,153 +361,80 @@ static void RepairJpegBytes(std::vector<uint8_t>& data) {
     data.swap(out);
 }
 
-// Загрузка фото из raw (поддержка 2.1: многострочный Base64)
-static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytes);
-
-static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw) {
-    auto lines0 = SplitLines(raw);
-    auto lines = UnfoldVCard_Folded(lines0);
-
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const std::wstring& L = lines[i];
-        if (L.empty()) continue;
-        if (IsSection(L, L"BEGIN:VCARD") || IsSection(L, L"END:VCARD") || IsSection(L, L"VERSION")) continue;
-
-        size_t colon = L.find(L':'); if (colon == std::wstring::npos) continue;
-        std::wstring head = Trim(L.substr(0, colon));
-        std::wstring headUpFull = ToUpperASCII(head);
-        size_t dot = headUpFull.find(L'.');
-        std::wstring headUpStripped = (dot != std::wstring::npos) ? headUpFull.substr(dot + 1) : headUpFull;
-        if (headUpStripped.rfind(L"PHOTO", 0) != 0) continue;
-
-        // Собираем значение (передаём полный заголовок для ENCODING)
-        std::wstring val = CollectValuePossiblyMultiline(lines, i, headUpFull);
-        // Доп. очистка base64 — помогает с v2.1 folded + странными токенами вроде ;JPEG (см. contacts (6).vcf)
-        std::wstring b64clean;
-        b64clean.reserve(val.size());
-        for (wchar_t c : val) {
-            if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
-                (c >= L'0' && c <= L'9') || c == L'+' || c == L'/' || c == L'=') b64clean += c;
-        }
-        // Случай data:... тоже поддержим (v3/v4)
-        std::vector<BYTE> bytes;
-        std::wstring vUp = ToUpperASCII(val);
-        size_t dataPos = vUp.find(L"DATA:");
-        if (dataPos == 0) {
-            size_t comma = val.find(L',');
-            if (comma != std::wstring::npos) {
-                std::wstring b64 = val.substr(comma + 1);
-                // clean for safety
-                std::wstring bc; for (wchar_t c : b64) if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='+'||c=='/'||c=='=') bc+=c;
-                bytes = Base64Decode(bc.empty() ? b64 : bc);
-            }
-        }
-        else {
-            // BASE64 (2.1/3/4)
-            bytes = Base64Decode(b64clean.empty() ? val : b64clean);
-        }
-
-        if (!bytes.empty()) {
-            // Delegate to common loader (fixes ownership/stream timing for reliable decode+render)
-            return BitmapFromMemory(bytes);
-        }
-        // URL мы не загружаем
-        break; // берём только первый PHOTO
-    }
-    return nullptr;
-}
-
-// Создать Bitmap из сырых байтов изображения
+// Create Bitmap that owns its pixels. FromStream often keeps a live IStream
+// reference — never return that object after releasing the stream (UAF).
 static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytesIn) {
     if (bytesIn.empty()) return nullptr;
 
-    // Work on a mutable copy — may repair JPEG headers (BlackBerry etc.)
     std::vector<uint8_t> bytes = bytesIn;
-    if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8)
+    bool repaired = false;
+    if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8) {
         RepairJpegBytes(bytes);
+        repaired = true;
+    }
 
     auto tryLoad = [](const std::vector<uint8_t>& data) -> std::unique_ptr<Gdiplus::Bitmap> {
         if (data.empty()) return nullptr;
+
         HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, data.size());
         if (!hMem) return nullptr;
         void* p = GlobalLock(hMem);
         if (!p) { GlobalFree(hMem); return nullptr; }
         memcpy(p, data.data(), data.size());
         GlobalUnlock(hMem);
+
+        // TRUE: stream frees HGLOBAL when its last ref dies
         IStream* pStream = nullptr;
         if (CreateStreamOnHGlobal(hMem, TRUE, &pStream) != S_OK) {
             GlobalFree(hMem);
             return nullptr;
         }
-        std::unique_ptr<Gdiplus::Bitmap> bmp(Gdiplus::Bitmap::FromStream(pStream));
-        bool good = false;
-        UINT w = 0, h = 0;
-        if (bmp) {
-            w = bmp->GetWidth();
-            h = bmp->GetHeight();
-            if (w > 0 && h > 0) good = true;
-        }
-        if (good) {
-            BitmapData bd{};
-            Rect r(0, 0, (INT)w, (INT)h);
-            if (bmp->LockBits(&r, ImageLockModeRead, PixelFormat32bppARGB, &bd) == Ok)
-                bmp->UnlockBits(&bd);
-            Bitmap* cloned = bmp->Clone(Rect(0, 0, (INT)w, (INT)h), PixelFormat32bppARGB);
-            if (cloned && cloned->GetLastStatus() == Ok) {
-                pStream->Release();
-                return std::unique_ptr<Gdiplus::Bitmap>(cloned);
+
+        // Stream-backed image — only temporary. Do not return this pointer.
+        std::unique_ptr<Gdiplus::Bitmap> streamBmp(Gdiplus::Bitmap::FromStream(pStream));
+        std::unique_ptr<Gdiplus::Bitmap> owned;
+
+        if (streamBmp) {
+            const UINT w = streamBmp->GetWidth();
+            const UINT h = streamBmp->GetHeight();
+            if (w > 0 && h > 0) {
+                // Force full decode while stream is still valid
+                BitmapData bd{};
+                Rect r(0, 0, (INT)w, (INT)h);
+                if (streamBmp->LockBits(&r, ImageLockModeRead, PixelFormat32bppARGB, &bd) == Ok)
+                    streamBmp->UnlockBits(&bd);
+
+                // Clone → independent pixel buffer (safe after stream release)
+                Bitmap* cloned = streamBmp->Clone(r, PixelFormat32bppARGB);
+                if (cloned && cloned->GetLastStatus() == Ok && cloned->GetWidth() > 0) {
+                    owned.reset(cloned);
+                } else {
+                    delete cloned;
+                    // Fallback: draw into a new memory Bitmap (also stream-independent)
+                    std::unique_ptr<Gdiplus::Bitmap> memBmp(new Gdiplus::Bitmap((INT)w, (INT)h, PixelFormat32bppARGB));
+                    if (memBmp && memBmp->GetLastStatus() == Ok) {
+                        Graphics g(memBmp.get());
+                        if (g.GetLastStatus() == Ok) {
+                            g.DrawImage(streamBmp.get(), 0, 0, (INT)w, (INT)h);
+                            if (memBmp->GetLastStatus() == Ok && memBmp->GetWidth() > 0)
+                                owned = std::move(memBmp);
+                        }
+                    }
+                }
             }
-            pStream->Release();
-            return bmp;
         }
+
+        // Destroy stream-backed bitmap BEFORE releasing our stream ref
+        streamBmp.reset();
         pStream->Release();
-        return nullptr;
+        // Never return streamBmp — only the independent `owned` bitmap
+        return owned;
     };
 
     if (auto bmp = tryLoad(bytes)) return bmp;
-
-    // Last resort: original bytes without repair
-    if (bytes.data() != bytesIn.data() || bytes.size() != bytesIn.size())
+    if (repaired)
         return tryLoad(bytesIn);
     return nullptr;
-}
-
-// Быстрая проверка: есть ли PHOTO в raw-блоке
-static bool RawBlockHasPhoto(const std::wstring& raw) {
-    auto lines0 = SplitLines(raw);
-    auto lines = UnfoldVCard_Folded(lines0);
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const std::wstring& L = lines[i];
-        if (L.empty()) continue;
-        if (IsSection(L, L"BEGIN:VCARD") || IsSection(L, L"END:VCARD") || IsSection(L, L"VERSION")) continue;
-        size_t colon = L.find(L':'); if (colon == std::wstring::npos) continue;
-        std::wstring head = Trim(L.substr(0, colon));
-        std::wstring headUp = ToUpperASCII(head);
-        size_t dot = headUp.find(L'.');
-        if (dot != std::wstring::npos) headUp = headUp.substr(dot + 1);
-        if (headUp.rfind(L"PHOTO", 0) == 0) return true;
-    }
-    return false;
-}
-
-// Technical / binary Apple & iOS fields that should not appear as card text
-static bool IsNoiseField(const std::wstring& headUp) {
-    static const wchar_t* noise[] = {
-        L"X-ADDRESSING-GRAMMAR",
-        L"X-SHARED-PHOTO-DISPLAY-PREF",
-        L"X-IMAGETYPE",
-        L"X-IMAGEHASH",
-        L"X-ABUID",
-        L"X-ABSHOWAS",
-        L"X-ABADR",   // Apple address sub-label; not useful as a card field
-        L"UID",
-        L"PRODID",
-        L"CLIENTPIDMAP",
-    };
-    for (auto* n : noise) {
-        if (headUp.rfind(n, 0) == 0) return true;
-    }
-    return false;
 }
 
 static bool LooksLikeBinaryBlob(const std::wstring& v) {
@@ -730,12 +456,30 @@ static bool LooksLikeBinaryBlob(const std::wstring& v) {
     return total >= 60 && b64 * 10 >= total * 9;
 }
 
-// ===================== Сборка текста с локализацией и X-ABLabel значениями =====================
-static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
-    auto lines0 = SplitLines(raw);
-    auto lines = UnfoldVCard_Folded(lines0);
+// ===================== Card text from parsed Contact (no second raw parse) =====================
+static std::wstring NormalizeDisplayNewlines(std::wstring val) {
+    // \n → CRLF for Win32 RichEdit; keep other content
+    std::wstring u;
+    u.reserve(val.size() + 8);
+    for (size_t k = 0; k < val.size(); ++k) {
+        if (val[k] == L'\n') {
+            if (u.empty() || u.back() != L'\r') u += L'\r';
+            u += L'\n';
+            continue;
+        }
+        if (val[k] == L'\r') {
+            u += L'\r';
+            if (k + 1 < val.size() && val[k + 1] == L'\n') { u += L'\n'; ++k; }
+            else u += L'\n';
+            continue;
+        }
+        u += val[k];
+    }
+    return u;
+}
 
-    // Pre-collect X-ABLABELs to attach nice labels to itemN. fields instead of separate "Label:" lines
+static std::wstring BuildFromContact(const Contact& c, bool ru) {
+    // X-ABLABEL → group prefix map (item2. → "Домашние контакты")
     std::map<std::wstring, std::wstring> itemLabels;
     auto stripApple = [](std::wstring s) -> std::wstring {
         if (s.find(L"_$!<") == 0 && s.size() > 4 && s.rfind(L">!$_") == s.size() - 4)
@@ -744,18 +488,9 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             return s.substr(3, s.size() - 6);
         return s;
     };
-    for (size_t j = 0; j < lines.size(); ++j) {
-        const std::wstring& LL = lines[j];
-        if (LL.empty()) continue;
-        size_t ppos = LL.find(L':');
-        if (ppos == std::wstring::npos) continue;
-        std::wstring h = Trim(LL.substr(0, ppos));
-        std::wstring hUp = ToUpperASCII(h);
-        if (hUp.find(L"X-ABLABEL") == std::wstring::npos) continue;
-        size_t jj = j;
-        std::wstring v = CollectValuePossiblyMultiline(lines, jj, hUp);
-        // Keep original casing for custom labels (e.g. «Домашние контакты», «День ангела»)
-        std::wstring pretty = stripApple(v);
+    for (const auto& f : c.fields) {
+        if (f.prop != L"X-ABLABEL") continue;
+        std::wstring pretty = stripApple(f.value);
         std::wstring key = ToUpperASCII(pretty);
         if (key == L"HOMEPAGE") pretty = ru ? L"Домашняя страница" : L"Home page";
         else if (key == L"ANNIVERSARY") pretty = ru ? L"Годовщина" : L"Anniversary";
@@ -767,137 +502,26 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         else if (key == L"CHILD") pretty = ru ? L"Ребёнок" : L"Child";
         else if (key == L"FRIEND") pretty = ru ? L"Друг" : L"Friend";
         else if (key == L"MANAGER") pretty = ru ? L"Руководитель" : L"Manager";
-        size_t d = h.find(L'.');
-        if (d != std::wstring::npos) {
-            itemLabels[h.substr(0, d + 1)] = pretty;
-        }
-    }
-
-    // Prefer FN; skip structured N when it equals FN (Apple often has N:;Name;;; + FN:Name)
-    std::wstring fnVal;
-    for (size_t j = 0; j < lines.size(); ++j) {
-        const std::wstring& LL = lines[j];
-        size_t ppos = LL.find(L':');
-        if (ppos == std::wstring::npos) continue;
-        std::wstring hUp = ToUpperASCII(Trim(LL.substr(0, ppos)));
-        size_t dot = hUp.find(L'.');
-        if (dot != std::wstring::npos) hUp = hUp.substr(dot + 1);
-        if (hUp == L"FN" || hUp.rfind(L"FN;", 0) == 0) {
-            size_t jj = j;
-            fnVal = Trim(CollectValuePossiblyMultiline(lines, jj, hUp));
-            break;
-        }
+        size_t d = f.head.find(L'.');
+        if (d != std::wstring::npos)
+            itemLabels[f.head.substr(0, d + 1)] = pretty;
     }
 
     std::wstring out;
-    for (size_t i = 0; i < lines.size(); ++i) {
-        const std::wstring& L = lines[i];
-        if (L.empty()) continue;
-        if (IsSection(L, L"BEGIN:VCARD"))   continue;
-        if (IsSection(L, L"END:VCARD"))     continue;
-        if (IsSection(L, L"VERSION"))       continue;
+    for (const auto& f : c.fields) {
+        if (!f.show && f.prop != L"X-ABLABEL") continue;
+        if (f.prop == L"X-ABLABEL") continue;
+        if (!f.show) continue;
 
-        size_t pos = L.find(L':');
-        // Orphan PHOTO folds / pure base64 lines (no "KEY:") — never dump into card text
-        if (pos == std::wstring::npos) {
-            if (LooksLikeBinaryBlob(L)) continue;
-            continue; // ignore non-property lines
-        }
-
-        std::wstring head = Trim(L.substr(0, pos));
-        std::wstring headUp = ToUpperASCII(head);
-        // Strip itemN. / group prefix so checks work for Apple-style "item4.PHOTO", "item1.X-ABLABEL" etc.
-        {
-            size_t dot = headUp.find(L'.');
-            if (dot != std::wstring::npos) headUp = headUp.substr(dot + 1);
-        }
-        // Skip technical / binary Apple fields
-        if (IsNoiseField(headUp)) continue;
-        // Skip PHOTO fields — displayed separately in the photo panel.
-        // Only skip embedded/base64 photos (to avoid dumping huge base64 into text).
-        // URI photos (vCard 4 / some v3) should be shown as "Photo: https://..."
-        if (headUp.rfind(L"PHOTO", 0) == 0) {
-            // Always consume multi-line base64 body so following fields stay aligned
-            std::wstring skipVal = CollectValuePossiblyMultiline(lines, i, ToUpperASCII(head));
-            (void)skipVal;
-            std::wstring rawVal = (pos + 1 < L.size()) ? Trim(L.substr(pos + 1)) : L"";
-            bool isUriPhoto = rawVal.rfind(L"http://", 0) == 0 || rawVal.rfind(L"https://", 0) == 0
-                || rawVal.rfind(L"data:", 0) == 0;
-            if (!isUriPhoto) continue; // embedded / base64 → photo panel only
-            // URI photo: fall through after collect already advanced i — re-read value
-            // (already consumed; emit URI form)
-            if (!skipVal.empty() && (skipVal.rfind(L"http://", 0) == 0 || skipVal.rfind(L"https://", 0) == 0)) {
-                out += (ru ? L"Фото: " : L"Photo: ");
-                out += skipVal;
-                out += L"\r\n";
-            }
-            continue;
-        }
-        // Skip X-ABLABEL lines themselves (we attach their value to the item field above)
-        if (headUp.find(L"X-ABLABEL") != std::wstring::npos) continue;
-
-        std::wstring val = CollectValuePossiblyMultiline(lines, i, ToUpperASCII(head));
+        std::wstring val = f.value;
+        if (val.empty() && !f.isNote) continue;
         if (LooksLikeBinaryBlob(val)) continue;
-        if (val.empty()) continue;
 
-        // Clean structured fields: remove empty ;;; parts for nicer display (N, ADR, ORG)
-        if (headUp == L"N" || headUp.rfind(L"N;", 0) == 0
-            || headUp == L"ADR" || headUp.rfind(L"ADR;", 0) == 0
-            || headUp == L"ORG" || headUp.rfind(L"ORG;", 0) == 0) {
-            std::vector<std::wstring> parts;
-            size_t start = 0;
-            while (start <= val.size()) {
-                size_t semi = val.find(L';', start);
-                if (semi == std::wstring::npos) { parts.push_back(Trim(val.substr(start))); break; }
-                parts.push_back(Trim(val.substr(start, semi - start)));
-                start = semi + 1;
-            }
-            std::wstring cleaned;
-            bool isName = (headUp == L"N" || headUp.rfind(L"N;", 0) == 0);
-            for (auto& p : parts) {
-                // ADR may contain \n escapes
-                for (size_t k = 0; k + 1 < p.size(); ++k) {
-                    if (p[k] == L'\\' && (p[k + 1] == L'n' || p[k + 1] == L'N')) {
-                        p.replace(k, 2, L", ");
-                    }
-                }
-                if (!p.empty()) {
-                    if (!cleaned.empty()) cleaned += (isName ? L" " : L", ");
-                    cleaned += p;
-                }
-            }
-            if (!cleaned.empty()) val = cleaned;
-        }
-        // Unescape vCard text (RFC 2426 / 6350): \n \N = newline, \t (common), \, \; \\
-        // Win32 multiline EDIT needs CRLF to show line breaks.
-        {
-            std::wstring u;
-            u.reserve(val.size() + 8);
-            for (size_t k = 0; k < val.size(); ++k) {
-                if (val[k] == L'\\' && k + 1 < val.size()) {
-                    wchar_t n = val[k + 1];
-                    if (n == L'n' || n == L'N') { u += L"\r\n"; ++k; continue; }
-                    if (n == L't' || n == L'T') { u += L'\t'; ++k; continue; }
-                    if (n == L',' || n == L';' || n == L'\\') { u += n; ++k; continue; }
-                }
-                // Normalize bare LF → CRLF (some exporters)
-                if (val[k] == L'\n') {
-                    if (u.empty() || u.back() != L'\r') u += L'\r';
-                    u += L'\n';
-                    continue;
-                }
-                u += val[k];
-            }
-            val = std::move(u);
-        }
+        // Skip N when equal to FN
+        if (f.prop == L"N" && !c.fn.empty() && val == c.fn) continue;
 
-        // Skip empty N/FN lines (e.g. N:;;;; or FN: ) to avoid "Name: " or "Full name: "
-        if (val.empty() && (headUp == L"N" || headUp.rfind(L"N;", 0) == 0 || headUp == L"FN")) continue;
-        if ((headUp == L"N" || headUp.rfind(L"N;", 0) == 0) && !fnVal.empty() && val == fnVal)
-            continue;
-
-        // vCard 4.0: nicer GENDER / KIND display values
-        if (headUp == L"GENDER" || headUp == L"X-GENDER") {
+        // Pretty GENDER / KIND
+        if (f.prop == L"GENDER" || f.prop == L"X-GENDER") {
             std::wstring g = val;
             size_t sc = g.find(L';');
             std::wstring sex = ToUpperASCII(Trim(sc != std::wstring::npos ? g.substr(0, sc) : g));
@@ -910,111 +534,53 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             else if (sex == L"U") pretty = ru ? L"Неизвестно" : L"Unknown";
             if (!id.empty() && id != pretty) pretty += L" (" + id + L")";
             val = pretty;
-        }
-        else if (headUp == L"KIND") {
+        } else if (f.prop == L"KIND") {
             std::wstring k = ToUpperASCII(Trim(val));
             if (k == L"INDIVIDUAL") val = ru ? L"Человек" : L"Individual";
             else if (k == L"GROUP") val = ru ? L"Группа" : L"Group";
             else if (k == L"ORG" || k == L"ORGANIZATION") val = ru ? L"Организация" : L"Organization";
             else if (k == L"LOCATION") val = ru ? L"Место" : L"Location";
-            else if (k == L"DEVICE") val = ru ? L"Устройство" : L"Device";
-            else if (k == L"APPLICATION") val = ru ? L"Приложение" : L"Application";
         }
 
-        // Clean ugly Android custom lines a bit (strip vnd prefix and trailing ;;;;;;;;; )
-        if (headUp.find(L"X-ANDROID-CUSTOM") == 0) {
-            std::vector<std::wstring> parts;
-            size_t st = 0;
-            while (true) {
-                size_t s = val.find(L';', st);
-                if (s == std::wstring::npos) {
-                    parts.push_back(Trim(val.substr(st)));
-                    break;
-                }
-                parts.push_back(Trim(val.substr(st, s - st)));
-                st = s + 1;
-            }
-            if (!parts.empty()) {
-                std::wstring type = parts[0];
-                if (type.find(L"vnd.android.cursor.item/") == 0) type = type.substr(24);
-                std::wstring date = parts.size() > 1 ? parts[1] : L"";
-                std::wstring lbl = L"";
-                if (parts.size() > 3 && !parts[3].empty()) lbl = parts[3];
-                else if (parts.size() > 2 && !parts[2].empty() && parts[2] != L"0" && parts[2] != L"1") lbl = parts[2];
-                size_t scp = lbl.find(L';');
-                if (scp != std::wstring::npos) lbl = lbl.substr(0, scp);
-                std::wstring res = type;
-                if (!lbl.empty()) res += L": " + lbl;
-                if (!date.empty() && date != L"0" && date.find(L';') == std::wstring::npos) res += L" (" + date + L")";
-                val = res;
-            }
+        if (f.prop == L"X-ANDROID-CUSTOM") {
+            // already have raw; light cleanup
+            if (val.find(L"vnd.android.cursor.item/") == 0)
+                val = val.substr(24);
         }
 
-        // vCard 2.1: QUOTED-PRINTABLE + CHARSET
-        std::wstring encVal;
-        bool isQP = HeaderHasParam(headUp, L"ENCODING", &encVal) && (ToUpperASCII(encVal) == L"QUOTED-PRINTABLE");
-        if (isQP) {
-            // Определим кодировку
-            std::wstring ch;
-            UINT cp = 0;
-            if (HeaderHasParam(headUp, L"CHARSET", &ch)) {
-                std::wstring up = ToUpperASCII(ch);
-                if (up.find(L"UTF-8") != std::wstring::npos || up.find(L"UTF8") != std::wstring::npos) cp = CP_UTF8;
-                else if (up.find(L"1251") != std::wstring::npos || up.find(L"WINDOWS-1251") != std::wstring::npos) cp = 1251;
-                else if (up.find(L"CP1251") != std::wstring::npos) cp = 1251;
-                else if (up.find(L"KOI8") != std::wstring::npos) cp = 20866; // KOI8-R (best-effort)
-            }
-            auto bytes = DecodeQuotedPrintableToBytes(val);
-            val = BytesToWide(bytes, cp ? cp : CP_UTF8);
-            if (val.empty()) val = BytesToWide(bytes, 1251); // ещё раз, если UTF-8 не подошёл
-        }
+        val = NormalizeDisplayNewlines(std::move(val));
 
-        // Специальная обработка соцсетей для более чистого вида
-        if (headUp.find(L"X-SOCIALPROFILE") == 0) {
-            // Уже "Социальный профиль (twitter): url" из BuildLocalizedHead
-        }
-
-        std::wstring label = BuildLocalizedHead(head, ru);
-
-        // If this field has itemN. prefix and we have a custom label for it, use the nice label instead of standard key
-        size_t dotPos = head.find(L'.');
+        std::wstring label = BuildLocalizedHead(f.head, ru);
+        size_t dotPos = f.head.find(L'.');
         if (dotPos != std::wstring::npos) {
-            std::wstring item = head.substr(0, dotPos + 1);
-            auto it = itemLabels.find(item);
-            if (it != itemLabels.end()) {
-                label = it->second;
-            }
+            auto it = itemLabels.find(f.head.substr(0, dotPos + 1));
+            if (it != itemLabels.end()) label = it->second;
         }
-
-        // Special handling for the encoded custom fields in this vCard (from ez-vcard sample)
-        if (headUp.find(L"X-FCENCODED-") == 0) {
+        if (f.prop.rfind(L"X-FCENCODED-", 0) == 0)
             label = ru ? L"Связанное / Пользовательское" : L"Related / Custom";
-        }
 
-        // NOTE — separate block: blank line, header on its own line, body below, blank after
-        const bool isNote = (headUp == L"NOTE" || headUp.rfind(L"NOTE;", 0) == 0);
-        if (isNote) {
-            if (!out.empty() && out.size() >= 2 && !(out[out.size() - 2] == L'\r' && out[out.size() - 1] == L'\n'
-                    && out.size() >= 4 && out[out.size() - 4] == L'\r')) {
-                // ensure one blank line before note block
-                if (!(out.size() >= 4 && out[out.size() - 4] == L'\r' && out[out.size() - 3] == L'\n'
-                        && out[out.size() - 2] == L'\r' && out[out.size() - 1] == L'\n'))
-                    out += L"\r\n";
-            }
+        if (f.isNote || f.prop == L"NOTE") {
+            if (!out.empty()) out += L"\r\n";
             out += L"── ";
             out += label;
             out += L" ──\r\n";
             out += val;
-            if (val.empty() || val.back() != L'\n')
-                out += L"\r\n";
+            if (val.empty() || val.back() != L'\n') out += L"\r\n";
             out += L"\r\n";
             continue;
         }
 
-        // Two-column table row: label <TAB> value  (tab stop set on RichEdit)
         out += label;
         out += L'\t';
         out += val;
+        out += L"\r\n";
+    }
+
+    // Optional PHOTO URL line (if any, no embedded photo)
+    if (!c.photo_url.empty() && !c.photo.has_value()) {
+        out += (ru ? L"Фото" : L"Photo");
+        out += L'\t';
+        out += c.photo_url;
         out += L"\r\n";
     }
     return out;
@@ -1071,17 +637,23 @@ struct ViewState {
     Fonts fonts;
 };
 
+// GWLP_USERDATA only if hwnd is a live window (guards PhotoWndProc parent / stray HWNDs).
+static ViewState* ViewStateFromHwnd(HWND h) {
+    if (!h || !IsWindow(h)) return nullptr;
+    return reinterpret_cast<ViewState*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+}
+
 static bool ContactHasPhoto(const ViewState* st, size_t idx) {
     if (!st || idx >= st->contacts.size()) return false;
     const Contact& c = st->contacts[idx];
     if (c.photo.has_value() && !c.photo->bytes.empty()) return true;
     if (!c.photo_url.empty()) return true;
-    if (idx < st->rawBlocks.size() && RawBlockHasPhoto(st->rawBlocks[idx])) return true;
     return false;
 }
 
-static bool ContactMatchesNeedle(const Contact& c, const std::wstring& needleNorm, bool wholeWord);
+static bool ContactMatchesNeedle(const Contact& c, const std::wstring& needle, bool wholeWord, bool matchCase = false);
 static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx);
+static void UpdateMatchPosFromSelection(ViewState* st);
 
 static void RebuildVisibleList(ViewState* st) {
     if (!st) return;
@@ -1100,6 +672,7 @@ static void RebuildVisibleList(ViewState* st) {
         st->sel = st->visibleIdx.empty() ? 0 : st->visibleIdx[0];
         st->listScroll = 0;
         st->rightScroll = 0;
+        UpdateMatchPosFromSelection(st);
     }
 }
 
@@ -1246,48 +819,87 @@ static std::wstring ContactDisplayName(const Contact& c) {
     return name;
 }
 
-static bool ContactMatchesNeedle(const Contact& c, const std::wstring& needleNorm, bool wholeWord) {
-    if (needleNorm.empty()) return false;
-    auto norm = [&](const std::wstring& x) { return LowerInvariant(x); };
-    std::wstring hay;
-    auto add = [&](const std::wstring& s) { if (!s.empty()) { hay += L' '; hay += norm(s); } };
-    add(c.fn); add(c.n_given); add(c.n_family); add(c.org); add(c.title); add(c.bday); add(c.url); add(c.note);
-    add(c.gender); add(c.lang); add(c.kind);
-    for (auto& t : c.notes) add(t);
-    for (auto& t : c.phones) { add(t.number); for (auto& tp : t.types) add(tp); }
-    for (auto& e : c.emails) { add(e.addr); for (auto& tp : e.types) add(tp); }
-    for (auto& a : c.addrs) add(a.text);
-    for (auto& u : c.urls) add(u);
-    for (auto& lg : c.langs) add(lg);
-    for (auto& m : c.members) add(m);
-
-    size_t pos = hay.find(needleNorm);
-    while (pos != std::wstring::npos) {
-        if (!wholeWord || (isWordBoundary(hay, pos) && isWordBoundary2(hay, pos + needleNorm.size())))
+// Match needle inside one field; no cross-field haystring.
+// When matchCase==false, needle must already be LowerInvariant.
+static bool FieldMatchesNeedle(const std::wstring& field, const std::wstring& needle, bool wholeWord, bool matchCase) {
+    if (field.empty() || needle.empty()) return false;
+    std::wstring storage;
+    const std::wstring* hay = &field;
+    if (!matchCase) {
+        // Lower after a raw-size reject would be wrong: e.g. "ß" → "ss" grows under LCMapString.
+        storage = LowerInvariant(field);
+        hay = &storage;
+    }
+    if (hay->size() < needle.size()) return false;
+    for (size_t pos = hay->find(needle); pos != std::wstring::npos; pos = hay->find(needle, pos + 1)) {
+        if (!wholeWord || (isWordBoundary(*hay, pos) && isWordBoundary2(*hay, pos + needle.size())))
             return true;
-        pos = hay.find(needleNorm, pos + 1);
     }
     return false;
 }
 
-static void RebuildSearchFlags(ViewState* st, bool wholeWord = false) {
+static bool ContactMatchesNeedle(const Contact& c, const std::wstring& needle, bool wholeWord, bool matchCase) {
+    if (needle.empty()) return false;
+    auto check = [&](const std::wstring& s) -> bool {
+        return FieldMatchesNeedle(s, needle, wholeWord, matchCase);
+    };
+
+    // Card UI is built from fields — cover NICKNAME/IMPP/X-*/etc., not only typed members.
+    for (const auto& f : c.fields) {
+        if (!f.value.empty() && check(f.value)) return true;
+    }
+    for (const auto& ac : c.androidCustoms) {
+        if (check(ac.rawType)) return true;
+        for (const auto& slot : ac.slots) if (check(slot)) return true;
+    }
+
+    // Structured members (also used when fields is empty / partial contacts)
+    if (check(c.fn) || check(c.n_given) || check(c.n_family) || check(c.org) ||
+        check(c.title) || check(c.bday) || check(c.url) || check(c.note) ||
+        check(c.gender) || check(c.lang) || check(c.kind) || check(c.photo_url))
+        return true;
+
+    for (const auto& t : c.notes) if (check(t)) return true;
+    for (const auto& t : c.phones) {
+        if (check(t.number)) return true;
+        for (const auto& tp : t.types) if (check(tp)) return true;
+    }
+    for (const auto& e : c.emails) {
+        if (check(e.addr)) return true;
+        for (const auto& tp : e.types) if (check(tp)) return true;
+    }
+    for (const auto& a : c.addrs) if (check(a.text)) return true;
+    for (const auto& u : c.urls) if (check(u)) return true;
+    for (const auto& lg : c.langs) if (check(lg)) return true;
+    for (const auto& m : c.members) if (check(m)) return true;
+    return false;
+}
+
+// 1-based position of st->sel among matches; 0 if selection is not a match (or no search).
+static void UpdateMatchPosFromSelection(ViewState* st) {
+    if (!st) return;
+    st->matchPos = 0;
+    if (st->matchCount <= 0 || st->matchFlags.empty()) return;
+    if (st->sel >= st->matchFlags.size() || !st->matchFlags[st->sel]) return;
+    int p = 0;
+    for (size_t i = 0; i <= st->sel; ++i) if (st->matchFlags[i]) ++p;
+    st->matchPos = p;
+}
+
+static void RebuildSearchFlags(ViewState* st, bool wholeWord = false, bool matchCase = false) {
     if (!st) return;
     st->matchFlags.assign(st->contacts.size(), 0);
     st->matchCount = 0;
     st->matchPos = 0;
     if (st->searchNeedle.empty()) return;
-    std::wstring n = LowerInvariant(st->searchNeedle);
+    const std::wstring n = matchCase ? st->searchNeedle : LowerInvariant(st->searchNeedle);
     for (size_t i = 0; i < st->contacts.size(); ++i) {
-        if (ContactMatchesNeedle(st->contacts[i], n, wholeWord)) {
+        if (ContactMatchesNeedle(st->contacts[i], n, wholeWord, matchCase)) {
             st->matchFlags[i] = 1;
             st->matchCount++;
         }
     }
-    if (st->sel < st->matchFlags.size() && st->matchFlags[st->sel]) {
-        int p = 0;
-        for (size_t i = 0; i <= st->sel; ++i) if (st->matchFlags[i]) ++p;
-        st->matchPos = p;
-    }
+    UpdateMatchPosFromSelection(st);
 }
 
 // Extract value part from a card line (table: label\\tvalue, or legacy "label: value")
@@ -1373,7 +985,7 @@ static void SetClipboardTextW(HWND h, const std::wstring& text) {
 // ===================== Левая панель (список) =====================
 static int DlgSBW() { return GetSystemMetrics(SM_CXVSCROLL); }
 static int ListPaneWidth(HWND h) {
-    auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    auto* st = ViewStateFromHwnd(h);
     int def96 = 300;
     int w96 = (st && st->listPaneW96 > 0) ? st->listPaneW96 : def96;
     int w = S(h, w96);
@@ -1666,32 +1278,11 @@ static void UpdateRightPanel(ViewState* st) {
         }
         photoUrl = c.photo_url;
     }
-    if (!st->photo && st->sel < st->rawBlocks.size()) {
-        st->photo = LoadPhotoFromRaw(st->rawBlocks[st->sel]);
-    }
-    // Optional HTTP(S) photo (ini LoadPhotoUrl=1). Default off — no network by default.
-    if (!st->photo && st->loadPhotoUrl) {
-        if (photoUrl.empty() && st->sel < st->rawBlocks.size()) {
-            // try extract first PHOTO:http from raw (BuildFromRawBlock skips embedded only)
-            auto lines = UnfoldVCard_Folded(SplitLines(st->rawBlocks[st->sel]));
-            for (auto& L : lines) {
-                size_t cpos = L.find(L':');
-                if (cpos == std::wstring::npos) continue;
-                std::wstring head = ToUpperASCII(Trim(L.substr(0, cpos)));
-                size_t d = head.find(L'.');
-                if (d != std::wstring::npos) head = head.substr(d + 1);
-                if (head.rfind(L"PHOTO", 0) != 0) continue;
-                std::wstring v = Trim(L.substr(cpos + 1));
-                if (v.rfind(L"http://", 0) == 0 || v.rfind(L"https://", 0) == 0) {
-                    photoUrl = v;
-                    break;
-                }
-            }
-        }
-        if (!photoUrl.empty()) {
-            auto bytes = HttpGetBytes(photoUrl);
-            if (!bytes.empty()) st->photo = BitmapFromMemory(bytes);
-        }
+    // Photo already decoded in Contact by parser (no second raw PHOTO parse)
+    // Optional HTTP(S) photo (ini LoadPhotoUrl=1)
+    if (!st->photo && st->loadPhotoUrl && !photoUrl.empty()) {
+        auto bytes = HttpGetBytes(photoUrl);
+        if (!bytes.empty()) st->photo = BitmapFromMemory(bytes);
     }
     if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
 
@@ -1704,49 +1295,11 @@ static void UpdateRightPanel(ViewState* st) {
         }
     }
 
-    // текст
+    // текст — only from already-parsed Contact.fields (no raw re-parse)
     if (IsWindow(st->hEdit)) {
         std::wstring text;
-        if (st->sel < st->rawBlocks.size() && !st->rawBlocks[st->sel].empty()) {
-            text = BuildFromRawBlock(st->rawBlocks[st->sel], g_tcRu);
-        }
-        else if (st->sel < st->contacts.size()) {
-            const Contact& c = st->contacts[st->sel];
-            auto add = [&](const std::wstring& k, const std::wstring& v) {
-                if (v.empty()) return;
-                text += k; text += L'\t'; text += v; text += L"\r\n";
-            };
-            std::wstring name = !c.fn.empty() ? c.fn : (c.n_given + (c.n_family.empty() ? L"" : L" ") + c.n_family);
-            if (name.empty()) name = L"(no name)";
-            add(g_tcRu ? L"Имя" : L"Name", name);
-            add(g_tcRu ? L"Тип контакта" : L"Kind", c.kind);
-            add(g_tcRu ? L"Пол" : L"Gender", c.gender);
-            add(g_tcRu ? L"Язык" : L"Language", c.lang);
-            for (auto& lg : c.langs) if (lg != c.lang) add(g_tcRu ? L"Язык" : L"Language", lg);
-            add(g_tcRu ? L"Компания" : L"Organization", c.org);
-            add(g_tcRu ? L"Должность" : L"Role", c.title);
-            if (!c.urls.empty()) { for (auto& u : c.urls) add(L"URL", u); }
-            else add(L"URL", c.url);
-            add(g_tcRu ? L"День рождения" : L"Birthday", c.bday);
-            for (auto& m : c.members) add(g_tcRu ? L"Участник" : L"Member", m);
-            for (auto& p : c.phones) if (!p.number.empty()) add(g_tcRu ? L"Телефон" : L"Phone", p.number);
-            bool any = false; for (auto& e : c.emails) { if (!e.addr.empty()) { add(L"Email", e.addr); any = true; } }
-            if (!any) { std::wstring fb = FallbackEmail_NotesAware(c); if (!fb.empty()) add(L"Email", fb); }
-            for (auto& a : c.addrs) if (!a.text.empty()) add(g_tcRu ? L"Адрес" : L"Address", a.text);
-            if constexpr (detail_detect::has_notes<Contact>::value) {
-                for (auto& n : c.notes) if (!n.empty()) {
-                    text += L"── "; text += (g_tcRu ? L"Заметка" : L"Note"); text += L" ──\r\n";
-                    text += n; text += L"\r\n\r\n";
-                }
-            } else if (!c.note.empty()) {
-                text += L"── "; text += (g_tcRu ? L"Заметка" : L"Note"); text += L" ──\r\n";
-                text += c.note; text += L"\r\n\r\n";
-            }
-        }
-        else {
-            text = L"";
-        }
-        // Preserve focus: EM_SETSEL can steal it from filter or list
+        if (st->sel < st->contacts.size())
+            text = BuildFromContact(st->contacts[st->sel], g_tcRu);
         HWND keepFocus = GetFocus();
         SetCardEditText(st->hEdit, text, st->fonts.hNorm);
         if (keepFocus && IsWindow(keepFocus) && GetFocus() != keepFocus)
@@ -1806,7 +1359,7 @@ static bool NavigateVisibleList(HWND h, ViewState* st, WPARAM key) {
 static LRESULT CALLBACK EscChildSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
     UINT_PTR idSubClass, DWORD_PTR data) {
     HWND viewer = (HWND)data;
-    auto* st = viewer ? (ViewState*)GetWindowLongPtrW(viewer, GWLP_USERDATA) : nullptr;
+    auto* st = ViewStateFromHwnd(viewer);
 
     // TC Lister uses dialog-like keyboard routing; without WANTARROWS Up/Down never reach us
     if (msg == WM_GETDLGCODE) {
@@ -1957,8 +1510,8 @@ static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LP
 
 // Окно превью фото
 static LRESULT CALLBACK PhotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    HWND parent = GetParent(hwnd);
-    auto* st = (ViewState*)GetWindowLongPtrW(parent, GWLP_USERDATA);
+    // Parent must be our viewer; never trust GWLP_USERDATA on a dead/foreign HWND.
+    auto* st = ViewStateFromHwnd(GetParent(hwnd));
     switch (msg) {
     case WM_ERASEBKGND: {
         // Paint will cover everything via double buffer; prevent default erase to reduce flicker
@@ -2037,6 +1590,9 @@ static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
     if (!st || st->contacts.empty()) return;
     if (idx >= st->contacts.size()) idx = st->contacts.size() - 1;
     st->sel = idx; st->rightScroll = 0; EnsureSelVisible(h, st);
+    // Keep status-bar "Found: p/N" in sync when selection changes via click/arrows
+    // (SearchEx already updates matchPos; manual selection did not).
+    UpdateMatchPosFromSelection(st);
 
     UpdateRightPanel(st);
 
@@ -2484,10 +2040,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (row >= 0 && (x < listW || x < listPane)) {
                 size_t idx = VisibleContact(st, st->listScroll + row);
                 if (idx != (size_t)-1 && idx < st->contacts.size()) {
-                    st->sel = idx; st->rightScroll = 0;
-                    UpdateRightPanel(st);
+                    SetSelectionAndReveal(h, st, idx);
                     SetFocus(h); // again: UpdateRightPanel must not leave focus on hEdit
-                    InvalidateRect(h, nullptr, FALSE);
                     return 0;
                 }
             }
@@ -2510,20 +2064,24 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
-        // Tooltip for long list names
+        // Tooltip for long list names (same hit-test as list click: filter offset + visibleIdx)
         if (st->hTip) {
             RECT rcClient{}; GetClientRect(h, &rcClient);
             int statusH = S(h, 18);
+            int filterH = S(h, 26);
+            int filterPad = S(h, 4);
+            int listTop = filterPad + filterH + filterPad;
             int listW = ListPaneWidth(h);
             int pad = S(h, 8);
             int tipRow = -1;
             std::wstring tipText;
-            if (x < listW && y < rcClient.bottom - statusH) {
+            if (x < listW && y >= listTop && y < rcClient.bottom - statusH) {
                 int rowH = st->listItemH ? st->listItemH : S(h, 60);
-                int row = (y - pad) / rowH;
+                if (rowH <= 0) rowH = S(h, 60);
+                int row = (y - listTop - pad) / rowH;
                 if (row >= 0 && row < st->perPage) {
-                    size_t idx = (size_t)(st->listScroll + row);
-                    if (idx < st->contacts.size()) {
+                    size_t idx = VisibleContact(st, st->listScroll + row);
+                    if (idx != (size_t)-1 && idx < st->contacts.size()) {
                         tipRow = (int)idx;
                         tipText = ContactDisplayName(st->contacts[idx]);
                         if (tipText.empty()) tipText = g_tcRu ? L"(пустая карточка)" : L"(empty card)";
@@ -2815,58 +2373,79 @@ size_t VCFView_Count(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_
 size_t VCFView_GetSelection(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); return st ? st->sel : 0; }
 void VCFView_SetSelection(HWND h, size_t idx) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
-    if (idx < st->contacts.size()) { st->sel = idx; st->rightScroll = 0; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); 
-        RECT rc; GetClientRect(h, &rc); SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom)); }
+    if (idx < st->contacts.size()) {
+        SetSelectionAndReveal(h, st, idx);
+        RECT rc; GetClientRect(h, &rc); SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+    }
 }
 
 // Поиск — по разобранным полям; подсветка совпадений + счётчик в статусбаре
-bool VCFView_SearchEx(HWND h, const std::wstring& needle, size_t startIndex, bool backwards, bool /*matchCase*/, bool wholeWord, bool wrap) {
+bool VCFView_SearchEx(HWND h, const std::wstring& needle, size_t startIndex, bool backwards, bool matchCase, bool wholeWord, bool wrap) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
     if (!st || st->contacts.empty() || needle.empty()) return false;
 
     st->searchNeedle = needle;
-    RebuildSearchFlags(st, wholeWord);
+    RebuildSearchFlags(st, wholeWord, matchCase);
 
-    auto norm = [&](const std::wstring& x) { return LowerInvariant(x); };
-    std::wstring n = norm(needle);
-
+    const std::wstring n = matchCase ? needle : LowerInvariant(needle);
     const size_t count = st->contacts.size();
-    auto nextIndex = [&](size_t i)->size_t { return backwards ? (i == 0 ? count - 1 : i - 1) : (i + 1 == count ? 0 : i + 1); };
+    auto nextIndex = [&](size_t i) -> size_t {
+        return backwards ? (i == 0 ? count - 1 : i - 1) : (i + 1 == count ? 0 : i + 1);
+    };
 
-    size_t i = startIndex % count, first = i;
-    do {
-        if (i < st->matchFlags.size() && st->matchFlags[i]) {
-            // verify whole-word against same helper
-            if (ContactMatchesNeedle(st->contacts[i], n, wholeWord)) {
-                st->sel = i;
-                st->rightScroll = 0;
-                // update matchPos among matches
-                int p = 0;
-                for (size_t k = 0; k <= i; ++k) if (k < st->matchFlags.size() && st->matchFlags[k]) ++p;
-                st->matchPos = p;
-                EnsureSelVisible(h, st);
-                UpdateRightPanel(st);
-                // highlight needle in EDIT text if present
-                if (IsWindow(st->hEdit)) {
-                    int len = GetWindowTextLengthW(st->hEdit);
-                    if (len > 0) {
-                        std::wstring all((size_t)len, L'\0');
-                        GetWindowTextW(st->hEdit, &all[0], len + 1);
-                        std::wstring low = LowerInvariant(all);
-                        size_t pos = low.find(n);
-                        if (pos != std::wstring::npos)
-                            SendMessageW(st->hEdit, EM_SETSEL, (WPARAM)pos, (LPARAM)(pos + n.size()));
-                    }
+    auto selectHit = [&](size_t i) -> bool {
+        if (i >= st->matchFlags.size() || !st->matchFlags[i]) return false;
+        if (!ContactMatchesNeedle(st->contacts[i], n, wholeWord, matchCase)) return false;
+        st->sel = i;
+        st->rightScroll = 0;
+        UpdateMatchPosFromSelection(st);
+        EnsureSelVisible(h, st);
+        UpdateRightPanel(st);
+        if (IsWindow(st->hEdit)) {
+            int len = GetWindowTextLengthW(st->hEdit);
+            if (len > 0) {
+                std::wstring all((size_t)len, L'\0');
+                GetWindowTextW(st->hEdit, &all[0], len + 1);
+                size_t pos = std::wstring::npos;
+                if (matchCase) {
+                    pos = all.find(needle);
+                } else {
+                    std::wstring low = LowerInvariant(all);
+                    pos = low.find(n);
                 }
-                InvalidateRect(h, nullptr, FALSE);
-                return true;
+                if (pos != std::wstring::npos)
+                    SendMessageW(st->hEdit, EM_SETSEL, (WPARAM)pos, (LPARAM)(pos + needle.size()));
             }
         }
-        i = nextIndex(i);
-    } while (wrap && i != first);
+        InvalidateRect(h, nullptr, FALSE);
+        return true;
+    };
 
-    InvalidateRect(h, nullptr, FALSE); // still show match highlights even if wrap failed mid-way
+    const size_t start = startIndex % count;
+    if (wrap) {
+        size_t i = start;
+        do {
+            if (selectHit(i)) return true;
+            i = nextIndex(i);
+        } while (i != start);
+    } else if (backwards) {
+        for (size_t i = start + 1; i-- > 0; )
+            if (selectHit(i)) return true;
+    } else {
+        for (size_t i = start; i < count; ++i)
+            if (selectHit(i)) return true;
+    }
+
+    InvalidateRect(h, nullptr, FALSE); // still show match highlights even if no hit selected
     return false;
+}
+
+bool VCFView_Search(HWND h, const std::wstring& needle) {
+    const size_t count = VCFView_Count(h);
+    if (count == 0 || needle.empty()) return false;
+    size_t start = VCFView_GetSelection(h);
+    start = (start + 1) % count;
+    return VCFView_SearchEx(h, needle, start, /*backwards*/false, /*matchCase*/false, /*wholeWord*/false, /*wrap*/true);
 }
 
 bool VCFView_CopyActive(HWND h) {

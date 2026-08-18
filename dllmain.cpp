@@ -69,16 +69,16 @@ static void ApplyShowFlagsTheme(HWND hView, int showFlags) {
     VCFView_SetTCDarkMode(dark ? 1 : 0, hView);
 }
 
-// ANSI → UTF-16 (твоя версия с malloc, чтобы no unwinding)
+// ANSI → UTF-16
 static std::wstring A2W(const char* s) {
     if (!s) return L"";
     int need = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
     if (need <= 0) return L"";
-    wchar_t* buf = (wchar_t*)malloc(need * sizeof(wchar_t));
-    if (!buf) return L"";
-    MultiByteToWideChar(CP_ACP, 0, s, -1, buf, need);
-    std::wstring w(buf);
-    free(buf);
+    // need includes the trailing L'\0' written by MultiByteToWideChar(-1)
+    std::wstring w(static_cast<size_t>(need), L'\0');
+    if (MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), need) <= 0)
+        return L"";
+    w.resize(static_cast<size_t>(need - 1));
     return w;
 }
 

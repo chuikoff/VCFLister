@@ -9,7 +9,6 @@
 #include <vector>
 #include <algorithm>
 #include <cwctype>
-#include <type_traits> // <-- добавлено для SFINAE-хелперов
 
 #include "vcf_parser.hpp"
 #include "vcf_utils.hpp"
@@ -44,17 +43,42 @@ static std::wstring unquote(const std::wstring& s) {
     return s;
 }
 
+// Prefer shared UnescapeVCard; keep name for local call sites
 static std::wstring unescape(const std::wstring& s) {
-    std::wstring r; r.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == L'\\' && i + 1 < s.size()) {
-            wchar_t c = s[i + 1];
-            if (c == L'n' || c == L'N') { r.push_back(L'\n'); ++i; continue; }
-            if (c == L',' || c == L';' || c == L'\\' || c == L':') { r.push_back(c); ++i; continue; }
-        }
-        r.push_back(s[i]);
+    return UnescapeVCard(s);
+}
+
+static bool isHiddenProp(const std::wstring& prop) {
+    // Not shown as card text (photo rendered separately; labels applied to groups)
+    return prop == L"BEGIN" || prop == L"END" || prop == L"VERSION"
+        || prop == L"PHOTO" || prop == L"X-ABLABEL"
+        || prop == L"UID" || prop == L"PRODID" || prop == L"CLIENTPIDMAP"
+        || prop == L"X-ADDRESSING-GRAMMAR" || prop == L"X-ABUID" || prop == L"X-ABSHOWAS"
+        || prop == L"X-IMAGETYPE" || prop == L"X-IMAGEHASH"
+        || prop == L"X-SHARED-PHOTO-DISPLAY-PREF";
+}
+
+static void pushField(Contact& c, const std::wstring& prop, const std::wstring& head,
+    const std::wstring& value, bool isNote = false) {
+    CardField f;
+    f.prop = prop;
+    f.head = head;
+    f.value = value;
+    f.isNote = isNote;
+    f.show = !isHiddenProp(prop) && !(value.empty() && !isNote);
+    // Always keep X-ABLABEL for label resolution even if hidden
+    if (prop == L"X-ABLABEL") {
+        f.show = false;
+        f.value = value;
+        c.fields.push_back(std::move(f));
+        return;
     }
-    return r;
+    if (!f.show && prop != L"PHOTO") return;
+    if (prop == L"PHOTO") {
+        f.show = false; // photo panel only
+        f.value.clear();
+    }
+    c.fields.push_back(std::move(f));
 }
 
 // split по ';' с учётом экранирования "\;"
@@ -71,155 +95,9 @@ static std::vector<std::wstring> splitSemicolonEscaped(const std::wstring& s) {
     return out;
 }
 
-// --- Base64 decode (ASCII, игнорирует пробелы/переводы строк) ---
-static std::vector<uint8_t> Base64Decode(const std::string& s) {
-    auto val = [](unsigned char c)->int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-        };
-    std::vector<uint8_t> out;
-    int v = 0, vb = -8;
-    for (unsigned char c : s) {
-        if (c <= ' ') continue; // пропускаем пробелы/CRLF/TAB
-        if (c == '=') break; // stop on padding
-        int d = val(c);
-        if (d < 0) continue;
-        v = (v << 6) | d;
-        vb += 6;
-        if (vb >= 0) {
-            out.push_back((uint8_t)((v >> vb) & 0xFF));
-            vb -= 8;
-        }
-    }
-    return out;
-}
-
-// Разворачивание «сложенных» строк: строки, начинающиеся с пробела/таба, — продолжение предыдущей
-static std::vector<std::wstring> unfoldLines_fold_prefix(const std::wstring& text) {
-    std::vector<std::wstring> raw;
-    std::wstring cur;
-    size_t i = 0, n = text.size();
-    while (i < n) {
-        size_t j = i;
-        while (j < n && text[j] != L'\r' && text[j] != L'\n') ++j;
-        std::wstring line = text.substr(i, j - i);
-
-        if (j < n && text[j] == L'\r') ++j;
-        if (j < n && text[j] == L'\n') ++j;
-
-        if (!line.empty() && (line[0] == L' ' || line[0] == L'\t')) {
-            if (!cur.empty()) cur += line.substr(1);
-            else cur = line.substr(1);
-        }
-        else {
-            if (!cur.empty()) raw.push_back(cur);
-            cur = line;
-        }
-        i = j;
-    }
-    if (!cur.empty()) raw.push_back(cur);
-    return raw;
-}
-
-// map CHARSET -> Windows CP
-static UINT codepageFromCharset(std::wstring cs) {
-    cs = upper(cs);
-    if (cs == L"UTF-8" || cs == L"UTF8") return CP_UTF8;
-    if (cs == L"UTF-16" || cs == L"UTF16" || cs == L"UTF-16LE") return 1200;
-    if (cs == L"WINDOWS-1251" || cs == L"CP1251" || cs == L"WIN-1251") return 1251;
-    if (cs == L"KOI8-R" || cs == L"KOI8R") return 20866;
-    if (cs == L"ISO-8859-5" || cs == L"ISO8859-5") return 28595;
-    if (cs == L"ISO-8859-1" || cs == L"ISO8859-1" || cs == L"LATIN1") return 28591;
-    return CP_UTF8;
-}
-
-static std::string w2ascii(const std::wstring& w) {
-    std::string s; s.reserve(w.size());
-    for (wchar_t ch : w) s.push_back((char)((ch < 128) ? ch : '?'));
-    return s;
-}
-
-// Quoted-Printable decode to bytes; handles soft breaks "=\r\n" / "=\n" / trailing '='
-static std::vector<unsigned char> decodeQP(const std::string& in) {
-    std::vector<unsigned char> out; out.reserve(in.size());
-    const size_t n = in.size();
-    for (size_t i = 0; i < n; ) {
-        unsigned char c = (unsigned char)in[i];
-        if (c == '=') {
-            // soft line break: "=\r\n", "=\n", or lone trailing '=' at end of value (vCard 2.1)
-            if (i + 1 >= n) break; // trailing soft-break marker — drop it
-            if (in[i + 1] == '\r' && i + 2 < n && in[i + 2] == '\n') { i += 3; continue; }
-            if (in[i + 1] == '\n' || in[i + 1] == '\r') { i += 2; continue; }
-            // whitespace after '=' can appear after unfold/join glitches
-            if (in[i + 1] == ' ' || in[i + 1] == '\t') { i += 2; continue; }
-            auto hex = [&](char x)->int {
-                if (x >= '0' && x <= '9') return x - '0';
-                if (x >= 'A' && x <= 'F') return 10 + (x - 'A');
-                if (x >= 'a' && x <= 'f') return 10 + (x - 'a');
-                return -1;
-                };
-            if (i + 2 < n) {
-                int h1 = hex(in[i + 1]), h2 = hex(in[i + 2]);
-                if (h1 >= 0 && h2 >= 0) { out.push_back((unsigned char)((h1 << 4) | h2)); i += 3; continue; }
-            }
-            // incomplete '=' at end → soft break, not literal
-            if (i + 1 == n - 1 && hex(in[i + 1]) >= 0) break;
-            out.push_back('=');
-            ++i;
-        }
-        else {
-            out.push_back(c);
-            ++i;
-        }
-    }
-    return out;
-}
-
-static std::wstring mbToWide(const unsigned char* data, int len, UINT cp) {
-    DWORD flags = (cp == CP_UTF8) ? MB_ERR_INVALID_CHARS : 0;
-    int wlen = MultiByteToWideChar(cp, flags, (LPCCH)data, len, nullptr, 0);
-    if (wlen <= 0) return L"";
-    std::wstring w(wlen, L'\0');
-    MultiByteToWideChar(cp, flags, (LPCCH)data, len, &w[0], wlen);
-    return w;
-}
-
-// Strip leftover QP soft-break markers and trailing whitespace after decode
-static std::wstring stripQpArtifacts(std::wstring s) {
-    while (!s.empty()) {
-        wchar_t c = s.back();
-        if (c == L'=' || c == L' ' || c == L'\t' || c == L'\r' || c == L'\n')
-            s.pop_back();
-        else
-            break;
-    }
-    // also remove orphan soft-break '=' stuck mid-string before newline (rare after bad joins)
-    std::wstring r; r.reserve(s.size());
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == L'=' && i + 1 < s.size() && (s[i + 1] == L'\n' || s[i + 1] == L'\r'))
-            continue;
-        r.push_back(s[i]);
-    }
-    return r;
-}
-
+// Text decode — shared VcfDecodeTextValue (QP + charset + unescape)
 static std::wstring decodeTextValue(const std::wstring& wval, bool isQP, const std::wstring& charset) {
-    if (!isQP) {
-        // Even without ENCODING=QP, some exports leave a trailing soft-break '=' on FN/N
-        if (!wval.empty() && wval.back() == L'=') {
-            std::wstring t = wval;
-            while (!t.empty() && t.back() == L'=') t.pop_back();
-            return t;
-        }
-        return wval;
-    }
-    std::string ascii = w2ascii(wval);
-    auto bytes = decodeQP(ascii);
-    return stripQpArtifacts(mbToWide(bytes.data(), (int)bytes.size(), codepageFromCharset(charset)));
+    return VcfDecodeTextValue(wval, isQP, charset);
 }
 
 // item1.EMAIL -> EMAIL
@@ -260,45 +138,17 @@ static void setEmbeddedPhoto(Contact& c, std::vector<uint8_t> bytes)
     c.photo = std::move(ph);
 }
 
-/* ===========================
-   SFINAE-хелперы для новых полей
-   =========================== */
-
-   // addNote: если у Contact есть vector<wstring> notes — пушим туда; иначе аккуратно накапливаем в contact.note
-template<typename T>
-static auto addNoteImpl(T& c, const std::wstring& txt, int)
--> decltype(c.notes.push_back(txt), void())
-{
-    c.notes.push_back(txt);
-    if (c.note.empty()) c.note = txt; // совместимость
-}
-static void addNoteImpl(...) { /* no-op fallback */ }
-
 static void addNote(Contact& c, const std::wstring& txt) {
     if (txt.empty()) return;
-    // попытка положить в notes (если есть)
-    addNoteImpl(c, txt, 0);
-    // если поля notes нет — склеиваем в note (с пустой строкой между)
-    if (c.notes.size() == 0) {
-        if (c.note.empty()) c.note = txt;
-        else                c.note += L"\n\n" + txt;
-    }
+    c.notes.push_back(txt);
+    if (c.note.empty()) c.note = txt; // primary note for list/compat
 }
 
-// addAndroidCustom: если у Contact есть vector<AndroidCustom> androidCustoms — записываем; иначе no-op
-template<typename T>
-static auto addAndroidImpl(T& c, const std::wstring& rawType, const std::vector<std::wstring>& slots, int)
--> decltype(c.androidCustoms.push_back(typename T::AndroidCustom{}), void())
-{
-    typename T::AndroidCustom ac;
+static void addAndroidCustom(Contact& c, const std::wstring& rawType, const std::vector<std::wstring>& slots) {
+    Contact::AndroidCustom ac;
     ac.rawType = rawType;
     ac.slots = slots;
     c.androidCustoms.push_back(std::move(ac));
-}
-static void addAndroidImpl(...) { /* no-op */ }
-
-static void addAndroidCustom(Contact& c, const std::wstring& rawType, const std::vector<std::wstring>& slots) {
-    addAndroidImpl(c, rawType, slots, 0);
 }
 
 // ---------- main parser ----------
@@ -306,8 +156,8 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
 {
     std::vector<Contact> contacts;
 
-    // 1) Разворачиваем «сложенные» строки: продолжения начинаются с пробела/таба
-    auto lines = unfoldLines_fold_prefix(text);
+    // One shared unfold path (same as UI utilities)
+    auto lines = UnfoldVCard_Folded(SplitLines(text));
 
     Contact cur;
     bool inCard = false;
@@ -409,70 +259,105 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             while (!value.empty() && value.back() == L'=') value.pop_back();
         }
 
-        // ----- раскладываем по полям -----
+        // ----- structured Contact + CardField (single pass) -----
         if (propName == L"N") {
             auto vs = split(value, L';');
             if (vs.size() >= 1) cur.n_family = unescape(decodeTextValue(vs[0], encQP, charset));
             if (vs.size() >= 2) cur.n_given = unescape(decodeTextValue(vs[1], encQP, charset));
+            // display: cleaned name parts
+            std::wstring disp;
+            for (auto& part : vs) {
+                auto t = trim(unescape(decodeTextValue(part, encQP, charset)));
+                if (t.empty()) continue;
+                if (!disp.empty()) disp += L" ";
+                disp += t;
+            }
+            pushField(cur, propName, left, disp);
         }
         else if (propName == L"FN") {
             cur.fn = unescape(decodeTextValue(value, encQP, charset));
+            pushField(cur, propName, left, cur.fn);
         }
         else if (propName == L"ORG") {
             cur.org = unescape(decodeTextValue(value, encQP, charset));
+            // clean ;;;
+            auto vs = split(cur.org, L';');
+            std::wstring cleaned;
+            for (auto& part : vs) {
+                auto t = trim(part);
+                if (t.empty()) continue;
+                if (!cleaned.empty()) cleaned += L", ";
+                cleaned += t;
+            }
+            if (!cleaned.empty()) cur.org = cleaned;
+            pushField(cur, propName, left, cur.org);
         }
         else if (propName == L"TITLE") {
             cur.title = unescape(decodeTextValue(value, encQP, charset));
+            pushField(cur, propName, left, cur.title);
         }
         else if (propName == L"URL") {
             std::wstring u = unescape(decodeTextValue(value, encQP, charset));
             if (!u.empty()) {
                 if (cur.url.empty()) cur.url = u;
                 cur.urls.push_back(u);
+                pushField(cur, propName, left, u);
             }
         }
         else if (propName == L"BDAY") {
             cur.bday = unescape(decodeTextValue(value, encQP, charset));
+            pushField(cur, propName, left, cur.bday);
         }
         else if (propName == L"GENDER") {
-            // v4: sex[;identity]  e.g. "M" or "M;Male" or "U"
             cur.gender = unescape(decodeTextValue(value, encQP, charset));
+            pushField(cur, propName, left, cur.gender);
         }
         else if (propName == L"LANG") {
             std::wstring lg = unescape(decodeTextValue(value, encQP, charset));
             if (!lg.empty()) {
                 if (cur.lang.empty()) cur.lang = lg;
                 cur.langs.push_back(lg);
+                pushField(cur, propName, left, lg);
             }
         }
         else if (propName == L"KIND") {
             cur.kind = unescape(decodeTextValue(value, encQP, charset));
+            pushField(cur, propName, left, cur.kind);
         }
         else if (propName == L"MEMBER") {
             std::wstring m = unescape(decodeTextValue(value, encQP, charset));
-            if (!m.empty()) cur.members.push_back(m);
+            if (!m.empty()) {
+                cur.members.push_back(m);
+                pushField(cur, propName, left, m);
+            }
         }
         else if (propName == L"X-GENDER") {
-            // legacy companion to GENDER
             if (cur.gender.empty())
                 cur.gender = unescape(decodeTextValue(value, encQP, charset));
+            pushField(cur, propName, left, unescape(decodeTextValue(value, encQP, charset)));
         }
         else if (propName == L"NOTE") {
-            // РАНЬШЕ: перезатирали одно поле note (терялись много NOTE)  [исходник: см. блок NOTE]
-            // ТЕПЕРЬ: накапливаем все заметки (или конкатенируем, если в модели нет vector<notes>)
-            addNote(cur, unescape(decodeTextValue(value, encQP, charset)));
+            std::wstring nt = unescape(decodeTextValue(value, encQP, charset));
+            addNote(cur, nt);
+            pushField(cur, propName, left, nt, true);
         }
         else if (propName == L"TEL") {
             Phone p;
             p.number = unescape(decodeTextValue(value, encQP, charset));
             p.types = parseTypes(params);
-            if (!p.number.empty()) cur.phones.push_back(std::move(p));
+            if (!p.number.empty()) {
+                cur.phones.push_back(p);
+                pushField(cur, propName, left, p.number);
+            }
         }
         else if (propName == L"EMAIL") {
             Email e;
             e.addr = unescape(decodeTextValue(value, encQP, charset));
             e.types = parseTypes(params);
-            if (!e.addr.empty()) cur.emails.push_back(std::move(e));
+            if (!e.addr.empty()) {
+                cur.emails.push_back(e);
+                pushField(cur, propName, left, e.addr);
+            }
         }
         else if (propName == L"ADR") {
             auto vs = split(unescape(decodeTextValue(value, encQP, charset)), L';');
@@ -485,19 +370,16 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             if (!joined.empty()) {
                 Address a; a.text = joined;
                 cur.addrs.push_back(std::move(a));
+                pushField(cur, propName, left, joined);
             }
         }
         else if (propName == L"PHOTO") {
-            // 1) PHOTO;VALUE=URL:...
             if (photoIsURL) {
                 cur.photo_url = unescape(decodeTextValue(value, encQP, charset));
             }
-            // 2) PHOTO;ENCODING=BASE64: (в v2.1 строки часто «сложены» с пробелом в начале)
             else if (photoIsBase64) {
-                // склеим возможные продолжения (начинаются с пробела/таба)
                 size_t j = idx;
                 std::wstring fullValue = value;
-                
                 while (j + 1 < lines.size()) {
                     const std::wstring& nxt = lines[j + 1];
                     if (!nxt.empty() && (nxt[0] == L' ' || nxt[0] == L'\t')) {
@@ -507,21 +389,12 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                     else break;
                 }
                 idx = j;
-
-                // wstring -> ASCII (base64 ASCII-only)
-                std::string b64; b64.reserve(fullValue.size());
-                for (wchar_t wc : fullValue) if (wc <= 0x7F) b64.push_back((char)wc);
-
-                auto bytes = Base64Decode(b64);
-                setEmbeddedPhoto(cur, std::move(bytes));
+                setEmbeddedPhoto(cur, VcfBase64Decode(fullValue));
             }
-            // 3) Добавим более широкую обработку фото в BASE64 формате, даже если не указано ENCODING=BASE64
+            // 3) BASE64 without ENCODING= (or bare ;JPEG)
             else {
-                // Сначала проверим, нужно ли склеить многострочные данные (для случая без ENCODING=BASE64)
                 size_t j = idx;
                 std::wstring fullValue = value;
-                
-                // Проверим, начинаются ли следующие строки с пробела/таба (возможные продолжения BASE64 данных)
                 while (j + 1 < lines.size()) {
                     const std::wstring& nxt = lines[j + 1];
                     if (!nxt.empty() && (nxt[0] == L' ' || nxt[0] == L'\t')) {
@@ -530,63 +403,19 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                     }
                     else break;
                 }
-                
-                // Обновим индекс, если были найдены продолжения
-                if (j > idx) {
-                    idx = j;
-                }
-                
-                // Удалим пробельные символы и проверим, похожи ли данные на BASE64
-                std::wstring cleanValue = fullValue;
-                cleanValue.erase(std::remove_if(cleanValue.begin(), cleanValue.end(),
-                    [](wchar_t c) { return c == L'\r' || c == L'\n' || c == L' ' || c == L'\t'; }), cleanValue.end());
-                
-                // Проверим, является ли значение похожим на BASE64 (содержит допустимые символы и имеет подходящую длину)
-                bool looksLikeBase64 = true;
-                size_t validChars = 0;
-                for (wchar_t c : cleanValue) {
-                    if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') ||
-                        (c >= L'0' && c <= L'9') || c == L'+' || c == L'/' || c == L'=') {
-                        validChars++;
-                    } else {
-                        // Разрешаем только BASE64-символы
-                        if (c != L'\r' && c != L'\n' && c != L' ' && c != L'\t') {
-                            looksLikeBase64 = false;
-                            break;
-                        }
-                    }
-                }
-                
-                // Если строка содержит BASE64-символы и длина подходящая, пробуем декодировать
-                if (looksLikeBase64 && validChars > 0 && cleanValue.length() > 10) {
-                    // Проверим, что длина кратна 4 (для BASE64) или может быть дополнена до кратной 4
-                    std::wstring paddedValue = cleanValue;
-                    while (paddedValue.length() % 4 != 0) {
-                        paddedValue += L'=';
-                    }
-                    
-                    std::string b64; b64.reserve(paddedValue.size());
-                    for (wchar_t wc : paddedValue) if (wc <= 0x7F) b64.push_back((char)wc);
-                    
-                    auto bytes = Base64Decode(b64);
-                    if (!bytes.empty()) {
-                        setEmbeddedPhoto(cur, std::move(bytes));
-                    }
-                    else {
-                        // Если BASE64 декодирование не удалось, но значение выглядит как URL, сохраняем как URL
-                        if (fullValue.length() > 7 && (fullValue.substr(0, 7) == L"http://" || fullValue.substr(0, 8) == L"https://")) {
-                            cur.photo_url = fullValue;
-                        }
-                    }
-                }
-                // Если BASE64 декодирование не удалось, но значение выглядит как URL, сохраняем как URL
-                else if (fullValue.length() > 7 && (fullValue.substr(0, 7) == L"http://" || fullValue.substr(0, 8) == L"https://")) {
+                if (j > idx) idx = j;
+
+                if (fullValue.rfind(L"http://", 0) == 0 || fullValue.rfind(L"https://", 0) == 0) {
                     cur.photo_url = fullValue;
+                } else {
+                    auto bytes = VcfBase64Decode(fullValue);
+                    if (!bytes.empty())
+                        setEmbeddedPhoto(cur, std::move(bytes));
                 }
             }
+            pushField(cur, propName, left, L""); // hide binary/url from text
         }
         else if (propName == L"X-ANDROID-CUSTOM") {
-            // Пример: X-ANDROID-CUSTOM:vnd.android.cursor.item/nickname;John;\;escaped\;;...
             std::wstring raw_val = unescape(decodeTextValue(value, encQP, charset));
             std::wstring rawType;
             std::vector<std::wstring> slots;
@@ -598,8 +427,13 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             else {
                 slots = splitSemicolonEscaped(raw_val);
             }
-            // положим (если есть место в модели; иначе тихий no-op)
             addAndroidCustom(cur, rawType, slots);
+            pushField(cur, propName, left, raw_val);
+        }
+        else {
+            // Unknown / other properties — keep for card display
+            std::wstring txt = unescape(decodeTextValue(value, encQP, charset));
+            pushField(cur, propName, left, txt);
         }
     }
 
