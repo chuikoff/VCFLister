@@ -399,10 +399,14 @@ static const int* GetB64Table() {
     return T;
 }
 
+static constexpr size_t kMaxPhotoDecodedBytes = 8u * 1024u * 1024u; // 8 MiB
+
 static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
     const int* T = GetB64Table();
+    if (wsrc.size() > (kMaxPhotoDecodedBytes / 3) * 4 + 64)
+        return {};
 
-    std::vector<BYTE> out; out.reserve(wsrc.size() * 3 / 4);
+    std::vector<BYTE> out; out.reserve(std::min(wsrc.size() * 3 / 4, kMaxPhotoDecodedBytes));
     int val = 0, valb = -8;
     for (wchar_t wc : wsrc) {
         if (wc == L'=' || wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') {
@@ -417,6 +421,10 @@ static std::vector<BYTE> Base64Decode(const std::wstring& wsrc) {
         if (valb >= 0) {
             out.push_back((BYTE)((val >> valb) & 0xFF));
             valb -= 8;
+            if (out.size() > kMaxPhotoDecodedBytes) {
+                out.clear();
+                return out;
+            }
         }
     }
     return out;
@@ -479,8 +487,26 @@ static std::unique_ptr<Gdiplus::Bitmap> LoadPhotoFromRaw(const std::wstring& raw
 }
 
 // Создать Bitmap из сырых байтов изображения
+static bool LooksLikeImageMagic(const std::vector<uint8_t>& b) {
+    if (b.size() < 12) return false;
+    // JPEG
+    if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return true;
+    // PNG
+    if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return true;
+    // GIF87a / GIF89a
+    if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F' && b[3] == '8' && (b[4] == '7' || b[4] == '9') && b[5] == 'a') return true;
+    // WEBP: RIFF....WEBP
+    if (b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' &&
+        b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P') return true;
+    // BMP
+    if (b[0] == 'B' && b[1] == 'M') return true;
+    return false;
+}
+
 static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytes) {
     if (bytes.empty()) return nullptr;
+    if (bytes.size() > kMaxPhotoDecodedBytes) return nullptr;
+    if (!LooksLikeImageMagic(bytes)) return nullptr;
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
     if (!hMem) return nullptr;
     void* p = GlobalLock(hMem);
@@ -543,6 +569,14 @@ static bool RawBlockHasPhoto(const std::wstring& raw) {
         if (headUp.rfind(L"PHOTO", 0) == 0) return true;
     }
     return false;
+}
+
+// Exact vCard property name (head already uppercased, group prefix stripped): "N" or "N;..." but not NOTE/NICKNAME
+static bool IsExactProp(const std::wstring& headUp, const wchar_t* name) {
+    const size_t n = wcslen(name);
+    if (headUp.size() < n) return false;
+    if (headUp.compare(0, n, name) != 0) return false;
+    return headUp.size() == n || headUp[n] == L';';
 }
 
 // ===================== Сборка текста с локализацией и X-ABLabel значениями =====================
@@ -617,7 +651,7 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         std::wstring val = CollectValuePossiblyMultiline(lines, i, headUp);
 
         // Clean structured fields: remove empty ;;; parts for nicer display (N, ADR etc.)
-        if (headUp.find(L"N") == 0 || headUp.find(L"ADR") == 0) {
+        if (IsExactProp(headUp, L"N") || IsExactProp(headUp, L"ADR")) {
             std::vector<std::wstring> parts;
             size_t start = 0;
             while (start <= val.size()) {
@@ -629,7 +663,7 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
             std::wstring cleaned;
             for (auto& p : parts) {
                 if (!p.empty()) {
-                    if (!cleaned.empty()) cleaned += (headUp.find(L"N") == 0 ? L" " : L", ");
+                    if (!cleaned.empty()) cleaned += (IsExactProp(headUp, L"N") ? L" " : L", ");
                     cleaned += p;
                 }
             }
@@ -637,7 +671,7 @@ static std::wstring BuildFromRawBlock(const std::wstring& raw, bool ru) {
         }
 
         // Skip empty N/FN lines (e.g. N:;;;; or FN: ) to avoid "Name: " or "Full name: "
-        if (val.empty() && (headUp.find(L"N") == 0 || headUp == L"FN")) continue;
+        if (val.empty() && (IsExactProp(headUp, L"N") || headUp == L"FN" || headUp.rfind(L"FN;", 0) == 0)) continue;
 
         // vCard 4.0: nicer GENDER / KIND display values
         if (headUp == L"GENDER" || headUp == L"X-GENDER") {
@@ -779,8 +813,81 @@ struct ViewState {
     // settings (from TC ini)
     bool loadPhotoUrl = false; // LoadPhotoUrl=1 enables HTTP photo fetch
 
+    WNDPROC editOldProc = nullptr;          // per-window subclass original (not global)
+    ULONG   photoFetchGen = 0;              // invalidate in-flight HTTP photo jobs
+
     std::unique_ptr<Gdiplus::Bitmap> photo;  // изображение
     Fonts fonts;
+};
+
+// ---- Module / lifetime (C3, C1, H3) ----
+static HINSTANCE g_hInstDll = nullptr;
+static LONG g_liveViews = 0;
+static LONG g_gdipRef = 0;
+static ULONG_PTR g_gdipToken = 0;
+static bool g_mainClassReg = false;
+static bool g_photoClassReg = false;
+
+static HINSTANCE ModuleInstance() {
+    return g_hInstDll ? g_hInstDll : GetModuleHandleW(nullptr);
+}
+
+void VCFView_SetModuleInstance(HINSTANCE h) {
+    if (h) g_hInstDll = h;
+}
+
+static void EnsureGdiplus() {
+    InterlockedIncrement(&g_gdipRef);
+    if (!g_gdipToken) {
+        GdiplusStartupInput gi;
+        if (GdiplusStartup(&g_gdipToken, &gi, nullptr) != Ok)
+            g_gdipToken = 0;
+    }
+}
+static void ReleaseGdiplus() {
+    if (InterlockedDecrement(&g_gdipRef) == 0 && g_gdipToken) {
+        GdiplusShutdown(g_gdipToken);
+        g_gdipToken = 0;
+    }
+}
+
+static void UnregisterPluginClasses() {
+    HINSTANCE hi = ModuleInstance();
+    if (g_mainClassReg) {
+        UnregisterClassW(kClass, hi);
+        g_mainClassReg = false;
+    }
+    if (g_photoClassReg) {
+        UnregisterClassW(kPhotoClass, hi);
+        g_photoClassReg = false;
+    }
+}
+
+void VCFView_OnDllDetach() {
+    if (g_liveViews == 0) {
+        SafeDelBrush(g_hbrBk);
+        if (g_gdipToken) {
+            GdiplusShutdown(g_gdipToken);
+            g_gdipToken = 0;
+            g_gdipRef = 0;
+        }
+        UnregisterPluginClasses();
+    }
+}
+
+static const UINT WM_VCF_PHOTO_READY = WM_APP + 77;
+
+struct PhotoFetchJob {
+    HWND hwnd = nullptr;
+    size_t sel = 0;
+    ULONG gen = 0;
+    std::wstring url;
+};
+
+struct PhotoFetchResult {
+    size_t sel = 0;
+    ULONG gen = 0;
+    std::vector<uint8_t> bytes;
 };
 
 static int ReadIniInt(const wchar_t* key, int defVal) {
@@ -803,20 +910,88 @@ static void SaveListWidth(ViewState* st, HWND h) {
     (void)h;
 }
 
+// ---- SSRF helpers for optional PHOTO URL fetch (LoadPhotoUrl=1) ----
+static bool ParseIPv4(const std::wstring& host, unsigned& out) {
+    unsigned a = 0, b = 0, c = 0, d = 0, n = 0;
+    const wchar_t* p = host.c_str();
+    auto readOctet = [&](unsigned& o) -> bool {
+        if (*p < L'0' || *p > L'9') return false;
+        unsigned v = 0;
+        while (*p >= L'0' && *p <= L'9') {
+            v = v * 10 + (unsigned)(*p - L'0');
+            if (v > 255) return false;
+            ++p;
+        }
+        o = v; return true;
+    };
+    if (!readOctet(a) || *p++ != L'.') return false;
+    if (!readOctet(b) || *p++ != L'.') return false;
+    if (!readOctet(c) || *p++ != L'.') return false;
+    if (!readOctet(d) || *p != 0) return false;
+    out = (a << 24) | (b << 16) | (c << 8) | d;
+    (void)n;
+    return true;
+}
+
+static bool IsPrivateOrLocalIPv4(unsigned ip) {
+    // 127.0.0.0/8
+    if ((ip & 0xFF000000u) == 0x7F000000u) return true;
+    // 10.0.0.0/8
+    if ((ip & 0xFF000000u) == 0x0A000000u) return true;
+    // 172.16.0.0/12
+    if ((ip & 0xFFF00000u) == 0xAC100000u) return true;
+    // 192.168.0.0/16
+    if ((ip & 0xFFFF0000u) == 0xC0A80000u) return true;
+    // 169.254.0.0/16 (link-local + cloud metadata 169.254.169.254)
+    if ((ip & 0xFFFF0000u) == 0xA9FE0000u) return true;
+    // 0.0.0.0/8
+    if ((ip & 0xFF000000u) == 0x00000000u) return true;
+    return false;
+}
+
+static bool ExtractUrlHost(const std::wstring& url, std::wstring& hostOut) {
+    URL_COMPONENTSW uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t hostBuf[256]{};
+    uc.lpszHostName = hostBuf;
+    uc.dwHostNameLength = 256;
+    if (!InternetCrackUrlW(url.c_str(), 0, 0, &uc)) return false;
+    if (uc.nScheme != INTERNET_SCHEME_HTTP && uc.nScheme != INTERNET_SCHEME_HTTPS) return false;
+    hostOut.assign(hostBuf);
+    return !hostOut.empty();
+}
+
+static bool UrlHostIsBlocked(const std::wstring& url) {
+    std::wstring host;
+    if (!ExtractUrlHost(url, host)) return true;
+    std::wstring low = host;
+    std::transform(low.begin(), low.end(), low.begin(), ::towlower);
+    if (low == L"localhost" || low == L"metadata.google.internal" || low == L"metadata")
+        return true;
+    // IPv6 literals / brackets — refuse (no safe allowlist)
+    if (!low.empty() && low[0] == L'[') return true;
+    if (low.find(L':') != std::wstring::npos) return true; // likely IPv6
+    unsigned ip = 0;
+    if (ParseIPv4(low, ip) && IsPrivateOrLocalIPv4(ip)) return true;
+    return false;
+}
+
 // Download image bytes from http(s) URL (optional photo feature; default off)
 static std::vector<uint8_t> HttpGetBytes(const std::wstring& url, DWORD timeoutMs = 5000) {
     std::vector<uint8_t> data;
     if (url.size() < 8) return data;
     std::wstring low = url; std::transform(low.begin(), low.end(), low.begin(), ::towlower);
     if (low.rfind(L"http://", 0) != 0 && low.rfind(L"https://", 0) != 0) return data;
+    if (UrlHostIsBlocked(url)) return data;
 
-    HINTERNET hNet = InternetOpenW(L"VCFLister/2.1", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    HINTERNET hNet = InternetOpenW(L"VCFLister/2.2", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
     if (!hNet) return data;
     InternetSetOptionW(hNet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
     InternetSetOptionW(hNet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
     InternetSetOptionW(hNet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
 
-    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_CACHE_WRITE;
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_CACHE_WRITE
+                | INTERNET_FLAG_NO_AUTO_REDIRECT; // reduce redirect-based SSRF
     if (low.rfind(L"https://", 0) == 0) flags |= INTERNET_FLAG_SECURE;
     HINTERNET hUrl = InternetOpenUrlW(hNet, url.c_str(), nullptr, 0, flags, 0);
     if (!hUrl) { InternetCloseHandle(hNet); return data; }
@@ -831,6 +1006,33 @@ static std::vector<uint8_t> HttpGetBytes(const std::wstring& url, DWORD timeoutM
     InternetCloseHandle(hUrl);
     InternetCloseHandle(hNet);
     return data;
+}
+
+static DWORD WINAPI PhotoFetchThreadProc(LPVOID param) {
+    std::unique_ptr<PhotoFetchJob> job((PhotoFetchJob*)param);
+    if (!job || !IsWindow(job->hwnd)) return 0;
+    auto bytes = HttpGetBytes(job->url);
+    auto* res = new PhotoFetchResult();
+    res->sel = job->sel;
+    res->gen = job->gen;
+    res->bytes = std::move(bytes);
+    if (!PostMessageW(job->hwnd, WM_VCF_PHOTO_READY, 0, (LPARAM)res)) {
+        delete res;
+    }
+    return 0;
+}
+
+static void StartPhotoFetchAsync(HWND hView, ViewState* st, const std::wstring& url) {
+    if (!st || !hView || url.empty()) return;
+    ++st->photoFetchGen;
+    auto* job = new PhotoFetchJob();
+    job->hwnd = hView;
+    job->sel = st->sel;
+    job->gen = st->photoFetchGen;
+    job->url = url;
+    HANDLE th = CreateThread(nullptr, 0, PhotoFetchThreadProc, job, 0, nullptr);
+    if (th) CloseHandle(th);
+    else delete job;
 }
 
 static std::wstring ContactDisplayName(const Contact& c) {
@@ -1098,8 +1300,10 @@ static void UpdateRightPanel(ViewState* st) {
             }
         }
         if (!photoUrl.empty()) {
-            auto bytes = HttpGetBytes(photoUrl);
-            if (!bytes.empty()) st->photo = BitmapFromMemory(bytes);
+            // Non-blocking: worker thread + WM_VCF_PHOTO_READY (keeps UI responsive)
+            HWND hView = nullptr;
+            if (st->hPhoto && IsWindow(st->hPhoto)) hView = GetParent(st->hPhoto);
+            if (hView && IsWindow(hView)) StartPhotoFetchAsync(hView, st, photoUrl);
         }
     }
     if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
@@ -1152,8 +1356,13 @@ static void UpdateRightPanel(ViewState* st) {
 }
 
 // Сабкласс EDIT — пробрасываем Esc в окно Lister, чтобы закрывалось
-static WNDPROC g_EditOldProc = nullptr;
+static WNDPROC EditOldProcOf(HWND hEdit) {
+    HWND viewer = GetParent(hEdit);
+    auto* st = viewer ? (ViewState*)GetWindowLongPtrW(viewer, GWLP_USERDATA) : nullptr;
+    return (st && st->editOldProc) ? st->editOldProc : DefWindowProcW;
+}
 static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LPARAM lParam) {
+    WNDPROC oldProc = EditOldProcOf(hEdit);
     switch (msg) {
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
@@ -1186,7 +1395,7 @@ static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LP
     case WM_RBUTTONUP:
     case WM_MOUSEMOVE:  // for selection drag
         {
-            LRESULT res = CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
+            LRESULT res = CallWindowProcW(oldProc, hEdit, msg, wParam, lParam);
             // Redirect focus to main view window so TC lister can switch plugins/views (HEX, other plugins etc.)
             // Selection remains visible thanks to ES_NOHIDESEL
             HWND viewer = GetParent(hEdit);
@@ -1196,7 +1405,7 @@ static LRESULT CALLBACK EditSubclassProc(HWND hEdit, UINT msg, WPARAM wParam, LP
             return res;
         }
     }
-    return CallWindowProcW(g_EditOldProc, hEdit, msg, wParam, lParam);
+    return CallWindowProcW(oldProc, hEdit, msg, wParam, lParam);
 }
 
 // Окно превью фото
@@ -1294,20 +1503,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_CREATE: {
         st = new ViewState(); SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)st);
+        InterlockedIncrement(&g_liveViews);
         MakeFonts(h, st->fonts);
-        static ULONG_PTR gdipToken = 0; if (!gdipToken) { GdiplusStartupInput gi; GdiplusStartup(&gdipToken, &gi, nullptr); }
+        EnsureGdiplus();
         RecomputeTheme();
 
-        // Регистрируем окно фото (один раз на процесс ок)
-        static bool photoReg = false;
-        if (!photoReg) {
-            WNDCLASSW wc{}; wc.lpfnWndProc = PhotoWndProc; wc.hInstance = GetModuleHandleW(nullptr);
+        // Регистрируем окно фото с HINSTANCE DLL
+        if (!g_photoClassReg) {
+            WNDCLASSW wc{}; wc.lpfnWndProc = PhotoWndProc; wc.hInstance = ModuleInstance();
             wc.lpszClassName = kPhotoClass; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
             wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-            RegisterClassW(&wc); photoReg = true;
+            if (RegisterClassW(&wc)) g_photoClassReg = true;
         }
 
         LoadViewSettings(st);
+
+        HINSTANCE hi = ModuleInstance();
 
         // Tooltip for long contact names
         INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_BAR_CLASSES | ICC_WIN95_CLASSES };
@@ -1315,7 +1526,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
             WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            h, nullptr, GetModuleHandleW(nullptr), nullptr);
+            h, nullptr, hi, nullptr);
         if (st->hTip) {
             SetWindowPos(st->hTip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             TOOLINFOW ti{}; ti.cbSize = sizeof(ti);
@@ -1330,29 +1541,30 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         // Скролл слева
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
-            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, hi, nullptr);
 
         // Правый скроллбар для карточки (большое фото или много текста)
         st->hRightScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
-            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, hi, nullptr);
 
         // Фото сверху справа
         st->hPhoto = CreateWindowExW(0, kPhotoClass, L"", WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
+            0, 0, 0, 0, h, (HMENU)1001, hi, nullptr);
 
         // EDIT ниже фото
         // Добавлен WS_VSCROLL для явного скроллбара в карточке при большом объёме данных
         st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
             ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY | ES_NOHIDESEL | WS_VSCROLL | WS_HSCROLL,
-            0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+            0, 0, 0, 0, h, (HMENU)1002, hi, nullptr);
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
-        g_EditOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
+        st->editOldProc = (WNDPROC)SetWindowLongPtrW(st->hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
 
         SetFocus(h);
         return 0;
     }
     case WM_DESTROY: {
         if (st) {
+            ++st->photoFetchGen; // drop in-flight HTTP photo results
             if (st->hEdit && IsWindow(st->hEdit)) DestroyWindow(st->hEdit);
             if (st->hPhoto && IsWindow(st->hPhoto)) DestroyWindow(st->hPhoto);
             if (st->hScroll && IsWindow(st->hScroll)) DestroyWindow(st->hScroll);
@@ -1361,8 +1573,26 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             st->photo.reset();
             FreeFonts(st->fonts); delete st;
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            // Only delete shared theme brush when no live views remain (C1 UAF fix)
+            if (InterlockedDecrement(&g_liveViews) == 0) {
+                SafeDelBrush(g_hbrBk);
+                UnregisterPluginClasses();
+            }
+            ReleaseGdiplus();
         }
-        SafeDelBrush(g_hbrBk);
+        return 0;
+    }
+    case WM_VCF_PHOTO_READY: {
+        std::unique_ptr<PhotoFetchResult> res((PhotoFetchResult*)l);
+        if (!st || !res) return 0;
+        if (res->gen != st->photoFetchGen || res->sel != st->sel) return 0;
+        if (st->photo) return 0; // already have embedded/raw photo
+        if (!res->bytes.empty()) {
+            st->photo = BitmapFromMemory(res->bytes);
+            if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
+            RECT rc; GetClientRect(h, &rc);
+            SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+        }
         return 0;
     }
     case WM_SIZE: {
@@ -1824,18 +2054,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 // ---------- Public API ----------
 HWND CreateVCFView(HWND parent, const std::vector<Contact>& contacts) {
-    static bool reg = false;
-    if (!reg) {
-        WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"VCF_VIEW_CLASS"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClassW(&wc); reg = true;
+    HINSTANCE hi = ModuleInstance();
+    if (!g_mainClassReg) {
+        WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = hi;
+        wc.lpszClassName = kClass; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        if (RegisterClassW(&wc)) g_mainClassReg = true;
     }
-    HWND h = CreateWindowExW(0, L"VCF_VIEW_CLASS", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND h = CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, parent, nullptr, hi, nullptr);
     if (h) VCFView_SetContacts(h, contacts);
     return h;
 }
 void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
+    ++st->photoFetchGen;
     st->contacts = contacts; st->sel = 0; st->listScroll = 0;
     st->rightScroll = 0;
     st->searchNeedle.clear();
@@ -1851,6 +2083,7 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
 
 extern "C" void VCFView_SetRawBlocks(HWND h, const std::vector<std::wstring>& rawBlocks) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
+    ++st->photoFetchGen;
     st->rawBlocks = rawBlocks;
     st->rightScroll = 0;
     UpdateRightPanel(st);
@@ -1863,7 +2096,7 @@ size_t VCFView_Count(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_
 size_t VCFView_GetSelection(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); return st ? st->sel : 0; }
 void VCFView_SetSelection(HWND h, size_t idx) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
-    if (idx < st->contacts.size()) { st->sel = idx; st->rightScroll = 0; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); 
+    if (idx < st->contacts.size()) { ++st->photoFetchGen; st->sel = idx; st->rightScroll = 0; EnsureSelVisible(h, st); UpdateRightPanel(st); InvalidateRect(h, nullptr, FALSE); 
         RECT rc; GetClientRect(h, &rc); SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom)); }
 }
 

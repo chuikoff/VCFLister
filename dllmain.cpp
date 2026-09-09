@@ -72,11 +72,22 @@ static std::wstring A2W(const char* s) {
 }
 
 // Прочитать файл целиком (wide), с попытками кодировок
+static constexpr size_t kMaxVcfFileBytes = 32u * 1024u * 1024u; // 32 MiB
+
 static std::wstring ReadWholeFileAsWide(const wchar_t* path) {
     std::wstring empty;
     std::ifstream f(path, std::ios::binary);
     if (!f) return empty;
-    std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.seekg(0, std::ios::end);
+    std::streamoff sz = f.tellg();
+    if (sz < 0) return empty;
+    if ((size_t)sz > kMaxVcfFileBytes) {
+        // Oversized VCF — refuse to load (protect TC process from OOM)
+        return empty;
+    }
+    f.seekg(0, std::ios::beg);
+    std::vector<char> buf((size_t)sz);
+    if (sz > 0 && !f.read(buf.data(), sz)) return empty;
     if (buf.empty()) return empty;
 
     auto tryMbToW = [](const char* data, int len, UINT cp, bool strictUTF8 = false)->std::wstring {
@@ -334,6 +345,9 @@ extern "C" {
     HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLoad, int ShowFlags) {
         return Impl_ListLoadW(ParentWin, FileToLoad, ShowFlags);
     }
+    int __stdcall ListLoadNextW(HWND ParentWin, HWND PluginWin, wchar_t* FileToLoad, int ShowFlags) {
+        return Impl_ListLoadNextW(ParentWin, PluginWin, FileToLoad, ShowFlags);
+    }
     int __stdcall ListSearchTextW(HWND PluginWin, wchar_t* SearchString, int SearchParameter) {
         return Impl_ListSearchTextW(PluginWin, SearchString, SearchParameter);
     }
@@ -350,6 +364,10 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hInst = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
+        VCFView_SetModuleInstance(hinstDLL);
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        VCFView_OnDllDetach();
     }
     return TRUE;
 }
