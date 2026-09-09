@@ -71,6 +71,9 @@ static std::vector<std::wstring> splitSemicolonEscaped(const std::wstring& s) {
     return out;
 }
 
+// Cap decoded PHOTO / Base64 payload (protect TC from OOM)
+static constexpr size_t kMaxPhotoDecodedBytes = 8u * 1024u * 1024u; // 8 MiB
+
 // --- Base64 decode (ASCII, игнорирует пробелы/переводы строк) ---
 static std::vector<uint8_t> Base64Decode(const std::string& s) {
     auto val = [](unsigned char c)->int {
@@ -81,7 +84,11 @@ static std::vector<uint8_t> Base64Decode(const std::string& s) {
         if (c == '/') return 63;
         return -1;
         };
+    // reject obviously oversized input early (~4/3 expansion)
+    if (s.size() > (kMaxPhotoDecodedBytes / 3) * 4 + 64)
+        return {};
     std::vector<uint8_t> out;
+    out.reserve(std::min(s.size() * 3 / 4, kMaxPhotoDecodedBytes));
     int v = 0, vb = -8;
     for (unsigned char c : s) {
         if (c <= ' ') continue; // пропускаем пробелы/CRLF/TAB
@@ -93,6 +100,10 @@ static std::vector<uint8_t> Base64Decode(const std::string& s) {
         if (vb >= 0) {
             out.push_back((uint8_t)((v >> vb) & 0xFF));
             vb -= 8;
+            if (out.size() > kMaxPhotoDecodedBytes) {
+                out.clear();
+                return out;
+            }
         }
     }
     return out;
@@ -255,6 +266,7 @@ static std::vector<std::wstring> parseTypes(const std::vector<std::wstring>& par
 static void setEmbeddedPhoto(Contact& c, std::vector<uint8_t> bytes)
 {
     if (bytes.empty()) return;
+    if (bytes.size() > kMaxPhotoDecodedBytes) return; // refuse oversized
     Photo ph;
     ph.bytes = std::move(bytes);
     c.photo = std::move(ph);

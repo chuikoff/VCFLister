@@ -3,6 +3,7 @@ EXPORTS
     ; Unicode
     ListGetDetectStringW
     ListLoadW
+    ListLoadNextW
     ListCloseWindow
     ListSearchTextW
     ListSendCommand
