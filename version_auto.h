@@ -13,9 +13,9 @@
 #define VCF_LISTER_STRPRODUCTVER L"2.2.1.0"
 
 #define VCF_LISTER_VERSION_STR           "2.2.1.0"
-#define VCF_LISTER_GIT_SHA               "pending"
+#define VCF_LISTER_GIT_SHA               "c381a08"
 #define VCF_LISTER_BUILD_TIMESTAMP       "2026-09-09T00:00:00Z"
-#define VCF_LISTER_GIT_SHA_WSTR          L"pending"
+#define VCF_LISTER_GIT_SHA_WSTR          L"c381a08"
 #define VCF_LISTER_BUILD_TIMESTAMP_WSTR  L"2026-09-09T00:00:00Z"
 
 #endif // VCF_LISTER_VERSION_AUTO_H
