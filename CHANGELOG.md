@@ -1,4 +1,6 @@
-## [2.2.1] – 2026-09-09
+## [2.5.1] – 2026-09-09
+
+Версия относительно последнего релиза v2.5.0 (changelog на master отставал на 2.2).
 
 ### Fixed (review: Critical + High)
 - **C1:** общая кисть темы `g_hbrBk` больше не удаляется при закрытии одного окна Lister (refcount живых окон) — устранение UAF GDI.
@@ -9,7 +11,7 @@
 - **H3:** refcount `GdiplusStartup` / `GdiplusShutdown`.
 - **H4:** экспорт `ListLoadNextW` (DEF + Win32); `NDEBUG` в Release|x64.
 - **H5:** очистка structured-полей только для точных тегов `N`/`ADR` (не NOTE/NICKNAME).
-- **H6:** версия выровнена на 2.2.1; убран `-dirty` из committed `version_auto.h`.
+- **H6:** версия выровнена на 2.5.1; убран `-dirty` из committed `version_auto.h`.
 
 ### Hygiene
 - Удалены мусорные артефакты: `vcf_view.cpp.orig`, `fix*.ps1`, `parts/`, `RCa14392`, `original_vcf_view.txt`.
