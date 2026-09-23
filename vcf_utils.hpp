@@ -18,6 +18,9 @@ inline bool isWordBoundary(const std::wstring& s, size_t pos) { return (pos == 0
 inline bool isWordBoundary2(const std::wstring& s, size_t pos) { return (pos >= s.size()) || !iswalnum(s[pos]); }
 
 // --- Shared vCard codecs (single implementation for parser + view) ---
+// Decoded PHOTO payload cap (protect the TC process from OOM).
+inline constexpr size_t kMaxPhotoDecodedBytes = 8u * 1024u * 1024u;
+
 std::wstring UnescapeVCard(const std::wstring& s);
 std::vector<uint8_t> VcfBase64Decode(const std::wstring& wsrc);
 std::vector<uint8_t> VcfQuotedPrintableDecode(const std::wstring& wsrc);

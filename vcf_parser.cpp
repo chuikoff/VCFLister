@@ -133,6 +133,7 @@ static std::vector<std::wstring> parseTypes(const std::vector<std::wstring>& par
 static void setEmbeddedPhoto(Contact& c, std::vector<uint8_t> bytes)
 {
     if (bytes.empty()) return;
+    if (bytes.size() > kMaxPhotoDecodedBytes) return;
     Photo ph;
     ph.bytes = std::move(bytes);
     c.photo = std::move(ph);

@@ -83,11 +83,19 @@ static std::wstring A2W(const char* s) {
 }
 
 // Прочитать файл целиком (wide), с попытками кодировок
+static constexpr unsigned long long kMaxVcfFileBytes = 32ull * 1024ull * 1024ull; // 32 MiB
+
 static std::wstring ReadWholeFileAsWide(const wchar_t* path) {
     std::wstring empty;
     std::ifstream f(path, std::ios::binary);
     if (!f) return empty;
-    std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.seekg(0, std::ios::end);
+    const std::streamoff sz = f.tellg();
+    if (sz < 0) return empty;
+    if (static_cast<unsigned long long>(sz) > kMaxVcfFileBytes) return empty;
+    f.seekg(0, std::ios::beg);
+    std::vector<char> buf(static_cast<size_t>(sz));
+    if (sz > 0 && !f.read(buf.data(), static_cast<std::streamsize>(sz))) return empty;
     if (buf.empty()) return empty;
 
     auto tryMbToW = [](const char* data, int len, UINT cp, bool strictUTF8 = false)->std::wstring {
@@ -377,6 +385,10 @@ BOOL APIENTRY DllMain(HINSTANCE hinstDLL, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hInst = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
+        VCFView_SetModuleInstance(hinstDLL);
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        VCFView_OnDllDetach();
     }
     return TRUE;
 }

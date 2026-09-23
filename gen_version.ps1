@@ -11,16 +11,36 @@ function Write-Header-Atomic($path, $text) {
     Move-Item -Force $tmp $path
 }
 
-# --- 1) Базовая версия из git-тэга (major.minor.patch) ---
-$major = 2; $minor = 0; $patch = 0
-try {
-    $tag = (git describe --tags --abbrev=0).Trim()   # vX.Y.Z
-    if ($tag -match "^v(\d+)\.(\d+)\.(\d+)$") {
-        $major = [int]$matches[1]
-        $minor = [int]$matches[2]
-        $patch = [int]$matches[3]
+# --- 1) Базовая версия: максимальный vX.Y.Z среди предков HEAD ---
+# Ближайший тег здесь врёт: v2.5.1 собран от v2.2 и после слияния оказывается ближе, чем v2.5.0/v2.5.2.
+function ConvertTo-VerKey([string]$text) {
+    if ($text -match '^v?(\d+)\.(\d+)\.(\d+)$') {
+        return ([int]$Matches[1] * 1000000) + ([int]$Matches[2] * 1000) + ([int]$Matches[3])
     }
-} catch { }  # если git/tags нет — останется 1.5.0
+    return -1
+}
+$major = 2; $minor = 0; $patch = 0
+$bestKey = -1
+try {
+    foreach ($tag in @(git tag --merged HEAD --list "v*")) {
+        $key = ConvertTo-VerKey $tag
+        if ($key -gt $bestKey) { $bestKey = $key }
+    }
+} catch { }
+# build_state.base может быть новее тега, пока тег vX.Y.Z ещё не поставлен
+$statePathEarly = Join-Path $PSScriptRoot "build_state.json"
+if (Test-Path $statePathEarly) {
+    try {
+        $early = Get-Content $statePathEarly -Raw | ConvertFrom-Json
+        $key = ConvertTo-VerKey ([string]$early.base)
+        if ($key -gt $bestKey) { $bestKey = $key }
+    } catch { }
+}
+if ($bestKey -ge 0) {
+    $major = [int]($bestKey / 1000000)
+    $minor = [int](($bestKey / 1000) % 1000)
+    $patch = [int]($bestKey % 1000)
+}
 
 $base = "$major.$minor.$patch"
 

@@ -88,8 +88,12 @@ std::vector<uint8_t> VcfBase64Decode(const std::wstring& wsrc) {
         if (c == '/') return 63;
         return -1;
     };
+    // ~4/3 expansion; reject before allocating the alphabet buffer
+    if (wsrc.size() > (kMaxPhotoDecodedBytes / 3) * 4 + 64)
+        return {};
+    const size_t alphCap = (kMaxPhotoDecodedBytes / 3) * 4 + 64;
     std::string alph;
-    alph.reserve(wsrc.size());
+    alph.reserve(wsrc.size() < alphCap ? wsrc.size() : alphCap);
     for (wchar_t wc : wsrc) {
         if (wc == L'=') break;
         if (wc == L'\r' || wc == L'\n' || wc == L' ' || wc == L'\t') continue;
@@ -99,8 +103,9 @@ std::vector<uint8_t> VcfBase64Decode(const std::wstring& wsrc) {
     }
     while (alph.size() % 4 == 1 && !alph.empty()) alph.pop_back();
 
+    const size_t outCap = alph.size() / 4 * 3;
     std::vector<uint8_t> out;
-    out.reserve(alph.size() * 3 / 4);
+    out.reserve(outCap < kMaxPhotoDecodedBytes ? outCap : kMaxPhotoDecodedBytes);
     int v = 0, vb = -8;
     for (unsigned char c : alph) {
         int d = val(c);
@@ -110,6 +115,7 @@ std::vector<uint8_t> VcfBase64Decode(const std::wstring& wsrc) {
         if (vb >= 0) {
             out.push_back((uint8_t)((v >> vb) & 0xFF));
             vb -= 8;
+            if (out.size() > kMaxPhotoDecodedBytes) return {};
         }
     }
     return out;

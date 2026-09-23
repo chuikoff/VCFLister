@@ -361,10 +361,22 @@ static void RepairJpegBytes(std::vector<uint8_t>& data) {
     data.swap(out);
 }
 
+static bool LooksLikeImageMagic(const std::vector<uint8_t>& b) {
+    if (b.size() < 12) return false;
+    if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return true; // JPEG
+    if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return true; // PNG
+    if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F' && b[3] == '8' && (b[4] == '7' || b[4] == '9') && b[5] == 'a') return true;
+    if (b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' &&
+        b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P') return true; // WEBP
+    if (b[0] == 'B' && b[1] == 'M') return true; // BMP
+    return false;
+}
+
 // Create Bitmap that owns its pixels. FromStream often keeps a live IStream
 // reference — never return that object after releasing the stream (UAF).
 static std::unique_ptr<Gdiplus::Bitmap> BitmapFromMemory(const std::vector<uint8_t>& bytesIn) {
-    if (bytesIn.empty()) return nullptr;
+    if (bytesIn.empty() || bytesIn.size() > kMaxPhotoDecodedBytes) return nullptr;
+    if (!LooksLikeImageMagic(bytesIn)) return nullptr;
 
     std::vector<uint8_t> bytes = bytesIn;
     bool repaired = false;
@@ -633,6 +645,10 @@ struct ViewState {
     // settings (from TC ini)
     bool loadPhotoUrl = false; // LoadPhotoUrl=1 enables HTTP photo fetch
 
+    ULONG  photoFetchGen = 0;               // invalidate in-flight HTTP photo jobs
+    size_t photoJobSel = static_cast<size_t>(-1);
+    std::wstring photoJobUrl;
+
     std::unique_ptr<Gdiplus::Bitmap> photo;  // изображение
     Fonts fonts;
 };
@@ -641,6 +657,62 @@ struct ViewState {
 static ViewState* ViewStateFromHwnd(HWND h) {
     if (!h || !IsWindow(h)) return nullptr;
     return reinterpret_cast<ViewState*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+}
+
+// ---- Module / lifetime (shared brush, GDI+, window classes) ----
+static HINSTANCE g_hInstDll = nullptr;
+static LONG g_liveViews = 0;
+static LONG g_gdipRef = 0;
+static ULONG_PTR g_gdipToken = 0;
+static bool g_mainClassReg = false;
+static bool g_photoClassReg = false;
+
+static HINSTANCE ModuleInstance() {
+    return g_hInstDll ? g_hInstDll : ::GetModuleHandleW(nullptr);
+}
+
+void VCFView_SetModuleInstance(HINSTANCE h) {
+    if (h) g_hInstDll = h;
+}
+
+static void EnsureGdiplus() {
+    InterlockedIncrement(&g_gdipRef);
+    if (!g_gdipToken) {
+        GdiplusStartupInput gi;
+        if (GdiplusStartup(&g_gdipToken, &gi, nullptr) != Ok)
+            g_gdipToken = 0;
+    }
+}
+
+static void ReleaseGdiplus() {
+    if (InterlockedDecrement(&g_gdipRef) == 0 && g_gdipToken) {
+        GdiplusShutdown(g_gdipToken);
+        g_gdipToken = 0;
+    }
+}
+
+static void UnregisterPluginClasses() {
+    HINSTANCE hi = ModuleInstance();
+    if (g_mainClassReg) {
+        UnregisterClassW(kClass, hi);
+        g_mainClassReg = false;
+    }
+    if (g_photoClassReg) {
+        UnregisterClassW(kPhotoClass, hi);
+        g_photoClassReg = false;
+    }
+}
+
+void VCFView_OnDllDetach() {
+    if (g_liveViews == 0) {
+        SafeDelBrush(g_hbrBk);
+        if (g_gdipToken) {
+            GdiplusShutdown(g_gdipToken);
+            g_gdipToken = 0;
+            g_gdipRef = 0;
+        }
+        UnregisterPluginClasses();
+    }
 }
 
 static bool ContactHasPhoto(const ViewState* st, size_t idx) {
@@ -782,20 +854,96 @@ static void SaveListWidth(ViewState* st, HWND h) {
     (void)h;
 }
 
+// ---- Optional PHOTO URL fetch (LoadPhotoUrl=1): block private/local targets ----
+static bool ParseIPv4(const std::wstring& host, unsigned& out) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    const wchar_t* p = host.c_str();
+    auto readOctet = [&](unsigned& o) -> bool {
+        if (*p < L'0' || *p > L'9') return false;
+        unsigned v = 0;
+        while (*p >= L'0' && *p <= L'9') {
+            v = v * 10u + (unsigned)(*p - L'0');
+            if (v > 255u) return false;
+            ++p;
+        }
+        o = v;
+        return true;
+    };
+    if (!readOctet(a) || *p++ != L'.') return false;
+    if (!readOctet(b) || *p++ != L'.') return false;
+    if (!readOctet(c) || *p++ != L'.') return false;
+    if (!readOctet(d) || *p != 0) return false;
+    out = (a << 24) | (b << 16) | (c << 8) | d;
+    return true;
+}
+
+static bool IsPrivateOrLocalIPv4(unsigned ip) {
+    if ((ip & 0xFF000000u) == 0x7F000000u) return true; // 127.0.0.0/8
+    if ((ip & 0xFF000000u) == 0x0A000000u) return true; // 10.0.0.0/8
+    if ((ip & 0xFFF00000u) == 0xAC100000u) return true; // 172.16.0.0/12
+    if ((ip & 0xFFFF0000u) == 0xC0A80000u) return true; // 192.168.0.0/16
+    if ((ip & 0xFFFF0000u) == 0xA9FE0000u) return true; // 169.254.0.0/16
+    if ((ip & 0xFF000000u) == 0x00000000u) return true; // 0.0.0.0/8
+    return false;
+}
+
+static bool ExtractUrlHost(const std::wstring& url, std::wstring& hostOut) {
+    URL_COMPONENTSW uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t hostBuf[256]{};
+    uc.lpszHostName = hostBuf;
+    uc.dwHostNameLength = 256;
+    if (!InternetCrackUrlW(url.c_str(), 0, 0, &uc)) return false;
+    if (uc.nScheme != INTERNET_SCHEME_HTTP && uc.nScheme != INTERNET_SCHEME_HTTPS) return false;
+    hostOut.assign(hostBuf, uc.dwHostNameLength);
+    return !hostOut.empty();
+}
+
+static bool UrlHostIsBlocked(const std::wstring& url) {
+    std::wstring host;
+    if (!ExtractUrlHost(url, host)) return true;
+    std::wstring low = host;
+    std::transform(low.begin(), low.end(), low.begin(), ::towlower);
+    if (low == L"localhost" || low == L"metadata.google.internal" || low == L"metadata")
+        return true;
+    if (!low.empty() && (low[0] == L'[' || low.find(L':') != std::wstring::npos))
+        return true; // IPv6 literal — no allowlist
+    unsigned ip = 0;
+    if (ParseIPv4(low, ip) && IsPrivateOrLocalIPv4(ip)) return true;
+    return false;
+}
+
+static const UINT WM_VCF_PHOTO_READY = WM_APP + 77;
+
+struct PhotoFetchJob {
+    HWND hwnd = nullptr;
+    size_t sel = 0;
+    ULONG gen = 0;
+    std::wstring url;
+};
+
+struct PhotoFetchResult {
+    size_t sel = 0;
+    ULONG gen = 0;
+    std::vector<uint8_t> bytes;
+};
+
 // Download image bytes from http(s) URL (optional photo feature; default off)
 static std::vector<uint8_t> HttpGetBytes(const std::wstring& url, DWORD timeoutMs = 5000) {
     std::vector<uint8_t> data;
     if (url.size() < 8) return data;
     std::wstring low = url; std::transform(low.begin(), low.end(), low.begin(), ::towlower);
     if (low.rfind(L"http://", 0) != 0 && low.rfind(L"https://", 0) != 0) return data;
+    if (UrlHostIsBlocked(url)) return data;
 
-    HINTERNET hNet = InternetOpenW(L"VCFLister/2.1", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    HINTERNET hNet = InternetOpenW(L"VCFLister/2.5", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
     if (!hNet) return data;
     InternetSetOptionW(hNet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
     InternetSetOptionW(hNet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
     InternetSetOptionW(hNet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
 
-    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_CACHE_WRITE;
+    DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_UI | INTERNET_FLAG_NO_CACHE_WRITE
+        | INTERNET_FLAG_NO_AUTO_REDIRECT;
     if (low.rfind(L"https://", 0) == 0) flags |= INTERNET_FLAG_SECURE;
     HINTERNET hUrl = InternetOpenUrlW(hNet, url.c_str(), nullptr, 0, flags, 0);
     if (!hUrl) { InternetCloseHandle(hNet); return data; }
@@ -809,7 +957,38 @@ static std::vector<uint8_t> HttpGetBytes(const std::wstring& url, DWORD timeoutM
     }
     InternetCloseHandle(hUrl);
     InternetCloseHandle(hNet);
+    if (data.size() >= kMax) return {};
     return data;
+}
+
+static DWORD WINAPI PhotoFetchThreadProc(LPVOID param) {
+    std::unique_ptr<PhotoFetchJob> job(static_cast<PhotoFetchJob*>(param));
+    if (!job || !IsWindow(job->hwnd)) return 0;
+    auto bytes = HttpGetBytes(job->url);
+    if (!IsWindow(job->hwnd)) return 0;
+    auto* res = new PhotoFetchResult();
+    res->sel = job->sel;
+    res->gen = job->gen;
+    res->bytes = std::move(bytes);
+    if (!PostMessageW(job->hwnd, WM_VCF_PHOTO_READY, 0, reinterpret_cast<LPARAM>(res)))
+        delete res;
+    return 0;
+}
+
+static bool StartPhotoFetchAsync(HWND hView, ViewState* st, const std::wstring& url) {
+    if (!st || !hView || url.empty()) return false;
+    auto* job = new PhotoFetchJob();
+    job->hwnd = hView;
+    job->sel = st->sel;
+    job->gen = st->photoFetchGen;
+    job->url = url;
+    HANDLE th = CreateThread(nullptr, 0, PhotoFetchThreadProc, job, 0, nullptr);
+    if (!th) {
+        delete job;
+        return false;
+    }
+    CloseHandle(th);
+    return true;
 }
 
 static std::wstring ContactDisplayName(const Contact& c) {
@@ -1268,21 +1447,28 @@ static void SetCardEditText(HWND hEdit, const std::wstring& text, HFONT hFont) {
 // ===================== EDIT и ФОТО: наполнение и поведение =====================
 static void UpdateRightPanel(ViewState* st) {
     if (!st) return;
-    // фото: embedded → raw base64 → optional URL download
-    st->photo.reset();
-    std::wstring photoUrl;
-    if (st->sel < st->contacts.size()) {
-        const Contact& c = st->contacts[st->sel];
-        if (c.photo.has_value() && !c.photo->bytes.empty()) {
-            st->photo = BitmapFromMemory(c.photo->bytes);
+    // Embedded photo is synchronous. URL photo is one worker per contact (LoadPhotoUrl=1).
+    const bool haveContact = st->sel < st->contacts.size();
+    const Contact* c = haveContact ? &st->contacts[st->sel] : nullptr;
+    const bool embedded = c && c->photo.has_value() && !c->photo->bytes.empty();
+    const std::wstring photoUrl = (c && !embedded) ? c->photo_url : L"";
+    const bool wantUrl = !embedded && st->loadPhotoUrl && !photoUrl.empty();
+    const bool sameUrlJob = wantUrl && st->sel == st->photoJobSel && photoUrl == st->photoJobUrl;
+
+    if (!sameUrlJob) {
+        ++st->photoFetchGen;
+        st->photo.reset();
+        st->photoJobSel = static_cast<size_t>(-1);
+        st->photoJobUrl.clear();
+        if (embedded)
+            st->photo = BitmapFromMemory(c->photo->bytes);
+        else if (wantUrl) {
+            HWND hView = (st->hPhoto && IsWindow(st->hPhoto)) ? GetParent(st->hPhoto) : nullptr;
+            if (hView && IsWindow(hView) && StartPhotoFetchAsync(hView, st, photoUrl)) {
+                st->photoJobSel = st->sel;
+                st->photoJobUrl = photoUrl;
+            }
         }
-        photoUrl = c.photo_url;
-    }
-    // Photo already decoded in Contact by parser (no second raw PHOTO parse)
-    // Optional HTTP(S) photo (ini LoadPhotoUrl=1)
-    if (!st->photo && st->loadPhotoUrl && !photoUrl.empty()) {
-        auto bytes = HttpGetBytes(photoUrl);
-        if (!bytes.empty()) st->photo = BitmapFromMemory(bytes);
     }
     if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
 
@@ -1620,17 +1806,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_CREATE: {
         st = new ViewState(); SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)st);
+        InterlockedIncrement(&g_liveViews);
         MakeFonts(h, st->fonts);
-        static ULONG_PTR gdipToken = 0; if (!gdipToken) { GdiplusStartupInput gi; GdiplusStartup(&gdipToken, &gi, nullptr); }
+        EnsureGdiplus();
         RecomputeTheme();
 
-        // Регистрируем окно фото (один раз на процесс ок)
-        static bool photoReg = false;
-        if (!photoReg) {
-            WNDCLASSW wc{}; wc.lpfnWndProc = PhotoWndProc; wc.hInstance = GetModuleHandleW(nullptr);
+        HINSTANCE hi = ModuleInstance();
+        if (!g_photoClassReg) {
+            WNDCLASSW wc{}; wc.lpfnWndProc = PhotoWndProc; wc.hInstance = hi;
             wc.lpszClassName = kPhotoClass; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
             wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-            RegisterClassW(&wc); photoReg = true;
+            if (RegisterClassW(&wc)) g_photoClassReg = true;
         }
 
         LoadViewSettings(st);
@@ -1641,7 +1827,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
             WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-            h, nullptr, GetModuleHandleW(nullptr), nullptr);
+            h, nullptr, ModuleInstance(), nullptr);
         if (st->hTip) {
             SetWindowPos(st->hTip, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             TOOLINFOW ti{}; ti.cbSize = sizeof(ti);
@@ -1657,7 +1843,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // Quick filter above list + "with photo" checkbox
         st->hFilter = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT,
-            0, 0, 0, 0, h, (HMENU)1010, GetModuleHandleW(nullptr), nullptr);
+            0, 0, 0, 0, h, (HMENU)1010, ModuleInstance(), nullptr);
         SendMessageW(st->hFilter, WM_SETFONT, (WPARAM)st->fonts.hSmall, TRUE);
         // Cue banner (Vista+)
         SendMessageW(st->hFilter, 0x1501 /*EM_SETCUEBANNER*/, TRUE,
@@ -1667,7 +1853,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         st->hPhotoOnly = CreateWindowExW(0, L"BUTTON",
             g_tcRu ? L"📷 фото" : L"📷 photo",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_TEXT,
-            0, 0, 0, 0, h, (HMENU)1011, GetModuleHandleW(nullptr), nullptr);
+            0, 0, 0, 0, h, (HMENU)1011, ModuleInstance(), nullptr);
         SendMessageW(st->hPhotoOnly, WM_SETFONT, (WPARAM)st->fonts.hSmall, TRUE);
         // Disable visual styles so WM_CTLCOLORBTN can set light text in dark theme (#20)
         SetWindowTheme(st->hPhotoOnly, L"", L"");
@@ -1675,31 +1861,31 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         // Скролл слева
         st->hScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
-            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, ModuleInstance(), nullptr);
 
         // Единственный скроллбар карточки (фото + полный текст)
         st->hRightScroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | WS_VISIBLE | SBS_VERT,
-            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, GetModuleHandleW(nullptr), nullptr);
+            0, 0, GetSystemMetrics(SM_CXVSCROLL), 100, h, nullptr, ModuleInstance(), nullptr);
 
         // Фото сверху справа
         st->hPhoto = CreateWindowExW(0, kPhotoClass, L"", WS_CHILD | WS_VISIBLE,
-            0, 0, 0, 0, h, (HMENU)1001, GetModuleHandleW(nullptr), nullptr);
+            0, 0, 0, 0, h, (HMENU)1001, ModuleInstance(), nullptr);
 
         // RichEdit below photo: wrap, readonly, bold values (#18); outer hRightScroll scrolls card
         EnsureRichEditLoaded();
         st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_NOHIDESEL | ES_SAVESEL,
-            0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+            0, 0, 0, 0, h, (HMENU)1002, ModuleInstance(), nullptr);
         if (!st->hEdit) {
             // Fallback if Msftedit unavailable
             st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, RICHEDIT_CLASSW, L"",
                 WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
-                0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+                0, 0, 0, 0, h, (HMENU)1002, ModuleInstance(), nullptr);
         }
         if (!st->hEdit) {
             st->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_NOHIDESEL,
-                0, 0, 0, 0, h, (HMENU)1002, GetModuleHandleW(nullptr), nullptr);
+                0, 0, 0, 0, h, (HMENU)1002, ModuleInstance(), nullptr);
         }
         SendMessageW(st->hEdit, WM_SETFONT, (WPARAM)st->fonts.hNorm, TRUE);
         SendMessageW(st->hEdit, EM_SETBKGNDCOLOR, 0, (LPARAM)g_clrBk);
@@ -1711,6 +1897,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_DESTROY: {
         if (st) {
+            ++st->photoFetchGen;
             if (st->hEdit && IsWindow(st->hEdit)) {
                 RemoveWindowSubclass(st->hEdit, EditSubclassProc, 3);
                 DestroyWindow(st->hEdit);
@@ -1730,8 +1917,25 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             st->photo.reset();
             FreeFonts(st->fonts); delete st;
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            if (InterlockedDecrement(&g_liveViews) == 0) {
+                SafeDelBrush(g_hbrBk);
+                UnregisterPluginClasses();
+            }
+            ReleaseGdiplus();
         }
-        SafeDelBrush(g_hbrBk);
+        return 0;
+    }
+    case WM_VCF_PHOTO_READY: {
+        std::unique_ptr<PhotoFetchResult> res(reinterpret_cast<PhotoFetchResult*>(l));
+        if (!st || !res) return 0;
+        if (res->gen != st->photoFetchGen || res->sel != st->sel) return 0;
+        if (st->photo) return 0;
+        if (!res->bytes.empty()) {
+            st->photo = BitmapFromMemory(res->bytes);
+            if (IsWindow(st->hPhoto)) InvalidateRect(st->hPhoto, nullptr, TRUE);
+            RECT rc; GetClientRect(h, &rc);
+            SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+        }
         return 0;
     }
     case WM_SIZE: {
@@ -2331,13 +2535,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 // ---------- Public API ----------
 HWND CreateVCFView(HWND parent, const std::vector<Contact>& contacts) {
-    static bool reg = false;
-    if (!reg) {
-        WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"VCF_VIEW_CLASS"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClassW(&wc); reg = true;
+    HINSTANCE hi = ModuleInstance();
+    if (!g_mainClassReg) {
+        WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = hi;
+        wc.lpszClassName = kClass; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        if (RegisterClassW(&wc)) g_mainClassReg = true;
     }
-    HWND h = CreateWindowExW(0, L"VCF_VIEW_CLASS", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND h = CreateWindowExW(0, kClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, parent, nullptr, hi, nullptr);
     if (h) VCFView_SetContacts(h, contacts);
     return h;
 }

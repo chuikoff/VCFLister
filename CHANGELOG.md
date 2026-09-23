@@ -1,3 +1,20 @@
+## [2.5.2] – 2026-09-23
+
+Восстановлены изменения 2.3–2.5.0. Опубликованная 2.5.1 собрана от v2.2 (`e4f3e5d`), теги 2.3–2.5.0 в неё не входили. Эта версия — дерево `origin/1.6` (v2.5.0) плюс правки код-ревью, перенесённые на этот код.
+
+### Fixed
+- **C1:** общая кисть `g_hbrBk` удаляется, только когда не осталось окон Lister.
+- **C2:** файл VCF больше 32 МиБ не читается; PHOTO / Base64 больше 8 МиБ отбрасывается.
+- **C3:** `RegisterClass` / `CreateWindow` с `HINSTANCE` DLL; `UnregisterClass` на последнем окне и в `DLL_PROCESS_DETACH`.
+- **H1:** HTTP-фото качается в фоновом потоке. Blocklist: localhost, частные и link-local IPv4, metadata, IPv6-литералы. `INTERNET_FLAG_NO_AUTO_REDIRECT`. В декодер попадают только JPEG/PNG/GIF/WEBP/BMP. `LoadPhotoUrl` по-прежнему выключен по умолчанию.
+- **H3:** `GdiplusStartup` / `GdiplusShutdown` со счётчиком окон.
+- **H4:** `NDEBUG` в конфигурации Release|x64.
+
+Уже было в 2.5.0: экспорт `ListLoadNextW`, подкласс EDIT на каждое окно (не глобальный `WNDPROC`), точное сравнение тегов `N` и `ADR` (не префикс `NOTE` / `NICKNAME`).
+
+### Cleanup
+- Удалены неподключённые `parts/*.part`.
+
 ## [2.5.0] – 2026-08-18
 
 ### Changed
