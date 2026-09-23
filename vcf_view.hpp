@@ -24,7 +24,6 @@ void   VCFView_SetSelection(HWND h, size_t idx);
 // Copy last activated (click) text to clipboard (optional hotkeys)
 bool  VCFView_CopyActive(HWND h);
 
-// DLL HINSTANCE for RegisterClass / CreateWindow (do not use GetModuleHandle(nullptr))
+// DLL HINSTANCE for RegisterClass / CreateWindow (not GetModuleHandle(nullptr))
 void  VCFView_SetModuleInstance(HINSTANCE h);
 void  VCFView_OnDllDetach();
-

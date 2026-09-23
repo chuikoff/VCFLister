@@ -1,23 +1,123 @@
-## [2.5.1] – 2026-09-09
+## [2.5.2] – 2026-09-23
 
-Версия относительно последнего релиза v2.5.0 (changelog на master отставал на 2.2).
+Восстановлены изменения 2.3–2.5.0. Опубликованная 2.5.1 собрана от v2.2 (`e4f3e5d`), теги 2.3–2.5.0 в неё не входили. Эта версия — дерево `origin/1.6` (v2.5.0) плюс правки код-ревью, перенесённые на этот код.
 
-### Fixed (review: Critical + High)
-- **C1:** общая кисть темы `g_hbrBk` больше не удаляется при закрытии одного окна Lister (refcount живых окон) — устранение UAF GDI.
-- **C2:** лимит размера VCF (32 МиБ) и декодированного PHOTO/Base64 (8 МиБ).
-- **C3:** регистрация/создание окон с `HINSTANCE` DLL; `UnregisterClass` при последнем окне / `DLL_PROCESS_DETACH`.
-- **H1:** HTTP-фото асинхронно (воркер + `PostMessage`); blocklist частных IP/localhost/metadata; `NO_AUTO_REDIRECT`; проверка magic bytes JPEG/PNG/GIF/WEBP/BMP. `LoadPhotoUrl` по умолчанию выкл.
-- **H2:** `editOldProc` хранится в `ViewState`, не в глобале.
-- **H3:** refcount `GdiplusStartup` / `GdiplusShutdown`.
-- **H4:** экспорт `ListLoadNextW` (DEF + Win32); `NDEBUG` в Release|x64.
-- **H5:** очистка structured-полей только для точных тегов `N`/`ADR` (не NOTE/NICKNAME).
-- **H6:** версия выровнена на 2.5.1; убран `-dirty` из committed `version_auto.h`.
+### Fixed
+- **C1:** общая кисть `g_hbrBk` удаляется, только когда не осталось окон Lister.
+- **C2:** файл VCF больше 32 МиБ не читается; PHOTO / Base64 больше 8 МиБ отбрасывается.
+- **C3:** `RegisterClass` / `CreateWindow` с `HINSTANCE` DLL; `UnregisterClass` на последнем окне и в `DLL_PROCESS_DETACH`.
+- **H1:** HTTP-фото качается в фоновом потоке. Blocklist: localhost, частные и link-local IPv4, metadata, IPv6-литералы. `INTERNET_FLAG_NO_AUTO_REDIRECT`. В декодер попадают только JPEG/PNG/GIF/WEBP/BMP. `LoadPhotoUrl` по-прежнему выключен по умолчанию.
+- **H3:** `GdiplusStartup` / `GdiplusShutdown` со счётчиком окон.
+- **H4:** `NDEBUG` в конфигурации Release|x64.
 
-### Hygiene
-- Удалены мусорные артефакты: `vcf_view.cpp.orig`, `fix*.ps1`, `parts/`, `RCa14392`, `original_vcf_view.txt`.
+Уже было в 2.5.0: экспорт `ListLoadNextW`, подкласс EDIT на каждое окно (не глобальный `WNDPROC`), точное сравнение тегов `N` и `ADR` (не префикс `NOTE` / `NICKNAME`).
 
-### Deferred (follow-up)
-- Унификация кодеков Base64/QP между `vcf_parser` и `vcf_view` (M1) — не делалась в этом PR.
+### Cleanup
+- Удалены неподключённые `parts/*.part`.
+
+## [2.5.0] – 2026-08-18
+
+### Changed
+- Карточка строится из **одного разбора** (`Contact.fields` / `BuildFromContact`), без повторного parse raw-блока.
+- Поиск: по полям по отдельности (без склейки огромной `hay`), плюс `fields` / `androidCustoms` (NICKNAME, IMPP, X-*, …).
+- Уважается **Match case** (`lcs_matchcase`); `wrap=false` сканирует до края списка.
+- `A2W` на `std::wstring` (без `malloc`/`free`).
+
+### Fixed
+- Статусбар **«Найдено: p/N»**: `matchPos` обновляется при клике/стрелках (`SetSelectionAndReveal`), не только в F3.
+- Tooltip списка: тот же hit-test, что у клика (фильтр + `visibleIdx`).
+- `PhotoWndProc`: безопасный `ViewStateFromHwnd` (`IsWindow` + null).
+- Поиск: корректная длина после `LowerInvariant` (напр. `ß` → `ss`).
+- Win32: `TargetExt=.wlx` (без MSB8012 TargetPath/`.dll`).
+
+### Cleanup
+- Удалён мёртвый SFINAE (`addNoteImpl` / `has_notes`), пустой `vcf_view_theme.hpp`, `*.orig`, `original_*.txt`, `fix*.ps1`, `RCa14392`.
+- `.gitignore`: `*.orig`, `original_*.txt`, `RCa*`.
+
+## [2.4.7] – 2026-08-01
+
+### Fixed
+- **#19** «Copy line value» всегда копирует **полное** значение строки (не выделение); копирование выделения без потери символа (RichEdit `EM_GETTEXTRANGE`).
+- **#20** Тёмная тема: подпись **📷 photo** — светлый цвет (`WM_CTLCOLORBTN` + `SetWindowTheme`).
+
+## [2.4.6] – 2026-07-31
+
+### Changed
+- **#18** Карточка как **таблица**: подпись | значение (tab + цвет), без bold.
+- **NOTE** — отдельный блок `── Заметка ──` с переносами строк (`\n` / `\t`).
+
+### Fixed
+- ПКМ по карточке **после выделения** — краш TC: RichEdit `EM_CHARFROMPOS` требует `POINTL*`, не `MAKELPARAM`.
+- Зависание ПКМ-меню под Lister: `PostMessage` + безопасный `TrackPopupMenu`, без reentrancy.
+- Выделение мышью: фокус не уводится с текста во время drag-select.
+
+## [2.4.5] – 2026-07-31
+
+### Added
+- **#18 Visual separation**: карточка на RichEdit — **значения полей жирным** (`Full name: **Leonard**`), заголовки `── Заметка ──` тоже жирные.
+- ПКМ по тексту карточки: меню «Копировать / строка / всё» (починен перехват меню EDIT).
+
+### Changed
+- **NOTE** — отдельный блок `── Заметка ──` с переносами; `\n`/`\t` escape.
+
+## [2.4.4] – 2026-07-31
+
+### Changed
+- **NOTE** в карточке — отдельный блок: пустая строка, заголовок `── Заметка ──`, текст с переносами ниже.
+- Escape в тексте: `\n` → перенос (CRLF в EDIT), `\t` → таб; `\,` `\;` `\\` по RFC.
+
+### Fixed
+- (из 2.4.3) iPhone PHOTO base64 не сыплется в текст; фото сверху; base64 `len%4==1`.
+
+## [2.4.3] – 2026-07-28
+
+### Fixed
+- **iPhone `\r\r\n`**: корректный split/unfold строк — base64 PHOTO больше не попадает в текст карточки (`John_Doe_IPHONE.vcf`).
+- PHOTO: надёжнее собирается base64 (`ENCODING=b`, `;JPEG` без TYPE); orphan-строки base64 не выводятся.
+- Скрыты `X-ABADR`; чище ORG/ADR (`\`n`, `;`).
+- Фото снова **сверху** карточки.
+- Base64: `len%4==1` (битые exports) — отбрасываем лишний символ.
+
+## [2.4.2] – 2026-07-28
+
+### Fixed
+- **BlackBerry PHOTO**: JPEG с битой длиной APP1 (перекрывает DQT) — починка маркеров + EOI, GDI+ снова показывает фото (`John_Doe_BLACK_BERRY.vcf`).
+
+## [2.4.1] – 2026-07-28
+
+### Fixed
+- Высота текста карточки: точный замер через `EM_POSFROMCHAR` + fallback; если текст короче окна — EDIT **растягивается** на свободное место (больше не обрезается при «пустом» экране, напр. `John_Doe_ANDROID.vcf`).
+
+## [2.4] – 2026-07-28
+
+### Added
+- **#12** `pluginst.inf` в архиве — авто-установка плагина в Total Commander.
+- **#11** Тёмная тема по **TC dark mode** (`lcp_darkmode` / `ListSendCommand` при `cm_SwitchDarkMode`), не по Windows.
+- **#11** Фото **после** текстовых полей, с ограничением размера превью.
+
+### Fixed
+- **#13** Карточка: полная высота текста + один внешний вертикальный скролл (без «окна» EDIT со стрелками под фото).
+- Apple/iOS vCard: скрыты служебные поля (`X-ADDRESSING-GRAMMAR`, `X-IMAGEHASH`, `PRODID`, …); сохранены кастомные метки (`Домашние контакты`, `День ангела`); без дубля N/FN.
+
+### Build
+- Единый архив: `VCFLister-2.4.zip` (`.wlx` + `.wlx64` + `pluginst.inf` + docs).
+
+## [2.3] – 2026-07-28
+
+### Added
+- **#8 Быстрый фильтр** над списком контактов (поле «Фильтр...»).
+- **Фильтр «📷 фото»** — показывать только контакты с фото.
+- **#9 Detect string** для авто-установки TC: `EXT="VCF" | EXT="VCARD"` (ANSI `ListGetDetectString` на x86 и x64).
+
+### Fixed
+- **#7 scroll bug**: один **вертикальный** скроллбар справа для всей карточки (фото + полный текст); убран горизонтальный скролл снизу у EDIT; текст переносится.
+- Навигация по **отфильтрованному** списку (↑/↓/PgUp/PgDn) с клавиатуры.
+- Фокус: стрелки/Enter/Tab из фильтра передают фокус на список; клик по списку забирает фокус у фильтра; ESC из фильтра/чекбокса закрывает Lister.
+- Экспорт `ListGetDetectString` для 64-bit TC (раньше только W-версия).
+
+### Build
+- Единый архив: `VCFLister-2.3.zip` (`.wlx` + `.wlx64` + docs).
+- Бинарники: `VCFLister.wlx64` (x64), `VCFLister.wlx` (Win32).
 
 ## [2.2] – 2026-07-28
 

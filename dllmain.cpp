@@ -31,6 +31,9 @@
 #define lcp_ascii       8
 #define lcp_variable    12
 #define lcp_forceshow   16
+// TC 9.50+: dark mode flags for ListLoad / ListSendCommand(lc_newparams)
+#define lcp_darkmode         128
+#define lcp_darkmodenative   256
 #define lcs_findfirst   1
 #define lcs_matchcase   2
 #define lcs_wholewords  4
@@ -57,37 +60,42 @@ static HINSTANCE g_hInst = nullptr;
 // Из viewer-а
 extern "C" void VCFView_SetIniPath(const wchar_t* iniPath);
 extern "C" void VCFView_SetRawBlocks(HWND hView, const std::vector<std::wstring>& rawBlocks);
+extern "C" void VCFView_SetTCDarkMode(int dark, HWND hWnd);
+extern "C" void VCFView_RefreshTheme(HWND hWnd);
 
-// ANSI → UTF-16 (твоя версия с malloc, чтобы no unwinding)
+static void ApplyShowFlagsTheme(HWND hView, int showFlags) {
+    // TC passes lcp_darkmode when cm_SwitchDarkMode / dark theme is active
+    const bool dark = (showFlags & lcp_darkmode) != 0 || (showFlags & lcp_darkmodenative) != 0;
+    VCFView_SetTCDarkMode(dark ? 1 : 0, hView);
+}
+
+// ANSI → UTF-16
 static std::wstring A2W(const char* s) {
     if (!s) return L"";
     int need = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
     if (need <= 0) return L"";
-    wchar_t* buf = (wchar_t*)malloc(need * sizeof(wchar_t));
-    if (!buf) return L"";
-    MultiByteToWideChar(CP_ACP, 0, s, -1, buf, need);
-    std::wstring w(buf);
-    free(buf);
+    // need includes the trailing L'\0' written by MultiByteToWideChar(-1)
+    std::wstring w(static_cast<size_t>(need), L'\0');
+    if (MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), need) <= 0)
+        return L"";
+    w.resize(static_cast<size_t>(need - 1));
     return w;
 }
 
 // Прочитать файл целиком (wide), с попытками кодировок
-static constexpr size_t kMaxVcfFileBytes = 32u * 1024u * 1024u; // 32 MiB
+static constexpr unsigned long long kMaxVcfFileBytes = 32ull * 1024ull * 1024ull; // 32 MiB
 
 static std::wstring ReadWholeFileAsWide(const wchar_t* path) {
     std::wstring empty;
     std::ifstream f(path, std::ios::binary);
     if (!f) return empty;
     f.seekg(0, std::ios::end);
-    std::streamoff sz = f.tellg();
+    const std::streamoff sz = f.tellg();
     if (sz < 0) return empty;
-    if ((size_t)sz > kMaxVcfFileBytes) {
-        // Oversized VCF — refuse to load (protect TC process from OOM)
-        return empty;
-    }
+    if (static_cast<unsigned long long>(sz) > kMaxVcfFileBytes) return empty;
     f.seekg(0, std::ios::beg);
-    std::vector<char> buf((size_t)sz);
-    if (sz > 0 && !f.read(buf.data(), sz)) return empty;
+    std::vector<char> buf(static_cast<size_t>(sz));
+    if (sz > 0 && !f.read(buf.data(), static_cast<std::streamsize>(sz))) return empty;
     if (buf.empty()) return empty;
 
     auto tryMbToW = [](const char* data, int len, UINT cp, bool strictUTF8 = false)->std::wstring {
@@ -169,7 +177,7 @@ static std::vector<std::wstring> SplitVCardBlocks(const std::wstring& text) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Общие Unicode-реализации
-static HWND Impl_ListLoadW(HWND ParentWin, const wchar_t* FileToLoad, int /*ShowFlags*/) {
+static HWND Impl_ListLoadW(HWND ParentWin, const wchar_t* FileToLoad, int ShowFlags) {
     if (!ParentWin || !FileToLoad) return nullptr;
     std::wstring text = ReadWholeFileAsWide(FileToLoad);
     if (text.empty()) return nullptr;
@@ -181,11 +189,14 @@ static HWND Impl_ListLoadW(HWND ParentWin, const wchar_t* FileToLoad, int /*Show
     std::vector<std::wstring> rawBlocks = SplitVCardBlocks(text);
 
     HWND hView = CreateVCFView(ParentWin, contacts);
-    if (hView) VCFView_SetRawBlocks(hView, rawBlocks);
+    if (hView) {
+        VCFView_SetRawBlocks(hView, rawBlocks);
+        ApplyShowFlagsTheme(hView, ShowFlags);
+    }
     return hView;
 }
 
-static int Impl_ListLoadNextW(HWND ParentWin, HWND PluginWin, const wchar_t* FileToLoad, int /*ShowFlags*/) {
+static int Impl_ListLoadNextW(HWND ParentWin, HWND PluginWin, const wchar_t* FileToLoad, int ShowFlags) {
     if (!ParentWin || !PluginWin || !FileToLoad) return LISTPLUGIN_ERROR;
 
     std::wstring text = ReadWholeFileAsWide(FileToLoad);
@@ -194,18 +205,16 @@ static int Impl_ListLoadNextW(HWND ParentWin, HWND PluginWin, const wchar_t* Fil
     std::vector<Contact> contacts = ParseVCard(text);
     std::vector<std::wstring> rawBlocks = SplitVCardBlocks(text);
 
-    // Ensure the view is properly updated with new contacts and raw blocks
     VCFView_SetContacts(PluginWin, contacts);
     VCFView_SetRawBlocks(PluginWin, rawBlocks);
-    
-    // Ensure the selection and display are properly reset/updated
+    ApplyShowFlagsTheme(PluginWin, ShowFlags);
+
     if (!contacts.empty()) {
-        VCFView_SetSelection(PluginWin, 0); // Set selection to first contact
+        VCFView_SetSelection(PluginWin, 0);
     } else {
-        // If no contacts, still ensure the display is refreshed
         InvalidateRect(PluginWin, NULL, TRUE);
     }
-    
+
     return LISTPLUGIN_OK;
 }
 
@@ -234,8 +243,12 @@ static int Impl_ListSearchTextW(HWND PluginWin, const wchar_t* SearchString, int
 }
 
 static int Impl_ListSendCommand(HWND PluginWin, int Command, int Parameter) {
-    (void)Parameter;
     if (!PluginWin) return 0;
+    // TC 9.50+: when user toggles cm_SwitchDarkMode, sends lc_newparams with dark flags
+    if (Command == lc_newparams) {
+        ApplyShowFlagsTheme(PluginWin, Parameter);
+        return 1;
+    }
     if (Command == lc_selectall) return 1;
     return 0;
 }
@@ -298,26 +311,35 @@ WLX_EXPORT void __stdcall ListCloseWindow(HWND ListWin) {
         // Игнорируем
     }
 }
-WLX_EXPORT int __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
+// TC Lister always uses ANSI ListGetDetectString for detect (x86 and x64).
+// Signature is void per WLX SDK; returning int breaks auto-install detect string (#9).
+WLX_EXPORT void __stdcall ListGetDetectString(char* DetectString, int maxlen) {
     __try {
-        if (!DetectString || maxlen <= 0) return 0;
-        const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
-        lstrcpynW(DetectString, ds, maxlen);
-        return 1;
+        if (!DetectString || maxlen <= 0) return;
+        // Standard TC detect: extension .vcf / .vcard
+        const char* ds = "EXT=\"VCF\" | EXT=\"VCARD\"";
+        lstrcpynA(DetectString, ds, maxlen);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
+    }
+}
+WLX_EXPORT void __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
+    __try {
+        if (!DetectString || maxlen <= 0) return;
+        const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
+        lstrcpynW(DetectString, ds, maxlen);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
 
 #else
 // x86: экспорт ANSI + Unicode без __try
 extern "C" {
-    int __stdcall ListGetDetectString(char* DetectString, int maxlen) {
+    void __stdcall ListGetDetectString(char* DetectString, int maxlen) {
+        if (!DetectString || maxlen <= 0) return;
         const char* ds = "EXT=\"VCF\" | EXT=\"VCARD\"";
-        if (!DetectString || maxlen <= 0) return 0;
-        strncpy_s(DetectString, maxlen, ds, _TRUNCATE);
-        return 1;
+        lstrcpynA(DetectString, ds, maxlen);
     }
     HWND __stdcall ListLoad(HWND ParentWin, char* FileToLoad, int ShowFlags) {
         std::wstring wfile = A2W(FileToLoad);
@@ -345,17 +367,16 @@ extern "C" {
     HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLoad, int ShowFlags) {
         return Impl_ListLoadW(ParentWin, FileToLoad, ShowFlags);
     }
-    int __stdcall ListLoadNextW(HWND ParentWin, HWND PluginWin, wchar_t* FileToLoad, int ShowFlags) {
-        return Impl_ListLoadNextW(ParentWin, PluginWin, FileToLoad, ShowFlags);
-    }
     int __stdcall ListSearchTextW(HWND PluginWin, wchar_t* SearchString, int SearchParameter) {
         return Impl_ListSearchTextW(PluginWin, SearchString, SearchParameter);
     }
-    int __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
-        if (!DetectString || maxlen <= 0) return 0;
+    void __stdcall ListGetDetectStringW(wchar_t* DetectString, int maxlen) {
+        if (!DetectString || maxlen <= 0) return;
         const wchar_t* ds = L"EXT=\"VCF\" | EXT=\"VCARD\"";
         lstrcpynW(DetectString, ds, maxlen);
-        return 1;
+    }
+    int __stdcall ListLoadNextW(HWND ParentWin, HWND PluginWin, wchar_t* FileToLoad, int ShowFlags) {
+        return Impl_ListLoadNextW(ParentWin, PluginWin, FileToLoad, ShowFlags);
     }
 }
 #endif

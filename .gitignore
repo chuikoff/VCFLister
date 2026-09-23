@@ -371,3 +371,10 @@ Release/
 # Плагин (артефакты сборки)
 *.wlx
 *.wlx64
+
+# Local junk / one-off edits (not part of the project)
+*.orig
+original_*.txt
+
+# RC.exe temp leftovers (e.g. RCa14392)
+RCa*

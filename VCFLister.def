@@ -1,7 +1,10 @@
 LIBRARY "VCFLister"
 EXPORTS
-    ; Unicode
+    ; Detect string (ANSI — TC uses this for both x86 and x64 auto-detect)
+    ListGetDetectString
     ListGetDetectStringW
+
+    ; Unicode
     ListLoadW
     ListLoadNextW
     ListCloseWindow
@@ -10,7 +13,6 @@ EXPORTS
     ListSetDefaultParams
 
     ; ANSI (Win32)
-    ListGetDetectString
     ListLoad
     ListLoadNext
     ListSearchText
