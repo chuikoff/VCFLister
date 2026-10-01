@@ -10,6 +10,7 @@ bool g_dark = false;
 bool g_tcRu = false;
 int  g_tcDarkMode = -1; // -1 unknown, 0 light, 1 dark (from ListLoad/ListSendCommand flags)
 HBRUSH   g_hbrBk = nullptr;
+HBRUSH   g_hbrListBg = nullptr;
 COLORREF g_clrBk, g_clrTxt, g_clrSub, g_clrGrid, g_clrSeparator;
 COLORREF g_clrListBg, g_clrListSel;
 
@@ -111,6 +112,8 @@ void RecomputeTheme() {
     }
     SafeDelBrush(g_hbrBk);
     g_hbrBk = CreateSolidBrush(g_clrBk);
+    SafeDelBrush(g_hbrListBg);
+    g_hbrListBg = CreateSolidBrush(g_clrListBg);
 }
 
 extern "C" void VCFView_SetIniPath(const wchar_t* iniPath) {
@@ -122,6 +125,7 @@ extern "C" void VCFView_SetTCDarkMode(int dark /*0/1*/, HWND hWnd) {
     g_tcDarkMode = (dark != 0) ? 1 : 0;
     RecomputeTheme();
     if (hWnd && IsWindow(hWnd)) {
+        VCFView_ApplyChrome(hWnd);
         InvalidateRect(hWnd, nullptr, TRUE);
         // repaint children (filter, edit, checkbox)
         EnumChildWindows(hWnd, [](HWND c, LPARAM) -> BOOL {
@@ -134,6 +138,7 @@ extern "C" void VCFView_SetTCDarkMode(int dark /*0/1*/, HWND hWnd) {
 extern "C" void VCFView_RefreshTheme(HWND hWnd) {
     RecomputeTheme();
     if (IsWindow(hWnd)) {
+        VCFView_ApplyChrome(hWnd);
         InvalidateRect(hWnd, nullptr, TRUE);
         EnumChildWindows(hWnd, [](HWND c, LPARAM) -> BOOL {
             InvalidateRect(c, nullptr, TRUE);

@@ -9,12 +9,15 @@ extern bool         g_tcRu;
 extern int          g_tcDarkMode; // -1 unknown, 0 light, 1 dark (TC cm_SwitchDarkMode)
 
 extern HBRUSH   g_hbrBk;
+extern HBRUSH   g_hbrListBg;
 extern COLORREF g_clrBk, g_clrTxt, g_clrSub, g_clrGrid, g_clrSeparator;
 extern COLORREF g_clrListBg, g_clrListSel;
 
 void RecomputeTheme();
 extern "C" void VCFView_SetIniPath(const wchar_t* iniPath);
 extern "C" void VCFView_RefreshTheme(HWND hWnd);
+// Scrollbars and the photo checkbox follow g_dark (call after RecomputeTheme).
+extern "C" void VCFView_ApplyChrome(HWND hWnd);
 // dark: 0=light, 1=dark — from ListLoad ShowFlags / ListSendCommand lc_newparams
 extern "C" void VCFView_SetTCDarkMode(int dark, HWND hWnd);
 

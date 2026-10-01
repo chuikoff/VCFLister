@@ -13,11 +13,13 @@
 #include <commctrl.h>
 #include <richedit.h>
 #include <uxtheme.h>
+#include <dwmapi.h>
 #include <wininet.h>
 #pragma comment(lib, "Gdiplus.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 #include <vector>
 #include <string>
@@ -706,6 +708,7 @@ static void UnregisterPluginClasses() {
 void VCFView_OnDllDetach() {
     if (g_liveViews == 0) {
         SafeDelBrush(g_hbrBk);
+        SafeDelBrush(g_hbrListBg);
         if (g_gdipToken) {
             GdiplusShutdown(g_gdipToken);
             g_gdipToken = 0;
@@ -1789,6 +1792,33 @@ static void SetSelectionAndReveal(HWND h, ViewState* st, size_t idx) {
     InvalidateRect(h, nullptr, FALSE);
 }
 
+// Photo checkbox: native theme in light mode (#24). In dark mode visual styles
+// are off so WM_CTLCOLORBTN can paint light text on the list row (#20).
+static void ApplyPhotoCheckboxChrome(HWND btn) {
+    if (!btn || !IsWindow(btn)) return;
+    SetWindowTheme(btn, g_dark ? L"" : nullptr, g_dark ? L"" : nullptr);
+    InvalidateRect(btn, nullptr, TRUE);
+}
+
+// Child SCROLLBAR controls. DarkMode_Explorer + immersive-dark, same pair as
+// wlx-multidoc-viewer (DWMWA 20, fallback 19). Light mode restores the default theme.
+static void ApplyScrollbarTheme(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    const BOOL state = g_dark ? TRUE : FALSE;
+    if (DwmSetWindowAttribute(hwnd, 20, &state, sizeof(state)) != S_OK)
+        DwmSetWindowAttribute(hwnd, 19, &state, sizeof(state));
+    SetWindowTheme(hwnd, g_dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
+}
+
+extern "C" void VCFView_ApplyChrome(HWND h) {
+    auto* st = ViewStateFromHwnd(h);
+    if (!st) return;
+    ApplyPhotoCheckboxChrome(st->hPhotoOnly);
+    ApplyScrollbarTheme(st->hScroll);
+    ApplyScrollbarTheme(st->hRightScroll);
+}
+
 // ===================== Window proc =====================
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA);
@@ -1855,8 +1885,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | BS_TEXT,
             0, 0, 0, 0, h, (HMENU)1011, ModuleInstance(), nullptr);
         SendMessageW(st->hPhotoOnly, WM_SETFONT, (WPARAM)st->fonts.hSmall, TRUE);
-        // Disable visual styles so WM_CTLCOLORBTN can set light text in dark theme (#20)
-        SetWindowTheme(st->hPhotoOnly, L"", L"");
         SetWindowSubclass(st->hPhotoOnly, EscChildSubclass, 2, (DWORD_PTR)h);
 
         // Скролл слева
@@ -1892,6 +1920,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(st->hEdit, EM_AUTOURLDETECT, FALSE, 0);
         SetWindowSubclass(st->hEdit, EditSubclassProc, 3, 0);
 
+        VCFView_ApplyChrome(h);
         SetFocus(h);
         return 0;
     }
@@ -1919,6 +1948,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SetWindowLongPtrW(h, GWLP_USERDATA, 0);
             if (InterlockedDecrement(&g_liveViews) == 0) {
                 SafeDelBrush(g_hbrBk);
+                SafeDelBrush(g_hbrListBg);
                 UnregisterPluginClasses();
             }
             ReleaseGdiplus();
@@ -2326,6 +2356,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SYSCOLORCHANGE: {
         RecomputeTheme();
         if (st) LoadViewSettings(st);
+        VCFView_ApplyChrome(h);
         UpdateRightPanel(st);
         InvalidateRect(h, nullptr, FALSE);
         return 0;
@@ -2428,12 +2459,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w;
         HWND hCtl = (HWND)l;
-        // Photo filter checkbox sits on list background — light text in dark theme
-        if (st && st->hPhotoOnly && hCtl == st->hPhotoOnly) {
+        // Dark theme only. Light mode keeps the themed checkbox (#24): an
+        // unthemed button with a hollow brush paints a black plate.
+        if (st && st->hPhotoOnly && hCtl == st->hPhotoOnly && g_dark) {
             SetTextColor(dc, g_clrTxt);
-            SetBkMode(dc, TRANSPARENT);
-            // Transparent so list-area paint shows through
-            return (INT_PTR)GetStockObject(HOLLOW_BRUSH);
+            SetBkColor(dc, g_clrListBg);
+            SetBkMode(dc, OPAQUE);
+            return (INT_PTR)(g_hbrListBg ? g_hbrListBg : GetStockObject(BLACK_BRUSH));
         }
         SetTextColor(dc, g_clrTxt);
         SetBkColor(dc, g_clrBk);
