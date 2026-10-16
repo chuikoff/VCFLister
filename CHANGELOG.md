@@ -1,3 +1,25 @@
+## [2.5.4] – 2026-10-16
+
+### Fixed
+- **Сборка Debug|x64 и compile.bat**: реализованы отсутствовавшие ANSI-экспорты `ListLoad`, `ListLoadNext`, `ListSearchText` под `_WIN64` для полного соответствия `VCFLister.def`.
+- **Буфер EM_GETTEXTRANGE**: исправлено потенциальное переполнение буфера на 1 символ из-за обязательного нуль-терминатора RichEdit в `GetEditCurrentLine` и `GetEditSelectionText`.
+- **EM_POSFROMCHAR в RichEdit**: исправлена передача целочисленного смещения вместо `POINTL*` в `wParam` (устранена угроза Access Violation при замере высоты карточки).
+- **Повторное открытие окна**: вызов `UnregisterClassW` убран из `WM_DESTROY` (вызывал `ERROR_CLASS_HAS_WINDOWS` и блокировал повторную регистрацию класса).
+- **Кодировка Windows-1251**: исправлен порядок детектирования кодировок в `ReadWholeFileAsWide` и `VcfBytesToWide` — нестрогий UTF-8 больше не перехватывает и не портит файлы 1251 без BOM.
+- **Поддержка vCard 2.1**: парсинг параметров `QUOTED-PRINTABLE` / `QP` и `BASE64` без префикса `ENCODING=`; корректная загрузка многострочного base64 без отступов.
+- **Скролл над фото**: в `PhotoWndProc` добавлен форвардинг `WM_MOUSEWHEEL` в родительское окно, карточка теперь прокручивается и при наведении на фото.
+- **Точность подсветки поиска**: `VCFView_SearchEx` переведён на `EM_FINDTEXTEXW`, устранён сдвиг рамки выделения из-за `\r\n`.
+- **HTTP-фото**: удержание модуля DLL в памяти на время работы потока (`GetModuleHandleExW` + `FreeLibraryAndExitThread`), очистка очереди от `WM_VCF_PHOTO_READY` в `WM_DESTROY`.
+- **Локаль**: fallback на системный русский язык `PRIMARYLANGID(GetUserDefaultUILanguage())` при пустом `LanguageIni`.
+- **Кодировка строк интерфейса**: добавлен флаг компилятора `/utf-8` и сохранён UTF-8 BOM, устранено искажение русских подписей и контекстного меню при сборке на любой локали.
+- **Автономность (CRT /MT)**: плагин переведён на статическую линковку с CRT (`/MT`), удалены внешние зависимости от распространяемых пакетов `VCRUNTIME140.dll` и `MSVCP140.dll`.
+
+### Cleanup
+- Удалено избыточное дублирование строк `rawBlocks` в `ViewState` и `dllmain.cpp`, экономящее память при открытии больших файлов.
+- В проект `VCFLister.vcxproj` добавлены отсутствующие заголовки `vcf_theme.hpp` и `vcf_utils.hpp`.
+
+Архив: `VCFLister-2.5.4.zip` (`.wlx` + `.wlx64` + `pluginst.inf` + docs).
+
 ## [2.5.3] – 2026-10-01
 
 ### Fixed

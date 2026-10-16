@@ -1,4 +1,4 @@
-#include "vcf_theme.hpp"
+﻿#include "vcf_theme.hpp"
 #include <algorithm>
 #include <windows.h>
 
@@ -65,15 +65,19 @@ static int ReadIniDarkMode() {
 }
 
 static bool DetectTCRussian() {
-    if (g_iniPath.empty()) return false;
-    wchar_t buf[MAX_PATH]{};
-    GetPrivateProfileStringW(L"Configuration", L"LanguageIni", L"", buf, MAX_PATH, g_iniPath.c_str());
-    std::wstring s = buf;
-    std::wstring low; low.resize(s.size());
-    std::transform(s.begin(), s.end(), low.begin(), ::towlower);
-    if (low.find(L"rus") != std::wstring::npos || low.find(L"russian") != std::wstring::npos)
-        return true;
-    return false;
+    if (!g_iniPath.empty()) {
+        wchar_t buf[MAX_PATH]{};
+        GetPrivateProfileStringW(L"Configuration", L"LanguageIni", L"", buf, MAX_PATH, g_iniPath.c_str());
+        if (buf[0]) {
+            std::wstring s = buf;
+            std::wstring low; low.resize(s.size());
+            std::transform(s.begin(), s.end(), low.begin(), ::towlower);
+            if (low.find(L"rus") != std::wstring::npos || low.find(L"russian") != std::wstring::npos)
+                return true;
+            return false;
+        }
+    }
+    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN;
 }
 
 void RecomputeTheme() {

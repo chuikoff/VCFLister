@@ -607,7 +607,6 @@ static const int kSplitHit = 4; // half-width of splitter hit zone (px at 96dpi)
 
 struct ViewState {
     std::vector<Contact> contacts;           // все контакты файла
-    std::vector<std::wstring> rawBlocks;     // сырые vCard-блоки
     std::vector<size_t> visibleIdx;          // индексы после quick filter
     size_t sel = 0;
 
@@ -800,10 +799,14 @@ static int MeasureEditContentHeight(HWND hEdit, int widthPx) {
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
 
     int byPos = 0;
-    // Y of last character (client coords) — most accurate when char is laid out
-    LRESULT pos = SendMessageW(hEdit, EM_POSFROMCHAR, (WPARAM)(len > 0 ? len - 1 : 0), 0);
-    if (pos != (LRESULT)-1) {
-        int y = (int)(short)HIWORD((DWORD)pos);
+    // Y of last character (client coords) — RichEdit 2.0+ takes POINTL* in wParam
+    POINTL ptl{};
+    LRESULT pos = SendMessageW(hEdit, EM_POSFROMCHAR, (WPARAM)&ptl, (LPARAM)(len > 0 ? len - 1 : 0));
+    if (pos != (LRESULT)-1 || ptl.y > 0) {
+        int y = (int)ptl.y;
+        if (y <= 0 && pos != (LRESULT)-1) {
+            y = (int)(short)HIWORD((DWORD)pos);
+        }
         // include full last line + padding
         byPos = y + lineH + 8;
     }
@@ -965,16 +968,23 @@ static std::vector<uint8_t> HttpGetBytes(const std::wstring& url, DWORD timeoutM
 }
 
 static DWORD WINAPI PhotoFetchThreadProc(LPVOID param) {
+    HMODULE hMod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(PhotoFetchThreadProc), &hMod);
+
     std::unique_ptr<PhotoFetchJob> job(static_cast<PhotoFetchJob*>(param));
-    if (!job || !IsWindow(job->hwnd)) return 0;
-    auto bytes = HttpGetBytes(job->url);
-    if (!IsWindow(job->hwnd)) return 0;
-    auto* res = new PhotoFetchResult();
-    res->sel = job->sel;
-    res->gen = job->gen;
-    res->bytes = std::move(bytes);
-    if (!PostMessageW(job->hwnd, WM_VCF_PHOTO_READY, 0, reinterpret_cast<LPARAM>(res)))
-        delete res;
+    if (job && IsWindow(job->hwnd)) {
+        auto bytes = HttpGetBytes(job->url);
+        if (IsWindow(job->hwnd)) {
+            auto* res = new PhotoFetchResult();
+            res->sel = job->sel;
+            res->gen = job->gen;
+            res->bytes = std::move(bytes);
+            if (!PostMessageW(job->hwnd, WM_VCF_PHOTO_READY, 0, reinterpret_cast<LPARAM>(res)))
+                delete res;
+        }
+    }
+
+    if (hMod) FreeLibraryAndExitThread(hMod, 0);
     return 0;
 }
 
@@ -1111,7 +1121,7 @@ static std::wstring GetEditCurrentLine(HWND hEdit) {
         if (lineLen < 0) lineLen = 0;
     }
     if (lineLen <= 0) return L"";
-    std::wstring out((size_t)lineLen, L'\0');
+    std::wstring out((size_t)lineLen + 1, L'\0');
     TEXTRANGEW tr{};
     tr.chrg.cpMin = idx;
     tr.chrg.cpMax = idx + lineLen;
@@ -1138,13 +1148,14 @@ static std::wstring GetEditSelectionText(HWND hEdit) {
     LONG n = cr.cpMax - cr.cpMin;
     if (n < 0) n = -n;
     if (n > 1'000'000) n = 1'000'000;
-    std::wstring out((size_t)n, L'\0');
+    std::wstring out((size_t)n + 1, L'\0');
     TEXTRANGEW tr{};
     tr.chrg.cpMin = (std::min)(cr.cpMin, cr.cpMax);
     tr.chrg.cpMax = (std::max)(cr.cpMin, cr.cpMax);
     tr.lpstrText = &out[0];
     int got = (int)SendMessageW(hEdit, EM_GETTEXTRANGE, 0, (LPARAM)&tr);
     if (got < 0) got = 0;
+    if (got > (int)n) got = (int)n;
     out.resize((size_t)got);
     return out;
 }
@@ -1702,6 +1713,11 @@ static LRESULT CALLBACK PhotoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     // Parent must be our viewer; never trust GWLP_USERDATA on a dead/foreign HWND.
     auto* st = ViewStateFromHwnd(GetParent(hwnd));
     switch (msg) {
+    case WM_MOUSEWHEEL: {
+        HWND viewer = GetParent(hwnd);
+        if (viewer) return SendMessageW(viewer, WM_MOUSEWHEEL, wParam, lParam);
+        break;
+    }
     case WM_ERASEBKGND: {
         // Paint will cover everything via double buffer; prevent default erase to reduce flicker
         return 1;
@@ -1927,6 +1943,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY: {
         if (st) {
             ++st->photoFetchGen;
+            MSG pendingMsg{};
+            while (PeekMessageW(&pendingMsg, h, WM_VCF_PHOTO_READY, WM_VCF_PHOTO_READY, PM_REMOVE)) {
+                delete reinterpret_cast<PhotoFetchResult*>(pendingMsg.lParam);
+            }
             if (st->hEdit && IsWindow(st->hEdit)) {
                 RemoveWindowSubclass(st->hEdit, EditSubclassProc, 3);
                 DestroyWindow(st->hEdit);
@@ -1949,7 +1969,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (InterlockedDecrement(&g_liveViews) == 0) {
                 SafeDelBrush(g_hbrBk);
                 SafeDelBrush(g_hbrListBg);
-                UnregisterPluginClasses();
             }
             ReleaseGdiplus();
         }
@@ -2594,16 +2613,8 @@ void VCFView_SetContacts(HWND h, const std::vector<Contact>& contacts) {
     SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
 }
 
-extern "C" void VCFView_SetRawBlocks(HWND h, const std::vector<std::wstring>& rawBlocks) {
-    auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); if (!st) return;
-    st->rawBlocks = rawBlocks;
-    st->rightScroll = 0;
-    // raw blocks affect photo detection for filter
-    RebuildVisibleList(st);
-    UpdateRightPanel(st);
-    InvalidateRect(h, nullptr, FALSE);
-    RECT rc; GetClientRect(h, &rc);
-    SendMessage(h, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+extern "C" void VCFView_SetRawBlocks(HWND /*h*/, const std::vector<std::wstring>& /*rawBlocks*/) {
+    // Kept for binary/export compatibility; raw blocks are no longer retained in memory.
 }
 
 size_t VCFView_Count(HWND h) { auto* st = (ViewState*)GetWindowLongPtrW(h, GWLP_USERDATA); return st ? st->contacts.size() : 0; }
@@ -2639,19 +2650,17 @@ bool VCFView_SearchEx(HWND h, const std::wstring& needle, size_t startIndex, boo
         EnsureSelVisible(h, st);
         UpdateRightPanel(st);
         if (IsWindow(st->hEdit)) {
-            int len = GetWindowTextLengthW(st->hEdit);
-            if (len > 0) {
-                std::wstring all((size_t)len, L'\0');
-                GetWindowTextW(st->hEdit, &all[0], len + 1);
-                size_t pos = std::wstring::npos;
-                if (matchCase) {
-                    pos = all.find(needle);
-                } else {
-                    std::wstring low = LowerInvariant(all);
-                    pos = low.find(n);
-                }
-                if (pos != std::wstring::npos)
-                    SendMessageW(st->hEdit, EM_SETSEL, (WPARAM)pos, (LPARAM)(pos + needle.size()));
+            FINDTEXTEXW ft{};
+            ft.chrg.cpMin = 0;
+            ft.chrg.cpMax = -1;
+            ft.lpstrText = needle.c_str();
+            DWORD ftFlags = FR_DOWN;
+            if (matchCase) ftFlags |= FR_MATCHCASE;
+            if (wholeWord) ftFlags |= FR_WHOLEWORD;
+            LRESULT res = SendMessageW(st->hEdit, EM_FINDTEXTEXW, (WPARAM)ftFlags, (LPARAM)&ft);
+            if (res != -1) {
+                SendMessageW(st->hEdit, EM_SETSEL, (WPARAM)ft.chrgText.cpMin, (LPARAM)ft.chrgText.cpMax);
+                SendMessageW(st->hEdit, EM_SCROLLCARET, 0, 0);
             }
         }
         InvalidateRect(h, nullptr, FALSE);

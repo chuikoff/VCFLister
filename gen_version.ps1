@@ -63,7 +63,7 @@ if (Test-Path $statePath) {
 $sha = "unknown"; $dirty = $false
 try {
     $sha = (git rev-parse --short=7 HEAD).Trim()
-    $dirty = ((git status --porcelain).Length -gt 0)
+    $dirty = ((git status --porcelain | Where-Object { $_ -notmatch 'build_state\.json' -and $_ -notmatch 'version_auto\.h' }).Length -gt 0)
 } catch { }
 
 $gitShaStr = if ($dirty -and $sha -ne "unknown") { "$sha-dirty" } else { $sha }

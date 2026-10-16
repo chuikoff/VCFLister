@@ -1,4 +1,4 @@
-// vcf_parser.cpp — vCard 2.1/3.0 parser with QP + BASE64 photo
+﻿// vcf_parser.cpp — vCard 2.1/3.0 parser with QP + BASE64 photo
 #define NOMINMAX
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
@@ -211,6 +211,12 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
                 if (v == L"QUOTED-PRINTABLE" || v == L"QP") encQP = true;
                 if (v == L"BASE64" || v == L"B") photoIsBase64 = true;
             }
+            else if (P == L"QUOTED-PRINTABLE" || P == L"QP") {
+                encQP = true;
+            }
+            else if (P == L"BASE64" || P == L"B") {
+                photoIsBase64 = true;
+            }
             else if (P.rfind(L"CHARSET=", 0) == 0) {
                 charset = unquote(p.substr(8));
             }
@@ -378,35 +384,32 @@ std::vector<Contact> ParseVCard(const std::wstring& text)
             if (photoIsURL) {
                 cur.photo_url = unescape(decodeTextValue(value, encQP, charset));
             }
-            else if (photoIsBase64) {
-                size_t j = idx;
-                std::wstring fullValue = value;
-                while (j + 1 < lines.size()) {
-                    const std::wstring& nxt = lines[j + 1];
-                    if (!nxt.empty() && (nxt[0] == L' ' || nxt[0] == L'\t')) {
-                        fullValue.append(nxt.c_str() + 1);
-                        ++j;
-                    }
-                    else break;
-                }
-                idx = j;
-                setEmbeddedPhoto(cur, VcfBase64Decode(fullValue));
-            }
-            // 3) BASE64 without ENCODING= (or bare ;JPEG)
             else {
                 size_t j = idx;
                 std::wstring fullValue = value;
                 while (j + 1 < lines.size()) {
                     const std::wstring& nxt = lines[j + 1];
+                    std::wstring nxtTrim = trim(nxt);
+                    if (nxtTrim.empty()) {
+                        if (fullValue.empty()) { ++j; continue; }
+                        else break;
+                    }
                     if (!nxt.empty() && (nxt[0] == L' ' || nxt[0] == L'\t')) {
                         fullValue.append(nxt.c_str() + 1);
                         ++j;
+                        continue;
                     }
-                    else break;
+                    // vCard 2.1: multiline base64 lines without leading space (no colon)
+                    if (nxtTrim.find(L':') == std::wstring::npos) {
+                        fullValue.append(nxtTrim);
+                        ++j;
+                        continue;
+                    }
+                    break;
                 }
-                if (j > idx) idx = j;
+                idx = j;
 
-                if (fullValue.rfind(L"http://", 0) == 0 || fullValue.rfind(L"https://", 0) == 0) {
+                if (!photoIsBase64 && (fullValue.rfind(L"http://", 0) == 0 || fullValue.rfind(L"https://", 0) == 0)) {
                     cur.photo_url = fullValue;
                 } else {
                     auto bytes = VcfBase64Decode(fullValue);

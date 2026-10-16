@@ -1,4 +1,4 @@
-#include "vcf_utils.hpp"
+﻿#include "vcf_utils.hpp"
 #include <windows.h>
 
 std::wstring Trim(const std::wstring& s) {
@@ -123,7 +123,15 @@ std::vector<uint8_t> VcfBase64Decode(const std::wstring& wsrc) {
 
 std::vector<uint8_t> VcfQuotedPrintableDecode(const std::wstring& wsrc) {
     std::string in; in.reserve(wsrc.size());
-    for (wchar_t wc : wsrc) in.push_back((char)((unsigned)wc & 0xFF));
+    for (wchar_t wc : wsrc) {
+        if (wc <= 127) {
+            in.push_back((char)wc);
+        } else {
+            char buf[8]{};
+            int n = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, buf, sizeof(buf), nullptr, nullptr);
+            for (int k = 0; k < n; ++k) in.push_back(buf[k]);
+        }
+    }
 
     std::vector<uint8_t> out; out.reserve(in.size());
     const size_t n = in.size();
@@ -133,7 +141,10 @@ std::vector<uint8_t> VcfQuotedPrintableDecode(const std::wstring& wsrc) {
             if (i + 1 >= n) break;
             if (in[i + 1] == '\r' && i + 2 < n && in[i + 2] == '\n') { i += 3; continue; }
             if (in[i + 1] == '\n' || in[i + 1] == '\r') { i += 2; continue; }
-            if (in[i + 1] == ' ' || in[i + 1] == '\t') { i += 2; continue; }
+            if ((in[i + 1] == ' ' || in[i + 1] == '\t') && i + 2 < n && (in[i + 2] == '\r' || in[i + 2] == '\n')) {
+                i += (i + 3 < n && in[i + 2] == '\r' && in[i + 3] == '\n') ? 4 : 3;
+                continue;
+            }
             auto hex = [](char x) -> int {
                 if (x >= '0' && x <= '9') return x - '0';
                 if (x >= 'A' && x <= 'F') return 10 + (x - 'A');
@@ -167,13 +178,20 @@ std::wstring VcfBytesToWide(const std::vector<uint8_t>& bytes, UINT codepage) {
     DWORD flags = (codepage == CP_UTF8) ? MB_ERR_INVALID_CHARS : 0;
     int wlen = MultiByteToWideChar(codepage, flags, (LPCCH)bytes.data(), (int)bytes.size(), nullptr, 0);
     if (wlen <= 0) {
-        // fallback UTF-8 then 1251
-        wlen = MultiByteToWideChar(CP_UTF8, 0, (LPCCH)bytes.data(), (int)bytes.size(), nullptr, 0);
-        if (wlen > 0) codepage = CP_UTF8;
-        else {
+        // try strict UTF-8
+        wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (LPCCH)bytes.data(), (int)bytes.size(), nullptr, 0);
+        if (wlen > 0) {
+            codepage = CP_UTF8;
+        } else {
+            // try 1251
             wlen = MultiByteToWideChar(1251, 0, (LPCCH)bytes.data(), (int)bytes.size(), nullptr, 0);
-            if (wlen <= 0) return L"";
-            codepage = 1251;
+            if (wlen > 0) {
+                codepage = 1251;
+            } else {
+                wlen = MultiByteToWideChar(CP_UTF8, 0, (LPCCH)bytes.data(), (int)bytes.size(), nullptr, 0);
+                if (wlen <= 0) return L"";
+                codepage = CP_UTF8;
+            }
         }
     }
     std::wstring w((size_t)wlen, L'\0');
@@ -186,9 +204,12 @@ UINT VcfCodepageFromCharset(const std::wstring& charset) {
     if (cs == L"UTF-8" || cs == L"UTF8") return CP_UTF8;
     if (cs == L"UTF-16" || cs == L"UTF16" || cs == L"UTF-16LE") return 1200;
     if (cs == L"WINDOWS-1251" || cs == L"CP1251" || cs == L"WIN-1251") return 1251;
+    if (cs == L"WINDOWS-1252" || cs == L"CP1252" || cs == L"WIN-1252") return 1252;
+    if (cs == L"WINDOWS-1250" || cs == L"CP1250" || cs == L"WIN-1250") return 1250;
     if (cs == L"KOI8-R" || cs == L"KOI8R") return 20866;
     if (cs == L"ISO-8859-5" || cs == L"ISO8859-5") return 28595;
     if (cs == L"ISO-8859-1" || cs == L"ISO8859-1" || cs == L"LATIN1") return 28591;
+    if (cs == L"ISO-8859-2" || cs == L"ISO8859-2") return 28592;
     return CP_UTF8;
 }
 
