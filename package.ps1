@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 
 $root = $PSScriptRoot
 $stateFile = Join-Path $root "build_state.json"
-$ver = "2.5.6"
+$ver = "2.5.7"
 if (Test-Path $stateFile) {
     try {
         $st = Get-Content $stateFile -Raw | ConvertFrom-Json

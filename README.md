@@ -51,7 +51,7 @@
 1. `VCFLister.ini` в каталоге самого плагина (рядом с `VCFLister.wlx` / `VCFLister.wlx64`).
 2. `wincmd.ini` (путь, переданный Total Commander в `ListSetDefaultParams`).
 
-При этом цвета Total Commander (`[Lister] BackColor`) и язык интерфейса (`LanguageIni` / `LanguageDll`) плагин всегда считывает из `wincmd.ini` (включая случай, когда ini-файл плагина переопределён через `[ReplaceIniLocation]`).
+Цвета Total Commander (`[Lister] BackColor`) и язык интерфейса (`LanguageIni` / `LanguageDll`) читаются из ini, который загрузил сам TC: переменная `COMMANDER_INI` (в том числе `/i=` и портативный TC), затем путь из `ListSetDefaultParams`, затем `%APPDATA%\GHISLER\wincmd.ini`. Это работает и когда `[ReplaceIniLocation]` подменяет ini плагина. Если каталог плагина только для чтения, `ListWidth` записывается в ini TC.
 
 | Ключ | Значение | По умолчанию |
 |------|----------|--------------|

@@ -1,4 +1,13 @@
-﻿## [2.5.6] – 2026-11-10
+﻿## [2.5.7] – 2026-11-23
+
+### Fixed
+- **wincmd.ini:** цвета и язык Total Commander читаются из ini, который TC реально загрузил. Сначала `COMMANDER_INI` (`/i=` и портативный TC), затем ini из `ListSetDefaultParams`, затем `%APPDATA%\GHISLER\wincmd.ini`. Настройки `[VCFLister]` по-прежнему в `VCFLister.ini`.
+- **ListWidth:** если каталог плагина только для чтения, ширина списка сохраняется в ini TC.
+- **Сборка:** путь в `git -C` в `gen_version.ps1` в кавычках, каталог с пробелом больше не срывает предсборку.
+
+Архив: VCFLister-2.5.7.zip (.wlx + .wlx64 + pluginst.inf + docs).
+
+## [2.5.6] – 2026-11-10
 
 ### Added
 - **Хранение VCFLister.ini в папке плагина ([#25](https://github.com/chuikoff/VCFLister/issues/25)):**

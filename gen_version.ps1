@@ -22,7 +22,7 @@ function ConvertTo-VerKey([string]$text) {
 $major = 2; $minor = 0; $patch = 0
 $bestKey = -1
 try {
-    foreach ($tag in @(git -C $PSScriptRoot tag --merged HEAD --list "v*")) {
+    foreach ($tag in @(git -C "$PSScriptRoot" tag --merged HEAD --list "v*")) {
         $key = ConvertTo-VerKey $tag
         if ($key -gt $bestKey) { $bestKey = $key }
     }
@@ -62,8 +62,8 @@ if (Test-Path $statePath) {
 # --- 3) Git SHA и -dirty (не критично для билда) ---
 $sha = "unknown"; $dirty = $false
 try {
-    $sha = (git -C $PSScriptRoot rev-parse --short=7 HEAD).Trim()
-    $dirty = ((git -C $PSScriptRoot status --porcelain | Where-Object { $_ -notmatch 'build_state\.json' -and $_ -notmatch 'version_auto\.h' }).Length -gt 0)
+    $sha = (git -C "$PSScriptRoot" rev-parse --short=7 HEAD).Trim()
+    $dirty = ((git -C "$PSScriptRoot" status --porcelain | Where-Object { $_ -notmatch 'build_state\.json' -and $_ -notmatch 'version_auto\.h' }).Length -gt 0)
 } catch { }
 
 $gitShaStr = if ($dirty -and $sha -ne "unknown") { "$sha-dirty" } else { $sha }

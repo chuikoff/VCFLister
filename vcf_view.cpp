@@ -852,19 +852,24 @@ static int ReadIniInt(const wchar_t* key, int defVal) {
     return defVal;
 }
 static void WriteIniInt(const wchar_t* key, int val) {
-    std::wstring targetIni = ResolvePluginIni();
-    if (targetIni.empty()) {
-        if (!g_iniPath.empty() && 
+    wchar_t buf[32];
+    wsprintfW(buf, L"%d", val);
+
+    std::wstring pluginIni = ResolvePluginIni();
+    if (pluginIni.empty()) {
+        if (!g_iniPath.empty() &&
             (GetPrivateProfileIntW(L"VCFLister", L"SaveToPluginDir", 0, g_iniPath.c_str()) != 0 ||
              GetPrivateProfileIntW(L"VCFLister", L"IniInPluginDir", 0, g_iniPath.c_str()) != 0)) {
             std::wstring dir = GetPluginDirectory();
-            if (!dir.empty()) targetIni = dir + L"\\VCFLister.ini";
+            if (!dir.empty()) pluginIni = dir + L"\\VCFLister.ini";
         }
     }
-    if (targetIni.empty()) targetIni = g_iniPath;
-    if (targetIni.empty()) return;
-    wchar_t buf[32]; wsprintfW(buf, L"%d", val);
-    WritePrivateProfileStringW(L"VCFLister", key, buf, targetIni.c_str());
+    // Prefer VCFLister.ini. Program Files is often read-only — then keep the value in TC's ini.
+    if (!pluginIni.empty() &&
+        WritePrivateProfileStringW(L"VCFLister", key, buf, pluginIni.c_str()))
+        return;
+    if (!g_iniPath.empty() && _wcsicmp(g_iniPath.c_str(), pluginIni.c_str()) != 0)
+        WritePrivateProfileStringW(L"VCFLister", key, buf, g_iniPath.c_str());
 }
 static void LoadViewSettings(ViewState* st) {
     if (!st) return;

@@ -45,23 +45,21 @@ std::wstring ResolvePluginIni() {
 }
 
 std::wstring ResolveWincmdIni() {
-    wchar_t out[MAX_PATH]{};
-    if (!g_iniPath.empty()) {
-        wcsncpy_s(out, g_iniPath.c_str(), _TRUNCATE);
-        wchar_t* slash = wcsrchr(out, L'\\');
-        if (!slash) slash = wcsrchr(out, L'/');
-        if (slash) {
-            wcsncpy_s(slash + 1, MAX_PATH - (size_t)(slash + 1 - out), L"wincmd.ini", _TRUNCATE);
-            if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return out;
-            wcsncpy_s(slash + 1, MAX_PATH - (size_t)(slash + 1 - out), L"WINCMD.INI", _TRUNCATE);
-            if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return out;
-        }
-    }
+    // COMMANDER_INI is the ini TC loaded (/i=, portable). DefaultIniName may be a
+    // redirected plugin ini ([ReplaceIniLocation]) and has no BackColor or LanguageIni.
+    wchar_t cmdIni[MAX_PATH]{};
+    DWORD n = GetEnvironmentVariableW(L"COMMANDER_INI", cmdIni, MAX_PATH);
+    if (n > 0 && n < MAX_PATH && GetFileAttributesW(cmdIni) != INVALID_FILE_ATTRIBUTES)
+        return cmdIni;
+
+    if (!g_iniPath.empty() && GetFileAttributesW(g_iniPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+        return g_iniPath;
+
     wchar_t appdata[MAX_PATH]{};
-    if (GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH) > 0) {
+    DWORD na = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (na > 0 && na < MAX_PATH) {
+        wchar_t out[MAX_PATH]{};
         swprintf_s(out, L"%s\\GHISLER\\wincmd.ini", appdata);
-        if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return out;
-        swprintf_s(out, L"%s\\GHISLER\\WINCMD.INI", appdata);
         if (GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES) return out;
     }
     return g_iniPath;
